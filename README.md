@@ -35,6 +35,17 @@ If you work with several CLI agent sessions at once — one Windows Terminal win
 
 ## Install
 
+One line, no admin rights (it copies the script next to your PowerShell profile and adds a load line to the profile — both idempotent):
+
+```powershell
+irm https://raw.githubusercontent.com/Cepstral/claude-codex-resume/main/install.ps1 | iex
+```
+
+From a clone: `.\install.ps1`. To update later, just re-run it (open tabs pick the new version up by themselves on the next `ccr`).
+
+<details>
+<summary>Manual install</summary>
+
 1. Get `Resume-CcSessions.ps1` (clone the repo, or download the raw file) and copy it next to your PowerShell profile:
 
    ```powershell
@@ -55,7 +66,7 @@ If you work with several CLI agent sessions at once — one Windows Terminal win
 
 4. Open a new tab and run `ccr`.
 
-Updating later: replace the file — every already-open tab picks the new version up by itself on the next `ccr` (built-in stale-shell reload).
+</details>
 
 ## Usage
 
