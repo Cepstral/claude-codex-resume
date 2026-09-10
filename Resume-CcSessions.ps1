@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.16'
+$script:CcrVersion = '0.17'
 
 # PowerShell 5.1 has no $IsWindows automatic variable (and only runs on
 # Windows). pwsh 6+ provides it read-only.
@@ -700,7 +700,11 @@ function Select-CcrPath {
 function Select-CcrSession {
     param(
         [Parameter(Mandatory)][object[]]$Sessions,
-        [string]$InitialFilter = ''
+        [string]$InitialFilter = '',
+        # Set when no backend can open extra terminal surfaces here (not
+        # Windows Terminal, not inside tmux): marking a second session then
+        # shows a live warning that only the first will open.
+        [switch]$NoMultiOpen
     )
 
     if ([Console]::IsInputRedirected -or [Console]::IsOutputRedirected) {
@@ -748,6 +752,7 @@ function Select-CcrSession {
             [void]$sb.Append("`e[H")
             $counts = "$($view.Count)/$($Sessions.Count)"
             if ($sel.Count) { $counts += " $([char]0x00B7) $($sel.Count) marked" }
+            if ($NoMultiOpen -and $sel.Count -gt 1) { $counts += " ! only the first will open (no tmux)" }
             $hdr = "filter> $filter"
             $pad = $w - 1 - $hdr.Length - $counts.Length - 2
             if ($pad -lt 1) { $pad = 1 }
@@ -989,7 +994,8 @@ function Resume-CcSessions {
         $picked = if ($newPick) { [pscustomobject]@{ NewSessionPath = $newPick.Path; NewSessionTool = $newPick.Tool; NewSessionName = $newPick.Name } } else { $null }
     }
     else {
-        $picked = Select-CcrSession -Sessions $sorted -InitialFilter $filterText
+        $canMultiOpen = $IsWindows -or [bool]$env:TMUX
+    $picked = Select-CcrSession -Sessions $sorted -InitialFilter $filterText -NoMultiOpen:(-not $canMultiOpen)
     }
     if ($null -eq $picked) { Write-Host 'ccr: cancelled.'; return }
 
