@@ -4,6 +4,9 @@
 #  Dot-sourced from Microsoft.PowerShell_profile.ps1 (same folder). Defines the
 #  Resume-CcSessions function (alias: ccr) plus Ccr-prefixed helpers.
 #
+#  Cross-platform: Windows (tabs via Windows Terminal), macOS/Linux (windows
+#  via tmux; without tmux one session at a time, in the current terminal).
+#
 #  Data sources are the same files each tool's own resume feature reads - no
 #  databases, no external modules - so this keeps working across tool updates:
 #    claude : <config dir>\projects\<slug>\<uuid>.jsonl (bounded head/tail reads;
@@ -19,7 +22,11 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.15'
+$script:CcrVersion = '0.16'
+
+# PowerShell 5.1 has no $IsWindows automatic variable (and only runs on
+# Windows). pwsh 6+ provides it read-only.
+if ($PSVersionTable.PSVersion.Major -lt 6) { $script:IsWindows = $true }
 
 # Read the first/last $Bytes of a file as UTF-8 text. Opened with a permissive
 # share mode because claude/codex may be appending to the file right now.
@@ -119,11 +126,12 @@ function Format-CcrAge {
 function Format-CcrCwd {
     param([string]$Path, [int]$Max)
     if (-not $Path) { return '' }
+    $sep = [System.IO.Path]::DirectorySeparatorChar
     $p = $Path
     if ($p.StartsWith($HOME, [StringComparison]::OrdinalIgnoreCase)) { $p = '~' + $p.Substring($HOME.Length) }
     if ($p.Length -gt $Max) {
-        $segs = $p -split '\\' | Where-Object { $_ }
-        if ($segs.Count -ge 2) { $p = [char]0x2026 + '\' + ($segs[-2..-1] -join '\') }
+        $segs = $p -split '[\\/]' | Where-Object { $_ }
+        if ($segs.Count -ge 2) { $p = [string][char]0x2026 + $sep + ($segs[-2..-1] -join $sep) }
     }
     if ($p.Length -gt $Max -and $Max -ge 2) { $p = $p.Substring(0, $Max - 1) + [char]0x2026 }
     $p
@@ -274,9 +282,18 @@ function Get-CcrClaudeSession {
 function Get-CcrCodexRunningMap {
     $map = @{}
     try {
-        foreach ($p in Get-CimInstance Win32_Process -Filter "Name='codex.exe'" -ErrorAction Stop) {
+        $procs = if ($IsWindows) {
+            # CIM gives the full command line reliably on Windows.
+            Get-CimInstance Win32_Process -Filter "Name='codex.exe'" -ErrorAction Stop |
+                ForEach-Object { [pscustomobject]@{ Id = [int]$_.ProcessId; CommandLine = $_.CommandLine } }
+        }
+        else {
+            Get-Process -Name codex -ErrorAction Stop |
+                ForEach-Object { [pscustomobject]@{ Id = $_.Id; CommandLine = $_.CommandLine } }
+        }
+        foreach ($p in $procs) {
             if ($p.CommandLine -match '(?i)resume\s+([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})') {
-                $map[$Matches[1]] = [int]$p.ProcessId
+                $map[$Matches[1]] = $p.Id
             }
         }
     }
@@ -292,11 +309,15 @@ function Get-CcrCodexRunningMap {
 function Initialize-CcrSqlite {
     if ('CcrSqlite' -as [type]) { return }
     if (-not [Environment]::Is64BitProcess) { throw 'ccr: 32-bit host, sqlite disabled' }
-    Add-Type -TypeDefinition @'
+    # Windows ships winsqlite3.dll in System32; on macOS/Linux "sqlite3"
+    # resolves to libsqlite3.dylib / libsqlite3.so (if absent, the overlay
+    # silently degrades to first-prompt titles).
+    $lib = if ($IsWindows) { 'winsqlite3.dll' } else { 'sqlite3' }
+    Add-Type -TypeDefinition (@'
 using System;
 using System.Runtime.InteropServices;
 public static class CcrSqlite {
-    const string Dll = "winsqlite3.dll";
+    const string Dll = "__CCRSQLITELIB__";
     [DllImport(Dll)] public static extern int sqlite3_open_v2([MarshalAs(UnmanagedType.LPUTF8Str)] string filename, out IntPtr db, int flags, IntPtr vfs);
     [DllImport(Dll)] public static extern int sqlite3_prepare_v2(IntPtr db, [MarshalAs(UnmanagedType.LPUTF8Str)] string sql, int nByte, out IntPtr stmt, IntPtr tail);
     [DllImport(Dll)] public static extern int    sqlite3_step(IntPtr stmt);
@@ -304,7 +325,7 @@ public static class CcrSqlite {
     [DllImport(Dll)] public static extern int    sqlite3_finalize(IntPtr stmt);
     [DllImport(Dll)] public static extern int    sqlite3_close_v2(IntPtr db);
 }
-'@
+'@ -replace '__CCRSQLITELIB__', $lib)
 }
 
 function Get-CcrCodexTitleMap {
@@ -357,7 +378,7 @@ function Get-CcrCodexTitleMap {
     # catalog. Catalog values win; the index fills the gaps (last entry per id).
     try {
         $idx = @{}
-        foreach ($line in (Read-CcrHeadLines -Path (Join-Path $HOME '.codex\session_index.jsonl'))) {
+        foreach ($line in (Read-CcrHeadLines -Path (Join-Path $HOME '.codex/session_index.jsonl'))) {
             if (-not $line) { continue }
             try { $o = $line | ConvertFrom-Json } catch { continue }
             if ($o.id -and $o.thread_name) { $idx[$o.id] = $o.thread_name }
@@ -371,7 +392,7 @@ function Get-CcrCodexTitleMap {
 function Get-CcrCodexSession {
     [CmdletBinding()]
     param()
-    $root = Join-Path $HOME '.codex\sessions'
+    $root = Join-Path $HOME '.codex/sessions'
     if (-not (Test-Path -LiteralPath $root)) { return @() }
     $hist = $null   # ~\.codex\history.jsonl, loaded lazily only if a fallback is needed
     $running = Get-CcrCodexRunningMap
@@ -436,7 +457,7 @@ function Get-CcrCodexSession {
         else { $cwd = $HOME }
         if ($curated.ContainsKey($id)) { $title = ConvertTo-CcrTitle $curated[$id] }   # /rename wins
         if (-not $title) {
-            if ($null -eq $hist) { $hist = Get-CcrHistoryTable -Path (Join-Path $HOME '.codex\history.jsonl') -IdName 'session_id' }
+            if ($null -eq $hist) { $hist = Get-CcrHistoryTable -Path (Join-Path $HOME '.codex/history.jsonl') -IdName 'session_id' }
             $title = ConvertTo-CcrTitle $hist[$id].text
         }
         if (-not $title) { $title = '(session)' }
@@ -1023,23 +1044,29 @@ function Resume-CcSessions {
     if ($launch.Count -eq 0) { Write-Warning 'ccr: nothing to open.'; return }
 
     # The first selection takes over THIS tab (which would otherwise sit idle
-    # at a prompt); the rest open as new tabs. With -NewWindow, or when not on
-    # an interactive console, everything goes to wt instead.
+    # at a prompt); the rest open as new tabs. With -NewWindow (Windows only),
+    # or when not on an interactive console, everything goes to the terminal
+    # backend instead: Windows Terminal on Windows, tmux windows elsewhere.
+    if (-not $IsWindows) { $NewWindow = $false }
     $inline = $null
     $tabs = @($launch)
     if (-not $NewWindow -and -not [Console]::IsOutputRedirected) {
         $inline = $launch[0]
         $tabs = @($launch | Select-Object -Skip 1)
     }
+    if ($tabs.Count -gt 0 -and -not $IsWindows -and -not $env:TMUX) {
+        Write-Warning 'ccr: opening several sessions outside Windows needs tmux - only the first selection starts (in this tab).'
+        $tabs = @()
+    }
 
     # wt.exe args as a flat array; ';' as its own element needs no escaping.
     $wtArgs = @()
-    if ($tabs.Count -gt 0) {
+    if ($IsWindows -and $tabs.Count -gt 0) {
         $wtArgs = if ($NewWindow) { @('-w', 'new') } else { @('-w', '0') }
         $first = $true
         foreach ($s in $tabs) {
             if (-not $first) { $wtArgs += ';' }
-            $cwd = $s.Cwd.TrimEnd('\')
+            $cwd = $s.Cwd.TrimEnd('\', '/')
             if ($cwd -match '^[A-Za-z]:$') { $cwd += '\' }   # bare "D:" is drive-relative
             $title = "$($s.Tool) $([char]0x00B7) $($s.Title)" -replace '["\;]', ' '
             if ($title.Length -gt 40) { $title = $title.Substring(0, 39) + [char]0x2026 }
@@ -1049,8 +1076,15 @@ function Resume-CcSessions {
     }
 
     $what = ($launch | ForEach-Object { "$($_.Tool):$($_.Title)" }) -join ', '
-    if ($PSCmdlet.ShouldProcess($what, 'open as Windows Terminal tabs')) {
-        if ($tabs.Count -gt 0) { wt.exe @wtArgs }
+    if ($PSCmdlet.ShouldProcess($what, 'open as terminal tabs')) {
+        if ($tabs.Count -gt 0) {
+            if ($IsWindows) { wt.exe @wtArgs }
+            else {
+                # tmux runs the command via sh -c; the window closes when the
+                # agent exits. Command text is fixed words + a validated uuid.
+                foreach ($s in $tabs) { & tmux new-window -c $s.Cwd $s.Command }
+            }
+        }
         if ($inline) {
             # Run the first selection in this very shell, like `cc` does:
             # cd to the recorded folder and hand the tab over to the agent.
@@ -1067,6 +1101,9 @@ function Resume-CcSessions {
     }
     else {
         if ($inline) { "this tab: $($inline.Command)   (cd $($inline.Cwd))" }
-        if ($tabs.Count -gt 0) { "wt.exe $($wtArgs -join ' ')" }
+        if ($tabs.Count -gt 0) {
+            if ($IsWindows) { "wt.exe $($wtArgs -join ' ')" }
+            else { foreach ($s in $tabs) { "tmux new-window -c $($s.Cwd) '$($s.Command)'" } }
+        }
     }
 }

@@ -1,6 +1,6 @@
 # claude-codex-resume
 
-A multi-select resume picker for **Claude Code** and **OpenAI Codex CLI** conversations on Windows.
+A multi-select resume picker for **Claude Code** and **OpenAI Codex CLI** conversations — Windows first, macOS/Linux via tmux.
 
 `ccr` shows your past sessions from both tools in one list, sorted by last message. Mark the ones you want with `Space`, press `Enter`, and each reopens as a tab of your current Windows Terminal window — in its original working directory, with the right resume command.
 
@@ -30,8 +30,9 @@ If you work with several CLI agent sessions at once — one Windows Terminal win
 
 ## Requirements
 
-- Windows 10/11, [PowerShell 7+](https://github.com/PowerShell/PowerShell), [Windows Terminal](https://github.com/microsoft/terminal)
-- [Claude Code](https://code.claude.com) and/or [Codex CLI](https://github.com/openai/codex)
+- [PowerShell 7+](https://github.com/PowerShell/PowerShell) and [Claude Code](https://code.claude.com) and/or [Codex CLI](https://github.com/openai/codex)
+- **Windows 10/11**: [Windows Terminal](https://github.com/microsoft/terminal) (multiple selections open as tabs)
+- **macOS / Linux**: run inside [tmux](https://github.com/tmux/tmux) to open multiple selections as tmux windows; without tmux you can still resume one session at a time (it takes over the current terminal). The Codex title overlay needs a resolvable `libsqlite3`; without it, titles fall back to first prompts. *Note: the Unix path is young — feedback welcome.*
 
 ## Install
 
