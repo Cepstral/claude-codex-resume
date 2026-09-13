@@ -44,6 +44,12 @@ irm https://raw.githubusercontent.com/Cepstral/claude-codex-resume/main/install.
 
 From a clone: `.\install.ps1`. To update later, just re-run it (open tabs pick the new version up by themselves on the next `ccr`).
 
+If the raw URL isn't reachable (e.g. a private fork), install through the authenticated [GitHub CLI](https://cli.github.com) instead — the installer then also downloads the script via `gh`:
+
+```powershell
+gh api repos/Cepstral/claude-codex-resume/contents/install.ps1 -H "Accept: application/vnd.github.raw" | Out-String | iex
+```
+
 <details>
 <summary>Manual install</summary>
 
