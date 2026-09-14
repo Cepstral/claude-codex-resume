@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.18'
+$script:CcrVersion = '0.21'
 
 # PowerShell 5.1 has no $IsWindows automatic variable (and only runs on
 # Windows). pwsh 6+ provides it read-only.
@@ -647,10 +647,46 @@ function Read-CcrInput {
     finally { [Console]::Write("`e[?25l") }
 }
 
+# Tool chooser for a NEW conversation: claude or codex. Returns the tool
+# name, or $null on Esc. Runs inside the caller's alt buffer.
+function Select-CcrTool {
+    $tools = @(
+        [pscustomobject]@{ Name = 'claude'; Color = "`e[38;5;208m"; Note = 'asks for a session name' },
+        [pscustomobject]@{ Name = 'codex'; Color = "`e[36m"; Note = 'no start name - /rename inside' }
+    )
+    $cursor = 0
+    while ($true) {
+        $sb = [System.Text.StringBuilder]::new()
+        [void]$sb.Append("`e[H").Append('tool for the new conversation').Append("`e[K`n")
+        [void]$sb.Append("`e[2m$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Enter choose $([char]0x00B7) c / x jump $([char]0x00B7) Esc back`e[22m`e[K")
+        for ($i = 0; $i -lt $tools.Count; $i++) {
+            $t = $tools[$i]
+            $row = "  $($t.Color)$($t.Name.PadRight(8))`e[39m `e[2m$($t.Note)`e[22m"
+            if ($i -eq $cursor) { $row = "`e[7m$row`e[27m" }
+            [void]$sb.Append("`n").Append($row).Append("`e[K")
+        }
+        [void]$sb.Append("`e[J")
+        [Console]::Write($sb.ToString())
+        $k = [Console]::ReadKey($true)
+        if ($k.Key -eq [ConsoleKey]::C -and ($k.Modifiers -band [ConsoleModifiers]::Control)) { return $null }
+        switch ($k.Key) {
+            'UpArrow' { if ($cursor -gt 0) { $cursor-- } }
+            'DownArrow' { if ($cursor -lt $tools.Count - 1) { $cursor++ } }
+            'Enter' { return $tools[$cursor].Name }
+            'Escape' { return $null }
+            default {
+                # First-letter shortcuts: c = claude, x = codex.
+                if ($k.KeyChar -eq 'c') { return 'claude' }
+                if ($k.KeyChar -eq 'x') { return 'codex' }
+            }
+        }
+    }
+}
+
 # Folder chooser for a NEW conversation (Ctrl+N): every path used by any
-# listed session, most recently used first, with session counts. Enter picks
-# the folder for claude and asks for a session name (claude --name; empty =
-# claude's auto title); Tab starts codex directly (codex has no start-name
+# listed session, most recently used first, with session counts. Enter on a
+# folder asks which tool (claude or codex), then - for claude - a session
+# name (claude --name; empty = claude's auto title; codex has no start-name
 # flag - /rename inside). Returns @{ Path; Tool; Name } or $null to go back.
 # Runs inside the caller's alt buffer.
 function Select-CcrPath {
@@ -687,7 +723,7 @@ function Select-CcrPath {
         $line1 = $hdr + (' ' * $pad) + $counts
         if ($line1.Length -gt $w - 1) { $line1 = $line1.Substring(0, $w - 1) }
         [void]$sb.Append($line1).Append("`e[K`n")
-        $hint = "Enter claude here (asks name) $([char]0x00B7) Tab codex here $([char]0x00B7) Esc back $([char]0x00B7) type to filter"
+        $hint = "Enter choose folder (then tool, name) $([char]0x00B7) Esc back $([char]0x00B7) type to filter"
         if ($hint.Length -gt $w - 1) { $hint = $hint.Substring(0, $w - 1) }
         [void]$sb.Append("`e[2m").Append($hint).Append("`e[22m`e[K")
 
@@ -720,15 +756,21 @@ function Select-CcrPath {
             'End' { $cursor = [Math]::Max($view.Count - 1, 0) }
             'Enter' {
                 if ($view.Count -gt 0) {
-                    $name = Read-CcrInput -Prompt 'name> ' -Text $InitialName `
-                        -Hint "session name for claude $([char]0x00B7) Enter confirm (empty = auto title) $([char]0x00B7) Esc back"
-                    if ($null -ne $name) {
-                        return [pscustomobject]@{ Path = $view[$cursor].Path; Tool = 'claude'; Name = $name.Trim() }
+                    # Folder -> tool -> (claude only) name. Esc at any step comes
+                    # back here and repaints the folder list.
+                    $tool = Select-CcrTool
+                    if ($tool -eq 'codex') {
+                        return [pscustomobject]@{ Path = $view[$cursor].Path; Tool = 'codex'; Name = '' }
                     }
-                    # Esc in the name box: fall through and repaint the folder list.
+                    if ($tool -eq 'claude') {
+                        $name = Read-CcrInput -Prompt 'name> ' -Text $InitialName `
+                            -Hint "session name for claude $([char]0x00B7) Enter confirm (empty = auto title) $([char]0x00B7) Esc back"
+                        if ($null -ne $name) {
+                            return [pscustomobject]@{ Path = $view[$cursor].Path; Tool = 'claude'; Name = $name.Trim() }
+                        }
+                    }
                 }
             }
-            'Tab' { if ($view.Count -gt 0) { return [pscustomobject]@{ Path = $view[$cursor].Path; Tool = 'codex'; Name = '' } } }
             'Escape' {
                 if ($filter) { $filter = ''; $cursor = 0; $top = 0 }
                 else { return $null }
@@ -971,7 +1013,8 @@ function Resume-CcSessions {
         Start a NEW conversation: pick from every folder past sessions used,
         most recently used first. Enter asks for a session name and starts
         claude there in this tab (empty name = claude's auto title); Tab
-        starts codex directly. Same menu as Ctrl+N inside the picker.
+        Enter on a folder asks which tool (claude or codex; c / x jump), then
+        for claude a session name. Same menu as Ctrl+N inside the picker.
     .EXAMPLE
         ccr -n Kitchen renovation
         Same, with the name box prefilled to "Kitchen renovation".
