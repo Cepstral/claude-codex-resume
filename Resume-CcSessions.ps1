@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.19'
+$script:CcrVersion = '0.20'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -154,30 +154,164 @@ function Get-CcrClaudeRoot {
     if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { Join-Path $HOME '.claude' }
 }
 
-# All Claude config dirs ccr should scan, as @{ Label; Path; Default }.
-# One account (no ccr.json): a single unlabeled root = Get-CcrClaudeRoot, so
-# behavior is unchanged. Several accounts: ccr.json lists one config dir per
-# account, each with its own `claude auth login` inside:
-#   { "claudeRoots": { "personal": "~/.claude", "work": "~/.claude-work" },
+# Codex's data dir: CODEX_HOME when set, else the stock ~\.codex. Holds
+# auth.json, config.toml, sessions/ and the thread catalog.
+function Get-CcrCodexRoot {
+    if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
+}
+
+# Parsed ccr.json (or $null when absent/unreadable).
+function Get-CcrConfig {
+    $cfgPath = $script:CcrConfigPath
+    if (-not $cfgPath -or -not (Test-Path -LiteralPath $cfgPath)) { return $null }
+    try { Get-Content -LiteralPath $cfgPath -Raw | ConvertFrom-Json }
+    catch { Write-Warning "ccr: cannot read $cfgPath ($_) - using the single default config dirs"; $null }
+}
+
+function Expand-CcrPath([string]$Path) {
+    if ($Path -match '^~([\\/]|$)') { $Path = $HOME + $Path.Substring(1) }
+    $Path = [System.Environment]::ExpandEnvironmentVariables($Path)
+    try { [System.IO.Path]::GetFullPath($Path) } catch { $Path }   # normalizes separators
+}
+
+# All config dirs ccr should scan for one tool, as @{ Label; Path; Default }.
+# One account (no ccr.json, or no entry for the tool): a single unlabeled
+# root = the tool's default dir, so behavior is unchanged. Several accounts:
+# ccr.json lists one config dir per account label, each with its own login
+# inside (`claude auth login` / `codex login` run with the dir selected):
+#   { "claudeRoots": { "personal": "~/.claude",  "work": "~/.claude-work" },
+#     "codexRoots":  { "personal": "~/.codex",   "work": "~/.codex-work" },
 #     "defaultRoot": "personal" }
 # "~" and %VAR% expand; a missing dir is kept (it may exist on another PC).
-function Get-CcrClaudeRoots {
-    $single = @([pscustomobject]@{ Label = ''; Path = (Get-CcrClaudeRoot); Default = $true })
-    $cfgPath = $script:CcrConfigPath
-    if (-not $cfgPath -or -not (Test-Path -LiteralPath $cfgPath)) { return $single }
-    try { $cfg = Get-Content -LiteralPath $cfgPath -Raw | ConvertFrom-Json }
-    catch { Write-Warning "ccr: cannot read $cfgPath ($_) - using the single default config dir"; return $single }
-    if (-not $cfg.claudeRoots) { return $single }
-    $roots = @(foreach ($p in $cfg.claudeRoots.PSObject.Properties) {
-            $path = [string]$p.Value
-            if ($path -match '^~([\\/]|$)') { $path = $HOME + $path.Substring(1) }
-            $path = [System.Environment]::ExpandEnvironmentVariables($path)
-            try { $path = [System.IO.Path]::GetFullPath($path) } catch { }   # normalizes separators
-            [pscustomobject]@{ Label = $p.Name; Path = $path; Default = ($p.Name -eq [string]$cfg.defaultRoot) }
+function Get-CcrRoots {
+    param([Parameter(Mandatory)][ValidateSet('claude', 'codex')][string]$Tool)
+    $defaultPath = if ($Tool -eq 'claude') { Get-CcrClaudeRoot } else { Get-CcrCodexRoot }
+    $single = @([pscustomobject]@{ Label = ''; Path = $defaultPath; Default = $true })
+    $cfg = Get-CcrConfig
+    if (-not $cfg) { return $single }
+    $map = if ($Tool -eq 'claude') { $cfg.claudeRoots } else { $cfg.codexRoots }
+    if (-not $map) { return $single }
+    $roots = @(foreach ($p in $map.PSObject.Properties) {
+            [pscustomobject]@{ Label = $p.Name; Path = (Expand-CcrPath ([string]$p.Value)); Default = ($p.Name -eq [string]$cfg.defaultRoot) }
         })
     if ($roots.Count -eq 0) { return $single }
     if (-not ($roots | Where-Object Default)) { $roots[0].Default = $true }
     $roots
+}
+function Get-CcrClaudeRoots { Get-CcrRoots -Tool claude }
+function Get-CcrCodexRoots { Get-CcrRoots -Tool codex }
+
+# --- account management (ccr -Accounts / -AddAccount / -RemoveAccount) -------
+
+# Who is logged in inside a config dir, without touching the live default
+# dir: run the tool's own status command with the dir selected.
+function Get-CcrLoginIdentity {
+    param([Parameter(Mandatory)][ValidateSet('claude', 'codex')][string]$Tool, [Parameter(Mandatory)][string]$RootPath)
+    if (-not (Test-Path -LiteralPath $RootPath)) { return '(dir missing)' }
+    $var = if ($Tool -eq 'claude') { 'CLAUDE_CONFIG_DIR' } else { 'CODEX_HOME' }
+    $prev = [System.Environment]::GetEnvironmentVariable($var)
+    [System.Environment]::SetEnvironmentVariable($var, $RootPath)
+    try {
+        if ($Tool -eq 'claude') {
+            $raw = & claude auth status --json 2>$null | Out-String
+            try { $j = $raw | ConvertFrom-Json } catch { return '(unknown)' }
+            if (-not $j.loggedIn) { return 'not logged in' }
+            $who = if ($j.email) { $j.email } else { $j.authMethod }
+            if ($j.subscriptionType) { "$who ($($j.subscriptionType))" } else { "$who" }
+        }
+        else {
+            # codex writes its status line to stderr.
+            $line = (& codex login status 2>&1 | ForEach-Object { "$_" } | Where-Object { $_ -and $_ -notmatch '^WARNING' } | Select-Object -First 1)
+            if ($line) { "$line".Trim() }
+            elseif (Test-Path -LiteralPath (Join-Path $RootPath 'auth.json')) { 'logged in (auth.json present)' }
+            else { 'not logged in' }
+        }
+    }
+    catch { '(unknown)' }
+    finally { [System.Environment]::SetEnvironmentVariable($var, $prev) }
+}
+
+function Show-CcrAccounts {
+    $cfg = Get-CcrConfig
+    if (-not $cfg -or (-not $cfg.claudeRoots -and -not $cfg.codexRoots)) {
+        Write-Host "ccr: no accounts configured (single default config dirs). Add one with: ccr -AddAccount <label>"
+        Write-Host "  config file: $($script:CcrConfigPath)"
+        return
+    }
+    Write-Host "accounts in $($script:CcrConfigPath)  (default: $($cfg.defaultRoot))"
+    foreach ($tool in 'claude', 'codex') {
+        $roots = @(Get-CcrRoots -Tool $tool)
+        if ($roots.Count -eq 1 -and -not $roots[0].Label) { Write-Host "  ${tool}: single default dir $($roots[0].Path)"; continue }
+        foreach ($r in $roots) {
+            $who = Get-CcrLoginIdentity -Tool $tool -RootPath $r.Path
+            Write-Host ("  {0,-6} {1,-12} {2,-45} {3}" -f $tool, $r.Label, (Format-CcrCwd $r.Path 45), $who)
+        }
+    }
+}
+
+# Write ccr.json back. Only the keys ccr owns are touched.
+function Save-CcrConfig([object]$Config) {
+    if (-not $script:CcrConfigPath) { throw 'ccr: no config path (load the script from a file, or set $env:CCR_CONFIG)' }
+    $Config | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $script:CcrConfigPath -Encoding utf8NoBOM
+}
+
+# Register a new account: one fresh config dir per tool next to the default
+# one (~/.claude-<label>, ~/.codex-<label>), the tool's own interactive
+# login run inside it, and the entry recorded in ccr.json. The first call
+# also records the CURRENT default dirs under a label so existing sessions
+# keep an account name.
+function Add-CcrAccount {
+    param([Parameter(Mandatory)][string]$Label, [string]$Tool = 'all')
+    if ($Label -notmatch '^[A-Za-z0-9_-]{1,20}$') { Write-Error "ccr: account label must be 1-20 letters/digits/_/- (got '$Label')"; return }
+    $cfg = Get-CcrConfig
+    if (-not $cfg) { $cfg = [pscustomobject]@{} }
+    foreach ($key in 'claudeRoots', 'codexRoots') {
+        if (-not $cfg.PSObject.Properties[$key]) { $cfg | Add-Member -NotePropertyName $key -NotePropertyValue ([pscustomobject]@{}) }
+    }
+    $tools = if ($Tool -eq 'all') { @('claude', 'codex') } else { @($Tool) }
+    $firstTime = -not ($cfg.claudeRoots.PSObject.Properties.Count -or $cfg.codexRoots.PSObject.Properties.Count)
+    if ($firstTime) {
+        # Give the existing default dirs a name so their sessions stay listed.
+        $existing = Read-Host 'label for the CURRENT login/dirs (e.g. personal)'
+        if ($existing -notmatch '^[A-Za-z0-9_-]{1,20}$' -or $existing -eq $Label) { Write-Error 'ccr: invalid or duplicate label'; return }
+        $cfg.claudeRoots | Add-Member -NotePropertyName $existing -NotePropertyValue (Get-CcrClaudeRoot)
+        $cfg.codexRoots | Add-Member -NotePropertyName $existing -NotePropertyValue (Get-CcrCodexRoot)
+        $cfg | Add-Member -NotePropertyName defaultRoot -NotePropertyValue $existing -Force
+    }
+    foreach ($t in $tools) {
+        $map = if ($t -eq 'claude') { $cfg.claudeRoots } else { $cfg.codexRoots }
+        if ($map.PSObject.Properties[$Label]) { Write-Warning "ccr: $t account '$Label' already configured - skipping"; continue }
+        $dir = Join-Path $HOME ".$t-$Label"
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        $map | Add-Member -NotePropertyName $Label -NotePropertyValue $dir
+        Save-CcrConfig $cfg   # record first, so an aborted login still leaves a usable entry
+        Write-Host "ccr: $t account '$Label' -> $dir  - starting the $t login flow in that dir" -ForegroundColor Yellow
+        $var = if ($t -eq 'claude') { 'CLAUDE_CONFIG_DIR' } else { 'CODEX_HOME' }
+        $prev = [System.Environment]::GetEnvironmentVariable($var)
+        [System.Environment]::SetEnvironmentVariable($var, $dir)
+        try { if ($t -eq 'claude') { & claude auth login } else { & codex login } }
+        finally { [System.Environment]::SetEnvironmentVariable($var, $prev) }
+    }
+    Write-Host ''
+    Show-CcrAccounts
+}
+
+function Remove-CcrAccount {
+    param([Parameter(Mandatory)][string]$Label)
+    $cfg = Get-CcrConfig
+    if (-not $cfg) { Write-Error 'ccr: no accounts configured'; return }
+    $hit = $false
+    foreach ($key in 'claudeRoots', 'codexRoots') {
+        $map = $cfg.$key
+        if ($map -and $map.PSObject.Properties[$Label]) { $map.PSObject.Properties.Remove($Label); $hit = $true }
+    }
+    if (-not $hit) { Write-Error "ccr: no account '$Label' configured"; return }
+    if ($cfg.defaultRoot -eq $Label) {
+        $left = @($cfg.claudeRoots.PSObject.Properties.Name) + @($cfg.codexRoots.PSObject.Properties.Name) | Select-Object -Unique -First 1
+        $cfg.defaultRoot = "$left"
+    }
+    Save-CcrConfig $cfg
+    Write-Host "ccr: account '$Label' forgotten (its config dirs and sessions were NOT deleted)."
 }
 
 # sessionId -> live claude process id (stale pid files filtered out).
@@ -420,9 +554,10 @@ public static class CcrSqlite {
 }
 
 function Get-CcrCodexTitleMap {
+    param([string]$RootPath = (Get-CcrCodexRoot))
     $map = @{}
     try {
-        $stateDb = Get-ChildItem -LiteralPath (Join-Path $HOME '.codex') -Filter 'state_*.sqlite' -File -ErrorAction Stop |
+        $stateDb = Get-ChildItem -LiteralPath $RootPath -Filter 'state_*.sqlite' -File -ErrorAction Stop |
             Where-Object { $_.BaseName -match '^state_\d+$' } |
             Sort-Object { [int]($_.BaseName -replace '^state_', '') } |
             Select-Object -Last 1
@@ -469,7 +604,7 @@ function Get-CcrCodexTitleMap {
     # catalog. Catalog values win; the index fills the gaps (last entry per id).
     try {
         $idx = @{}
-        foreach ($line in (Read-CcrHeadLines -Path (Join-Path $HOME '.codex/session_index.jsonl'))) {
+        foreach ($line in (Read-CcrHeadLines -Path (Join-Path $RootPath 'session_index.jsonl'))) {
             if (-not $line) { continue }
             try { $o = $line | ConvertFrom-Json } catch { continue }
             if ($o.id -and $o.thread_name) { $idx[$o.id] = $o.thread_name }
@@ -482,14 +617,18 @@ function Get-CcrCodexTitleMap {
 
 function Get-CcrCodexSession {
     [CmdletBinding()]
-    param()
-    $root = Join-Path $HOME '.codex/sessions'
-    if (-not (Test-Path -LiteralPath $root)) { return @() }
-    $hist = $null   # ~\.codex\history.jsonl, loaded lazily only if a fallback is needed
+    param(
+        # One entry from Get-CcrCodexRoots; omitted = the single default root.
+        [object]$Root = $null
+    )
+    if (-not $Root) { $Root = [pscustomobject]@{ Label = ''; Path = (Get-CcrCodexRoot); Default = $true } }
+    $sessRoot = Join-Path $Root.Path 'sessions'
+    if (-not (Test-Path -LiteralPath $sessRoot)) { return @() }
+    $hist = $null   # <root>\history.jsonl, loaded lazily only if a fallback is needed
     $running = Get-CcrCodexRunningMap
-    $curated = Get-CcrCodexTitleMap
+    $curated = Get-CcrCodexTitleMap -RootPath $Root.Path
 
-    $files = Get-ChildItem -LiteralPath $root -Recurse -Filter 'rollout-*.jsonl' -File -ErrorAction SilentlyContinue
+    $files = Get-ChildItem -LiteralPath $sessRoot -Recurse -Filter 'rollout-*.jsonl' -File -ErrorAction SilentlyContinue
     $out = foreach ($file in $files) {
         $m = [regex]::Match($file.Name, '-([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.jsonl$')
         if (-not $m.Success) { continue }
@@ -548,7 +687,7 @@ function Get-CcrCodexSession {
         else { $cwd = $HOME }
         if ($curated.ContainsKey($id)) { $title = ConvertTo-CcrTitle $curated[$id] }   # /rename wins
         if (-not $title) {
-            if ($null -eq $hist) { $hist = Get-CcrHistoryTable -Path (Join-Path $HOME '.codex/history.jsonl') -IdName 'session_id' }
+            if ($null -eq $hist) { $hist = Get-CcrHistoryTable -Path (Join-Path $Root.Path 'history.jsonl') -IdName 'session_id' }
             $title = ConvertTo-CcrTitle $hist[$id].text
         }
         if (-not $title) { $title = '(session)' }
@@ -562,6 +701,8 @@ function Get-CcrCodexSession {
             Running      = $running.ContainsKey($id)
             ProcessId    = $running[$id]
             Source       = $file.FullName
+            Root         = $Root.Label
+            RootPath     = $Root.Path
         }
     }
     @($out)
@@ -726,7 +867,8 @@ function Select-CcrPath {
     param(
         [Parameter(Mandatory)][object[]]$Sessions,
         [string]$InitialName = '',
-        [object[]]$Roots = @()
+        [object[]]$ClaudeRoots = @(),
+        [object[]]$CodexRoots = @()
     )
     $groups = @($Sessions | Group-Object { $_.Cwd.ToLowerInvariant() } | ForEach-Object {
             $latest = ($_.Group | Sort-Object LastActivity -Descending)[0]
@@ -793,16 +935,24 @@ function Select-CcrPath {
                     $name = Read-CcrInput -Prompt 'name> ' -Text $InitialName `
                         -Hint "session name for claude $([char]0x00B7) Enter confirm (empty = auto title) $([char]0x00B7) Esc back"
                     if ($null -ne $name) {
-                        $rootLabel = if ($Roots.Count -gt 1) { Select-CcrRoot -Roots $Roots }
-                        elseif ($Roots.Count -eq 1) { $Roots[0].Label } else { $null }
-                        if ($Roots.Count -le 1 -or $null -ne $rootLabel) {
+                        $rootLabel = if ($ClaudeRoots.Count -gt 1) { Select-CcrRoot -Roots $ClaudeRoots }
+                        elseif ($ClaudeRoots.Count -eq 1) { $ClaudeRoots[0].Label } else { $null }
+                        if ($ClaudeRoots.Count -le 1 -or $null -ne $rootLabel) {
                             return [pscustomobject]@{ Path = $view[$cursor].Path; Tool = 'claude'; Name = $name.Trim(); Root = $rootLabel }
                         }
                     }
                     # Esc in the name or account box: fall through and repaint the folder list.
                 }
             }
-            'Tab' { if ($view.Count -gt 0) { return [pscustomobject]@{ Path = $view[$cursor].Path; Tool = 'codex'; Name = ''; Root = $null } } }
+            'Tab' {
+                if ($view.Count -gt 0) {
+                    $rootLabel = if ($CodexRoots.Count -gt 1) { Select-CcrRoot -Roots $CodexRoots }
+                    elseif ($CodexRoots.Count -eq 1) { $CodexRoots[0].Label } else { $null }
+                    if ($CodexRoots.Count -le 1 -or $null -ne $rootLabel) {
+                        return [pscustomobject]@{ Path = $view[$cursor].Path; Tool = 'codex'; Name = ''; Root = $rootLabel }
+                    }
+                }
+            }
             'Escape' {
                 if ($filter) { $filter = ''; $cursor = 0; $top = 0 }
                 else { return $null }
@@ -830,12 +980,16 @@ function Select-CcrSession {
         # Windows Terminal, not inside tmux): marking a second session then
         # shows a live warning that only the first will open.
         [switch]$NoMultiOpen,
-        # Claude config dirs in play; more than one adds an account column and
-        # an account step to Ctrl+N.
-        [object[]]$Roots = @()
+        # Config dirs (accounts) in play per tool; more than one for either
+        # tool adds an account column and an account step to Ctrl+N.
+        [object[]]$ClaudeRoots = @(),
+        [object[]]$CodexRoots = @()
     )
-    $multiRoot = $Roots.Count -gt 1
-    $rootW = if ($multiRoot) { [Math]::Min(10, ($Roots | ForEach-Object { $_.Label.Length } | Measure-Object -Maximum).Maximum) } else { 0 }
+    $multiRoot = ($ClaudeRoots.Count -gt 1) -or ($CodexRoots.Count -gt 1)
+    $rootW = if ($multiRoot) {
+        [Math]::Min(10, (@($ClaudeRoots) + @($CodexRoots) | ForEach-Object { "$($_.Label)".Length } | Measure-Object -Maximum).Maximum)
+    }
+    else { 0 }
 
     if ([Console]::IsInputRedirected -or [Console]::IsOutputRedirected) {
         Write-Error 'ccr: needs an interactive console.'
@@ -937,7 +1091,7 @@ function Select-CcrSession {
             if ($k.Key -eq [ConsoleKey]::C -and ($k.Modifiers -band [ConsoleModifiers]::Control)) { return $null }
             if ($k.Key -eq [ConsoleKey]::N -and ($k.Modifiers -band [ConsoleModifiers]::Control)) {
                 # Ctrl+N: pick a folder (and tool, and account) for a brand-new conversation.
-                $newPick = Select-CcrPath -Sessions $Sessions -Roots $Roots
+                $newPick = Select-CcrPath -Sessions $Sessions -ClaudeRoots $ClaudeRoots -CodexRoots $CodexRoots
                 if ($newPick) { return [pscustomobject]@{ NewSessionPath = $newPick.Path; NewSessionTool = $newPick.Tool; NewSessionName = $newPick.Name; NewSessionRoot = $newPick.Root } }
                 continue
             }
@@ -1071,12 +1225,20 @@ function Resume-CcSessions {
         ccr -WhatIf
         Run the picker, then print the wt.exe command line instead of launching.
     .EXAMPLE
+        ccr -AddAccount work
+        Set up a second account for claude and codex: ccr creates one data dir
+        per tool (~/.claude-work, ~/.codex-work), runs each tool's own login
+        flow inside it, and records both in ccr.json next to this script. The
+        first time it also asks for a label for the current login (e.g.
+        "personal"). ccr -Accounts shows who is logged in where;
+        ccr -RemoveAccount work forgets the entry (nothing is deleted).
+    .EXAMPLE
         ccr -Root work
-        With several accounts configured (ccr.json next to this script, one
-        Claude config dir per account), list only the "work" account's
+        With several accounts configured, list only the "work" account's
         sessions. Without -Root every account is listed, with an account
-        column; a session always resumes under the account it belongs to,
-        and Ctrl+N asks which account a new conversation goes to.
+        column; a session always resumes under the account it belongs to
+        (CLAUDE_CONFIG_DIR / CODEX_HOME set per launched process), and
+        Ctrl+N asks which account a new conversation goes to.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     [Alias('ccr')]
@@ -1094,7 +1256,15 @@ function Resume-CcSessions {
         [switch]$NewWindow,
         # Multi-account: restrict the list to one configured account (label
         # from ccr.json). Also the account Ctrl+N/-n defaults to.
-        [string]$Root = ''
+        [string]$Root = '',
+        # Multi-account management: -Accounts lists the configured accounts
+        # and their login state; -AddAccount <label> creates the config dirs
+        # for a new account (per -Tool), runs the tools' own login flows in
+        # them, and records them in ccr.json; -RemoveAccount <label> only
+        # forgets the entry (no data is deleted).
+        [switch]$Accounts,
+        [string]$AddAccount = '',
+        [string]$RemoveAccount = ''
     )
     $filterText = if ($Filter) { ($Filter -join ' ').Trim() } else { '' }
 
@@ -1123,27 +1293,36 @@ function Resume-CcSessions {
     }
     catch { }
 
-    # Claude config dirs (accounts). One unlabeled root unless ccr.json says
-    # otherwise; -Root narrows the LISTING to a single configured account.
+    # --- account management (multi-account) --------------------------------
+    if ($Accounts) { Show-CcrAccounts; return }
+    if ($AddAccount) { Add-CcrAccount -Label $AddAccount -Tool $Tool; return }
+    if ($RemoveAccount) { Remove-CcrAccount -Label $RemoveAccount; return }
+
+    # Config dirs (accounts) per tool. One unlabeled root each unless ccr.json
+    # says otherwise; -Root narrows the LISTING to a single configured account.
     # Multi-account mode (explicit config dir on every launch) depends on how
-    # many accounts are configured, not on how many are listed - a session
-    # must always start under its own account's dir.
-    $allRoots = @(Get-CcrClaudeRoots)
-    $multiRoot = $allRoots.Count -gt 1
-    $roots = $allRoots
+    # many accounts are configured for that tool, not on how many are listed:
+    # a session must always start under its own account's dir.
+    $allClaudeRoots = @(Get-CcrClaudeRoots)
+    $allCodexRoots = @(Get-CcrCodexRoots)
+    $multiClaude = $allClaudeRoots.Count -gt 1
+    $multiCodex = $allCodexRoots.Count -gt 1
+    $claudeRoots = $allClaudeRoots
+    $codexRoots = $allCodexRoots
     if ($Root) {
-        $pick = @($allRoots | Where-Object { $_.Label -eq $Root })
-        if ($pick.Count -eq 0) {
-            Write-Error "ccr: no account '$Root' in $($script:CcrConfigPath) (known: $(($allRoots.Label | Where-Object { $_ }) -join ', '))"
+        $known = @(@($allClaudeRoots.Label) + @($allCodexRoots.Label) | Where-Object { $_ } | Select-Object -Unique)
+        if ($Root -notin $known) {
+            Write-Error "ccr: no account '$Root' in $($script:CcrConfigPath) (known: $($known -join ', '))"
             return
         }
-        $roots = $pick
-        $roots[0].Default = $true
+        $claudeRoots = @($allClaudeRoots | Where-Object { $_.Label -eq $Root })
+        $codexRoots = @($allCodexRoots | Where-Object { $_.Label -eq $Root })
+        foreach ($r in @($claudeRoots) + @($codexRoots)) { $r.Default = $true }
     }
 
     $sessions = [System.Collections.Generic.List[object]]::new()
-    if ($Tool -in 'claude', 'all') { foreach ($r in $roots) { foreach ($s in Get-CcrClaudeSession -Root $r) { $sessions.Add($s) } } }
-    if ($Tool -in 'codex', 'all') { foreach ($s in Get-CcrCodexSession) { $sessions.Add($s) } }
+    if ($Tool -in 'claude', 'all') { foreach ($r in $claudeRoots) { foreach ($s in Get-CcrClaudeSession -Root $r) { $sessions.Add($s) } } }
+    if ($Tool -in 'codex', 'all') { foreach ($r in $codexRoots) { foreach ($s in Get-CcrCodexSession -Root $r) { $sessions.Add($s) } } }
     if ($sessions.Count -eq 0) { Write-Warning 'ccr: no sessions found.'; return }
 
     $sorted = @($sessions | Sort-Object LastActivity -Descending)
@@ -1161,7 +1340,7 @@ function Resume-CcSessions {
         [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
         [Console]::Write("`e[?1049h`e[?25l")
         # Any text after `ccr -n` prefills the NAME box, not the folder filter.
-        try { $newPick = Select-CcrPath -Sessions $sorted -InitialName $filterText -Roots $roots }
+        try { $newPick = Select-CcrPath -Sessions $sorted -InitialName $filterText -ClaudeRoots $claudeRoots -CodexRoots $codexRoots }
         finally {
             [Console]::Write("`e[?25h`e[?1049l")
             [Console]::OutputEncoding = $prevEnc
@@ -1171,23 +1350,29 @@ function Resume-CcSessions {
     }
     else {
         $canMultiOpen = $IsWindows -or [bool]$env:TMUX
-        $picked = Select-CcrSession -Sessions $sorted -InitialFilter $filterText -NoMultiOpen:(-not $canMultiOpen) -Roots $roots
+        $picked = Select-CcrSession -Sessions $sorted -InitialFilter $filterText -NoMultiOpen:(-not $canMultiOpen) -ClaudeRoots $claudeRoots -CodexRoots $codexRoots
     }
     if ($null -eq $picked) { Write-Host 'ccr: cancelled.'; return }
 
-    # With several accounts, a claude process must see the config dir of the
-    # account its conversation belongs to. In this shell that is a scoped env
-    # change around the call; in new tabs it is prefixed to the command.
-    function Invoke-CcrWithRoot([string]$RootPath, [scriptblock]$Body) {
-        if (-not $multiRoot -or -not $RootPath) { & $Body; return }
-        $prev = $env:CLAUDE_CONFIG_DIR
-        $env:CLAUDE_CONFIG_DIR = $RootPath
-        try { & $Body } finally { $env:CLAUDE_CONFIG_DIR = $prev }
+    # With several accounts, a tool process must see the config dir of the
+    # account its conversation belongs to (CLAUDE_CONFIG_DIR / CODEX_HOME). In
+    # this shell that is a scoped env change around the call; in new tabs it
+    # is prefixed to the command. Single-account tools get no override.
+    function Get-CcrRootVar([string]$ToolName) {
+        if ($ToolName -eq 'codex') { if ($multiCodex) { 'CODEX_HOME' } } elseif ($multiClaude) { 'CLAUDE_CONFIG_DIR' }
     }
-    function Get-CcrRootPrefix([string]$RootPath, [string]$Shell) {
-        if (-not $multiRoot -or -not $RootPath) { return '' }
-        if ($Shell -eq 'sh') { "CLAUDE_CONFIG_DIR='$($RootPath -replace "'", "'\''")' " }
-        else { "`$env:CLAUDE_CONFIG_DIR='$($RootPath -replace "'", "''")'; " }
+    function Invoke-CcrWithRoot([string]$ToolName, [string]$RootPath, [scriptblock]$Body) {
+        $var = Get-CcrRootVar $ToolName
+        if (-not $var -or -not $RootPath) { & $Body; return }
+        $prev = [System.Environment]::GetEnvironmentVariable($var)
+        [System.Environment]::SetEnvironmentVariable($var, $RootPath)
+        try { & $Body } finally { [System.Environment]::SetEnvironmentVariable($var, $prev) }
+    }
+    function Get-CcrRootPrefix([string]$ToolName, [string]$RootPath, [string]$Shell) {
+        $var = Get-CcrRootVar $ToolName
+        if (-not $var -or -not $RootPath) { return '' }
+        if ($Shell -eq 'sh') { "$var='$($RootPath -replace "'", "'\''")' " }
+        else { "`$env:$var='$($RootPath -replace "'", "''")'; " }
     }
 
     # New-conversation flow (Ctrl+N or -n): take over this tab, cc-style.
@@ -1197,10 +1382,11 @@ function Resume-CcSessions {
         $newTool = if ($single.NewSessionTool -eq 'codex') { 'codex' } else { 'claude' }
         $newName = if ($single.PSObject.Properties['NewSessionName']) { "$($single.NewSessionName)".Trim() } else { '' }
         $newRoot = $null
-        if ($newTool -eq 'claude' -and $multiRoot) {
+        $toolRoots = if ($newTool -eq 'codex') { $codexRoots } else { $claudeRoots }
+        if (Get-CcrRootVar $newTool) {
             $lbl = "$($single.NewSessionRoot)"
-            $newRoot = @($roots | Where-Object { $_.Label -eq $lbl } | Select-Object -First 1)[0]
-            if (-not $newRoot) { $newRoot = @($roots | Where-Object Default | Select-Object -First 1)[0] }
+            $newRoot = @($toolRoots | Where-Object { $_.Label -eq $lbl } | Select-Object -First 1)[0]
+            if (-not $newRoot) { $newRoot = @($toolRoots | Where-Object Default | Select-Object -First 1)[0] }
         }
         if (-not (Test-Path -LiteralPath $dir -PathType Container)) {
             Write-Warning "ccr: folder no longer exists: $dir"
@@ -1211,14 +1397,14 @@ function Resume-CcSessions {
             Set-Location -LiteralPath $dir
             $tabTitle = if ($newName) { "$newTool $([char]0x00B7) $newName" } else { "$newTool $([char]0x00B7) new" }
             try { $Host.UI.RawUI.WindowTitle = $tabTitle } catch { }
-            Invoke-CcrWithRoot $newRoot.Path {
+            Invoke-CcrWithRoot $newTool $newRoot.Path {
                 if ($newTool -eq 'claude' -and $newName) { & claude --name $newName }
                 else { & $newTool }
             }
         }
         else {
             $nameArg = if ($newTool -eq 'claude' -and $newName) { " --name '$newName'" } else { '' }
-            "this tab: $(Get-CcrRootPrefix $newRoot.Path 'pwsh')$newTool$nameArg   (cd $dir)"
+            "this tab: $(Get-CcrRootPrefix $newTool $newRoot.Path 'pwsh')$newTool$nameArg   (cd $dir)"
         }
         return
     }
@@ -1245,7 +1431,7 @@ function Resume-CcSessions {
         # model and follows the user's saved effort default.
         $cmd = if ($s.Tool -eq 'claude') { "claude --resume $($s.SessionId)" }
         else { "codex resume $($s.SessionId)" }
-        $rootPath = if ($s.Tool -eq 'claude' -and $s.PSObject.Properties['RootPath']) { $s.RootPath } else { $null }
+        $rootPath = if ($s.PSObject.Properties['RootPath']) { $s.RootPath } else { $null }
         $launch.Add([pscustomobject]@{ Tool = $s.Tool; Title = $s.Title; Cwd = $cwd; Command = $cmd; RootPath = $rootPath })
     }
     if ($launch.Count -eq 0) { Write-Warning 'ccr: nothing to open.'; return }
@@ -1277,7 +1463,7 @@ function Resume-CcSessions {
             if ($cwd -match '^[A-Za-z]:$') { $cwd += '\' }   # bare "D:" is drive-relative
             $title = "$($s.Tool) $([char]0x00B7) $($s.Title)" -replace '["\;]', ' '
             if ($title.Length -gt 40) { $title = $title.Substring(0, 39) + [char]0x2026 }
-            $wtArgs += @('new-tab', '-d', $cwd, '--title', $title, 'pwsh.exe', '-NoExit', '-Command', ((Get-CcrRootPrefix $s.RootPath 'pwsh') + $s.Command))
+            $wtArgs += @('new-tab', '-d', $cwd, '--title', $title, 'pwsh.exe', '-NoExit', '-Command', ((Get-CcrRootPrefix $s.Tool $s.RootPath 'pwsh') + $s.Command))
             $first = $false
         }
     }
@@ -1289,7 +1475,7 @@ function Resume-CcSessions {
             else {
                 # tmux runs the command via sh -c; the window closes when the
                 # agent exits. Command text is fixed words + a validated uuid.
-                foreach ($s in $tabs) { & tmux new-window -c $s.Cwd ((Get-CcrRootPrefix $s.RootPath 'sh') + $s.Command) }
+                foreach ($s in $tabs) { & tmux new-window -c $s.Cwd ((Get-CcrRootPrefix $s.Tool $s.RootPath 'sh') + $s.Command) }
             }
         }
         if ($inline) {
@@ -1303,14 +1489,14 @@ function Resume-CcSessions {
             $parts = $inline.Command -split ' '   # fixed words + validated uuid, no quoting needed
             $exe = $parts[0]
             $exeArgs = $parts[1..($parts.Count - 1)]
-            Invoke-CcrWithRoot $inline.RootPath { & $exe @exeArgs }
+            Invoke-CcrWithRoot $inline.Tool $inline.RootPath { & $exe @exeArgs }
         }
     }
     else {
-        if ($inline) { "this tab: $(Get-CcrRootPrefix $inline.RootPath 'pwsh')$($inline.Command)   (cd $($inline.Cwd))" }
+        if ($inline) { "this tab: $(Get-CcrRootPrefix $inline.Tool $inline.RootPath 'pwsh')$($inline.Command)   (cd $($inline.Cwd))" }
         if ($tabs.Count -gt 0) {
             if ($IsWindows) { "wt.exe $($wtArgs -join ' ')" }
-            else { foreach ($s in $tabs) { "tmux new-window -c $($s.Cwd) '$((Get-CcrRootPrefix $s.RootPath 'sh') + $s.Command)'" } }
+            else { foreach ($s in $tabs) { "tmux new-window -c $($s.Cwd) '$((Get-CcrRootPrefix $s.Tool $s.RootPath 'sh') + $s.Command)'" } }
         }
     }
 }

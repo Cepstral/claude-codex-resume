@@ -1,59 +1,79 @@
-# Two (or more) Claude accounts, decided per conversation
+# Two (or more) accounts, decided per conversation
 
-Claude Code keeps one login per **config dir** (`CLAUDE_CONFIG_DIR`, default `~/.claude`):
-the OAuth tokens, the logged-in identity, settings, memory, and every transcript live there.
-ccr's multi-account mode is built on exactly that: **one config dir per account**, each with
-a normal `claude auth login` inside. A conversation belongs to the account whose dir it lives
-in, so ccr always resumes it under the right account with no bookkeeping — and ccr never
-touches a credential.
+Both tools keep one login per **data dir** — Claude Code in `CLAUDE_CONFIG_DIR` (default
+`~/.claude`), Codex in `CODEX_HOME` (default `~/.codex`): the OAuth tokens, the logged-in
+identity, settings, and every transcript live there. ccr's multi-account mode is built on
+exactly that: **one dir per account and tool**, each with the tool's own normal login inside.
+A conversation belongs to the account whose dir it lives in, so ccr always resumes it under the
+right account with no bookkeeping — and ccr never touches a credential.
 
-## Setup (once)
+## Setup (once) — from inside ccr
 
-1. Log the second account into its own dir. The dir is created on first use:
+```powershell
+ccr -AddAccount work
+```
 
-   ```powershell
-   $env:CLAUDE_CONFIG_DIR = "$HOME\.claude-work"
-   claude auth login          # browser flow: sign in with the work account
-   claude auth status --text  # shows the work identity and this config dir
-   Remove-Item Env:CLAUDE_CONFIG_DIR
-   ```
+The first time, ccr asks for a label for your **current** login/dirs (say `personal`) so the
+sessions you already have keep an account name. Then, for each tool, it creates a fresh dir
+(`~/.claude-work`, `~/.codex-work`), runs the tool's own interactive login **in that dir**
+(`claude auth login` / `codex login` — a browser opens, you sign in with the work account),
+and records the entry in `ccr.json` next to `Resume-CcSessions.ps1`. `-Tool claude` or
+`-Tool codex` limits it to one tool.
 
-   (Bash/zsh: `CLAUDE_CONFIG_DIR=~/.claude-work claude auth login`.)
+```powershell
+ccr -Accounts              # what is configured, and who is logged in where
+ccr -RemoveAccount work    # forget the entry; dirs and sessions are NOT deleted
+```
 
-2. Tell ccr about both dirs with a `ccr.json` **next to `Resume-CcSessions.ps1`**
-   (or anywhere, with `$env:CCR_CONFIG` pointing at it):
+`ccr -Accounts` on a two-account setup:
 
-   ```json
-   {
-     "claudeRoots": {
-       "personal": "~/.claude",
-       "work":     "~/.claude-work"
-     },
-     "defaultRoot": "personal"
-   }
-   ```
+```
+accounts in C:\Users\me\OneDrive\.claude\pwsh\ccr.json  (default: personal)
+  claude personal     ~\OneDrive\.claude          me@gmail.com (max)
+  claude work         ~\.claude-work              me@company.com (max)
+  codex  personal     ~\.codex                    Logged in using ChatGPT
+  codex  work         ~\.codex-work               Logged in using ChatGPT
+```
 
-   `~` and `%VAR%` expand. `defaultRoot` is what `Ctrl+N` preselects.
+Identity comes from `claude auth status` / `codex login status` run with that dir selected, so
+this is also the quickest way to see that a login went through.
 
-3. Copy `settings.json` and your global `CLAUDE.md` into the second dir if you want the same
-   behavior there (each dir is independent — see the table at the end). Project trust is asked
-   again per dir the first time you open a folder under the other account.
+### By hand instead
 
-Without a `ccr.json`, nothing changes: ccr uses `CLAUDE_CONFIG_DIR` / `~/.claude` as before.
+The same result is a `ccr.json` (`$env:CCR_CONFIG` can point elsewhere) plus one login per dir:
+
+```json
+{
+  "claudeRoots": { "personal": "~/.claude", "work": "~/.claude-work" },
+  "codexRoots":  { "personal": "~/.codex",  "work": "~/.codex-work"  },
+  "defaultRoot": "personal"
+}
+```
+
+```powershell
+$env:CLAUDE_CONFIG_DIR = "$HOME\.claude-work"; claude auth login; Remove-Item Env:CLAUDE_CONFIG_DIR
+$env:CODEX_HOME        = "$HOME\.codex-work";  codex login;      Remove-Item Env:CODEX_HOME
+```
+
+`~` and `%VAR%` expand. `defaultRoot` is what `Ctrl+N` preselects. A tool with no entry keeps
+its single default dir (you can split only Claude, or only Codex). Copy `settings.json`, your
+global `CLAUDE.md`, or `config.toml` into the new dirs if you want the same behavior there —
+each dir is independent (see the table at the end); project trust is asked again per dir.
+
+Without a `ccr.json`, nothing changes: ccr uses the default dirs as before.
 
 ## What the picker shows
 
-An **account column** appears between the tool and the age (magenta). Codex rows have none —
-Codex has its own single login.
+An **account column** appears between the tool and the age (magenta), for both tools:
 
 ```
 filter>                                                 88/121 · 2 marked
-↑↓ move · Space mark · Enter open · Ctrl+N new · Del delete · Esc cancel · type to filter · v0.19
+↑↓ move · Space mark · Enter open · Ctrl+N new · Del delete · Esc cancel · type to filter · v0.20
 ● claude work      1h  Billing API pagination          D:\repos\api-server
   claude personal  3h  Home automation bridge          D:\repos\home
-  codex            5h  migrate build to vite           D:\repos\web-app
+  codex  work      5h  migrate build to vite           D:\repos\web-app
 ● claude personal  1d  Physics simulation viral videos D:\repos\sim-shorts
-  claude work      2d  Release notes 9.1               D:\repos\api-server
+  codex  personal  2d  sono affidabili i nebulizzatori ~
 ```
 
 The label is part of the filter text, so typing `work` narrows to that account, exactly like
@@ -68,14 +88,15 @@ means concretely — the config dir is set for each launched process, never glob
 ```
 PS> ccr -WhatIf
 this tab: $env:CLAUDE_CONFIG_DIR='C:\Users\me\.claude-work'; claude --resume 7faabc0d-…   (cd D:\repos\api-server)
-wt.exe -w 0 new-tab -d D:\repos\sim-shorts --title claude · Physics simulation viral videos pwsh.exe -NoExit -Command $env:CLAUDE_CONFIG_DIR='C:\Users\me\.claude'; claude --resume 507eb4d0-…
+wt.exe -w 0 new-tab -d D:\repos\web-app --title codex · migrate build to vite pwsh.exe -NoExit -Command $env:CODEX_HOME='C:\Users\me\.codex-work'; codex resume 01a09b9c-…
 ```
 
-On macOS/Linux inside tmux the same lands as `CLAUDE_CONFIG_DIR='…' claude --resume …` per
-window. The value is a path, not a secret, so it is fine on a command line.
+On macOS/Linux inside tmux the same lands as `CLAUDE_CONFIG_DIR='…' claude --resume …` /
+`CODEX_HOME='…' codex resume …` per window. The value is a path, not a secret, so it is fine
+on a command line.
 
-In the current tab the variable is set only for the duration of the claude process and
-restored afterwards: typing `claude` by hand later still uses your default account.
+In the current tab the variable is set only for the duration of the tool process and restored
+afterwards: typing `claude` or `codex` by hand later still uses your default account.
 
 ## Only one account
 
@@ -99,24 +120,27 @@ account for the new conversation
 ```
 
 Enter starts `claude --name "<name>"` in the chosen dir; Esc steps back to the name box.
-`Tab` (new Codex session) skips the question — Codex has one login.
+`Tab` (new Codex session) asks the same question when Codex has several accounts configured.
 
 ## Moving a conversation to the other account
 
-Transcripts are not tied to an account. Move the session's `.jsonl` — and its sidecar folder
-of the same name, if present — from `<dirA>/projects/<slug>/` to `<dirB>/projects/<slug>/`
-(same `<slug>`; it is derived from the project folder, not the account). ccr lists it under the
-new account on the next run and resumes it there. Remote Control links do not move: they are
-cloud objects owned by the account that created them.
+Claude transcripts are not tied to an account. Move the session's `.jsonl` — and its sidecar
+folder of the same name, if present — from `<dirA>/projects/<slug>/` to
+`<dirB>/projects/<slug>/` (same `<slug>`; it is derived from the project folder, not the
+account). ccr lists it under the new account on the next run and resumes it there. Remote
+Control links do not move: they are cloud objects owned by the account that created them.
+Codex keeps a catalog beside its rollout files, so moving a Codex rollout by hand is not
+supported — start the thread again under the other account instead.
 
 ## What is shared and what is per account
 
-| Per config dir (= per account)                       | Shared                                   |
-|------------------------------------------------------|------------------------------------------|
-| login, `.claude.json` (identity, project trust, MCP) | the projects themselves and their `CLAUDE.md` files |
-| `settings.json`, global `CLAUDE.md`, skills, plugins | Codex (single login, own data dir)       |
-| transcripts, auto-memory, prompt history             | ccr and its `ccr.json`                   |
-| Remote Control sessions and rate limits              |                                          |
+| Per dir (= per account)                                        | Shared                                              |
+|----------------------------------------------------------------|-----------------------------------------------------|
+| Claude: login, `.claude.json` (identity, project trust, MCP)   | the projects themselves and their `CLAUDE.md` files |
+| Claude: `settings.json`, global `CLAUDE.md`, skills, plugins   | ccr and its `ccr.json`                              |
+| Claude: transcripts, auto-memory, prompt history               |                                                     |
+| Codex: `auth.json`, `config.toml`, sessions, thread catalog    |                                                     |
+| Remote Control sessions and rate limits                        |                                                     |
 
 ## Why not one dir with a token per conversation?
 
