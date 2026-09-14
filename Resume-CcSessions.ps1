@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.20'
+$script:CcrVersion = '0.22'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -828,8 +828,8 @@ function Read-CcrInput {
     finally { [Console]::Write("`e[?25l") }
 }
 
-# Account chooser for a NEW claude conversation when several config dirs are
-# configured. Returns the chosen root's label, or $null on Esc.
+# Account chooser for a NEW conversation when several config dirs are
+# configured for that tool. Returns the chosen root's label, or $null on Esc.
 function Select-CcrRoot {
     param([Parameter(Mandatory)][object[]]$Roots)
     $cursor = [Math]::Max(0, [array]::IndexOf(@($Roots.Label), @($Roots | Where-Object Default | Select-Object -First 1).Label))
@@ -846,22 +846,59 @@ function Select-CcrRoot {
         [void]$sb.Append("`e[J")
         [Console]::Write($sb.ToString())
         $k = [Console]::ReadKey($true)
+        if ($k.Key -eq [ConsoleKey]::C -and ($k.Modifiers -band [ConsoleModifiers]::Control)) { return $null }
         switch ($k.Key) {
             'UpArrow' { if ($cursor -gt 0) { $cursor-- } }
             'DownArrow' { if ($cursor -lt $Roots.Count - 1) { $cursor++ } }
             'Enter' { return $Roots[$cursor].Label }
             'Escape' { return $null }
         }
+    }
+}
+
+# Tool chooser for a NEW conversation: claude or codex. Returns the tool
+# name, or $null on Esc. Runs inside the caller's alt buffer.
+function Select-CcrTool {
+    $tools = @(
+        [pscustomobject]@{ Name = 'claude'; Color = "`e[38;5;208m"; Note = 'asks for a session name' },
+        [pscustomobject]@{ Name = 'codex'; Color = "`e[36m"; Note = 'no start name - /rename inside' }
+    )
+    $cursor = 0
+    while ($true) {
+        $sb = [System.Text.StringBuilder]::new()
+        [void]$sb.Append("`e[H").Append('tool for the new conversation').Append("`e[K`n")
+        [void]$sb.Append("`e[2m$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Enter choose $([char]0x00B7) c / x jump $([char]0x00B7) Esc back`e[22m`e[K")
+        for ($i = 0; $i -lt $tools.Count; $i++) {
+            $t = $tools[$i]
+            $row = "  $($t.Color)$($t.Name.PadRight(8))`e[39m `e[2m$($t.Note)`e[22m"
+            if ($i -eq $cursor) { $row = "`e[7m$row`e[27m" }
+            [void]$sb.Append("`n").Append($row).Append("`e[K")
+        }
+        [void]$sb.Append("`e[J")
+        [Console]::Write($sb.ToString())
+        $k = [Console]::ReadKey($true)
         if ($k.Key -eq [ConsoleKey]::C -and ($k.Modifiers -band [ConsoleModifiers]::Control)) { return $null }
+        switch ($k.Key) {
+            'UpArrow' { if ($cursor -gt 0) { $cursor-- } }
+            'DownArrow' { if ($cursor -lt $tools.Count - 1) { $cursor++ } }
+            'Enter' { return $tools[$cursor].Name }
+            'Escape' { return $null }
+            default {
+                # First-letter shortcuts: c = claude, x = codex.
+                if ($k.KeyChar -eq 'c') { return 'claude' }
+                if ($k.KeyChar -eq 'x') { return 'codex' }
+            }
+        }
     }
 }
 
 # Folder chooser for a NEW conversation (Ctrl+N): every path used by any
-# listed session, most recently used first, with session counts. Enter picks
-# the folder for claude and asks for a session name (claude --name; empty =
-# claude's auto title) - and, with several accounts configured, which account
-# it belongs to; Tab starts codex directly (codex has no start-name flag -
-# /rename inside). Returns @{ Path; Tool; Name; Root } or $null to go back.
+# listed session, most recently used first, with session counts. Enter on a
+# folder asks which tool (claude or codex), then - for claude - a session
+# name (claude --name; empty = claude's auto title; codex has no start-name
+# flag - /rename inside), then - when several accounts are configured for
+# that tool - which account it belongs to. Returns @{ Path; Tool; Name; Root }
+# or $null to go back.
 # Runs inside the caller's alt buffer.
 function Select-CcrPath {
     param(
@@ -899,7 +936,7 @@ function Select-CcrPath {
         $line1 = $hdr + (' ' * $pad) + $counts
         if ($line1.Length -gt $w - 1) { $line1 = $line1.Substring(0, $w - 1) }
         [void]$sb.Append($line1).Append("`e[K`n")
-        $hint = "Enter claude here (asks name) $([char]0x00B7) Tab codex here $([char]0x00B7) Esc back $([char]0x00B7) type to filter"
+        $hint = "Enter choose folder (then tool, name) $([char]0x00B7) Esc back $([char]0x00B7) type to filter"
         if ($hint.Length -gt $w - 1) { $hint = $hint.Substring(0, $w - 1) }
         [void]$sb.Append("`e[2m").Append($hint).Append("`e[22m`e[K")
 
@@ -932,24 +969,27 @@ function Select-CcrPath {
             'End' { $cursor = [Math]::Max($view.Count - 1, 0) }
             'Enter' {
                 if ($view.Count -gt 0) {
-                    $name = Read-CcrInput -Prompt 'name> ' -Text $InitialName `
-                        -Hint "session name for claude $([char]0x00B7) Enter confirm (empty = auto title) $([char]0x00B7) Esc back"
-                    if ($null -ne $name) {
-                        $rootLabel = if ($ClaudeRoots.Count -gt 1) { Select-CcrRoot -Roots $ClaudeRoots }
-                        elseif ($ClaudeRoots.Count -eq 1) { $ClaudeRoots[0].Label } else { $null }
-                        if ($ClaudeRoots.Count -le 1 -or $null -ne $rootLabel) {
-                            return [pscustomobject]@{ Path = $view[$cursor].Path; Tool = 'claude'; Name = $name.Trim(); Root = $rootLabel }
+                    # Folder -> tool -> (claude only) name -> (multi-account
+                    # only) account. Esc at any step comes back here and
+                    # repaints the folder list.
+                    $tool = Select-CcrTool
+                    if ($tool -eq 'codex') {
+                        $rootLabel = if ($CodexRoots.Count -gt 1) { Select-CcrRoot -Roots $CodexRoots }
+                        elseif ($CodexRoots.Count -eq 1) { $CodexRoots[0].Label } else { $null }
+                        if ($CodexRoots.Count -le 1 -or $null -ne $rootLabel) {
+                            return [pscustomobject]@{ Path = $view[$cursor].Path; Tool = 'codex'; Name = ''; Root = $rootLabel }
                         }
                     }
-                    # Esc in the name or account box: fall through and repaint the folder list.
-                }
-            }
-            'Tab' {
-                if ($view.Count -gt 0) {
-                    $rootLabel = if ($CodexRoots.Count -gt 1) { Select-CcrRoot -Roots $CodexRoots }
-                    elseif ($CodexRoots.Count -eq 1) { $CodexRoots[0].Label } else { $null }
-                    if ($CodexRoots.Count -le 1 -or $null -ne $rootLabel) {
-                        return [pscustomobject]@{ Path = $view[$cursor].Path; Tool = 'codex'; Name = ''; Root = $rootLabel }
+                    if ($tool -eq 'claude') {
+                        $name = Read-CcrInput -Prompt 'name> ' -Text $InitialName `
+                            -Hint "session name for claude $([char]0x00B7) Enter confirm (empty = auto title) $([char]0x00B7) Esc back"
+                        if ($null -ne $name) {
+                            $rootLabel = if ($ClaudeRoots.Count -gt 1) { Select-CcrRoot -Roots $ClaudeRoots }
+                            elseif ($ClaudeRoots.Count -eq 1) { $ClaudeRoots[0].Label } else { $null }
+                            if ($ClaudeRoots.Count -le 1 -or $null -ne $rootLabel) {
+                                return [pscustomobject]@{ Path = $view[$cursor].Path; Tool = 'claude'; Name = $name.Trim(); Root = $rootLabel }
+                            }
+                        }
                     }
                 }
             }
@@ -1211,7 +1251,8 @@ function Resume-CcSessions {
         Start a NEW conversation: pick from every folder past sessions used,
         most recently used first. Enter asks for a session name and starts
         claude there in this tab (empty name = claude's auto title); Tab
-        starts codex directly. Same menu as Ctrl+N inside the picker.
+        Enter on a folder asks which tool (claude or codex; c / x jump), then
+        for claude a session name. Same menu as Ctrl+N inside the picker.
     .EXAMPLE
         ccr -n Kitchen renovation
         Same, with the name box prefilled to "Kitchen renovation".

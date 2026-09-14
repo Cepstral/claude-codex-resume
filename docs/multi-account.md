@@ -110,7 +110,8 @@ ccr work                # same listing via the filter word; other accounts stay 
 
 ## New conversation
 
-`Ctrl+N` (or `ccr -n`) → pick the folder → `Enter` → type the name → **choose the account**:
+`Ctrl+N` (or `ccr -n`) → pick the folder → choose the **tool** (`claude` / `codex`) → for
+Claude, type the name → **choose the account**:
 
 ```
 account for the new conversation
@@ -119,8 +120,8 @@ account for the new conversation
   work         ~\.claude-work
 ```
 
-Enter starts `claude --name "<name>"` in the chosen dir; Esc steps back to the name box.
-`Tab` (new Codex session) asks the same question when Codex has several accounts configured.
+Enter starts `claude --name "<name>"` (or `codex`) in the chosen dir; Esc steps back one level.
+The account question only appears for a tool that has several accounts configured.
 
 ## Moving a conversation to the other account
 
