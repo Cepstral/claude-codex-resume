@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.17'
+$script:CcrVersion = '0.18'
 
 # PowerShell 5.1 has no $IsWindows automatic variable (and only runs on
 # Windows). pwsh 6+ provides it read-only.
@@ -256,20 +256,71 @@ function Get-CcrClaudeSession {
                 catch { }
             }
 
+            # /clear bookkeeping. A session begun by /clear records, near its top,
+            # the Remote Control bridge id of the terminal process it was cleared
+            # in; the conversation it replaced ends with that same bridge id.
+            $bh = [regex]::Matches($head, '"bridgeSessionId":"([^"]+)"')
+            $bt = [regex]::Matches($tail, '"bridgeSessionId":"([^"]+)"')
+            $headBridge = if ($bh.Count) { $bh[0].Groups[1].Value } else { $null }
+            $tailBridge = if ($bt.Count) { $bt[$bt.Count - 1].Groups[1].Value }
+            elseif ($bh.Count) { $bh[$bh.Count - 1].Groups[1].Value }
+            else { $null }
+            $startedByClear = $false
+            foreach ($line in ($head -split "`n")) {
+                if ($line -notlike '*"type":"user"*') { continue }
+                try { $o = $line | ConvertFrom-Json } catch { continue }
+                if ($o.type -ne 'user' -or $o.isMeta) { continue }
+                $c = $o.message.content
+                $t = if ($c -is [string]) { $c }
+                else { (@($c) | Where-Object { $_.type -eq 'text' } | Select-Object -First 1).text }
+                if ($t) { $startedByClear = $t.Contains('<command-name>/clear</command-name>'); break }
+            }
+            $startedAt = $null
+            $fm = [regex]::Match($head, '"timestamp":"([^"]+)"')
+            if ($fm.Success) {
+                try {
+                    $startedAt = [datetime]::Parse($fm.Groups[1].Value, [cultureinfo]::InvariantCulture,
+                        [System.Globalization.DateTimeStyles]::AdjustToUniversal)
+                }
+                catch { }
+            }
+
             [pscustomobject]@{
-                Tool         = 'claude'
-                SessionId    = $id
-                Title        = $title
-                Cwd          = $cwd
-                LastActivity = $last
-                Running      = $running.ContainsKey($id)
-                ProcessId    = $running[$id]
-                Source       = $file.FullName
+                Tool           = 'claude'
+                SessionId      = $id
+                Title          = $title
+                Cwd            = $cwd
+                LastActivity   = $last
+                Running        = $running.ContainsKey($id)
+                ProcessId      = $running[$id]
+                Source         = $file.FullName
+                StartedAt      = $startedAt
+                StartedByClear = $startedByClear
+                HeadBridge     = $headBridge
+                TailBridge     = $tailBridge
+                Cleared        = $false
             }
         }
         catch { Write-Verbose "ccr: skipping $($file.FullName): $_" }
     }
-    @($out)
+    $list = @($out)
+
+    # Mark conversations replaced by a /clear. Exact link: the new session's
+    # first bridge id equals the old one's last. Sessions from before bridge ids
+    # were recorded fall back to same folder + same name (the name carries over
+    # across /clear); a session with a bridge id but no match is never guessed.
+    foreach ($n in @($list | Where-Object { $_.StartedByClear -and $_.StartedAt })) {
+        $limit = $n.StartedAt.AddMinutes(1)
+        $cands = if ($n.HeadBridge) {
+            @($list | Where-Object { $_.SessionId -ne $n.SessionId -and $_.TailBridge -eq $n.HeadBridge -and $_.LastActivity -le $limit })
+        }
+        else {
+            @($list | Where-Object { $_.SessionId -ne $n.SessionId -and $_.Title -eq $n.Title -and $_.Cwd -eq $n.Cwd -and $_.LastActivity -le $limit })
+        }
+        $prev = $cands | Sort-Object LastActivity -Descending | Select-Object -First 1
+        if ($prev) { $prev.Cleared = $true }
+    }
+    $list
 }
 
 # =============================================================================
@@ -728,7 +779,7 @@ function Select-CcrSession {
             # --- refilter (recomputed every pass; cheap at <= 500 rows) ---
             $view = if ($filter) {
                 @($Sessions | Where-Object {
-                        ("$($_.Tool) $($_.Title) $($_.Cwd)").IndexOf($filter, [StringComparison]::OrdinalIgnoreCase) -ge 0
+                        ("$($_.Tool) $($_.Title) $($_.Cwd)$(if ($_.Cleared) { ' cleared' })").IndexOf($filter, [StringComparison]::OrdinalIgnoreCase) -ge 0
                     })
             }
             else { $Sessions }
@@ -776,9 +827,16 @@ function Select-CcrSession {
                     $mark = if ($sel.Contains($key)) { "`e[32m$([char]0x25CF)`e[39m" } else { ' ' }
                     $toolColor = if ($s.Tool -eq 'claude') { "`e[38;5;208m" } else { "`e[36m" }
                     $age = if ($s.Running) { "`e[31m" + 'run'.PadLeft(6) + "`e[39m" } else { (Format-CcrAge $s.LastActivity).PadLeft(6) }
+                    # "(cleared)" in yellow after the title when a /clear replaced
+                    # this conversation; the title is shortened to make room.
+                    $suffix = if ($s.Cleared -and $titleW -ge 20) { ' (cleared)' } else { '' }
                     $titleTxt = $s.Title
-                    if ($titleTxt.Length -gt $titleW) { $titleTxt = $titleTxt.Substring(0, [Math]::Max(0, $titleW - 1)) + [char]0x2026 }
-                    $titleTxt = $titleTxt.PadRight($titleW)
+                    $room = $titleW - $suffix.Length
+                    if ($titleTxt.Length -gt $room) { $titleTxt = $titleTxt.Substring(0, [Math]::Max(0, $room - 1)) + [char]0x2026 }
+                    $titleTxt = if ($suffix) {
+                        "$titleTxt `e[33m(cleared)`e[39m" + (' ' * [Math]::Max(0, $titleW - $titleTxt.Length - $suffix.Length))
+                    }
+                    else { $titleTxt.PadRight($titleW) }
                     $cwdTxt = (Format-CcrCwd $s.Cwd $cwdW).PadRight($cwdW)
                     $row = "$mark $toolColor$($s.Tool.PadRight(6))`e[39m$age  $titleTxt  `e[2m$cwdTxt`e[22m"
                     if ($i -eq $cursor) { $row = "`e[7m$row`e[27m" }
@@ -898,7 +956,10 @@ function Resume-CcSessions {
         resume <id>" - fresh ones expose no session id to match). Titles:
         claude custom/AI titles; codex has no auto-titles - /rename a thread
         in codex to name it (ccr reads the catalog and the legacy
-        session_index for those names).
+        session_index for those names). A claude conversation that a /clear
+        replaced shows a yellow "(cleared)" after its title - /clear starts
+        a new session under the same name - and "cleared" works as a
+        filter word to list them all.
     .EXAMPLE
         ccr
         Pick from the 200 most recent sessions of both tools (-Top 0 for all).
