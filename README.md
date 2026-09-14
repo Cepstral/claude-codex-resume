@@ -27,6 +27,7 @@ If you work with several CLI agent sessions at once — one Windows Terminal win
 - **The first selection takes over the tab you ran `ccr` in** — the launcher tab never sits idle — and the rest open as tabs of the current window (`wt -w 0`), each in the session's recorded folder. Sessions already running elsewhere are flagged `run` (codex ones when started via `codex resume <id>`).
 - **Cleared conversations are labeled.** `/clear` starts a new session that keeps the tab's name, so the conversation it replaced would look like a duplicate; ccr tags it with a yellow `(cleared)`. The link is exact where Claude Code recorded a Remote Control bridge id (the new session's first id equals the old one's last), with a same-folder-and-name fallback only for older sessions that predate those ids. Type `cleared` to list them all.
 - Respects `CLAUDE_CONFIG_DIR` for relocated Claude data directories.
+- **Several Claude accounts, decided per conversation** — one config dir per account listed in a `ccr.json`; the picker gains an account column, every session resumes under its own account, `Ctrl+N` asks which account a new conversation goes to, `-Root work` narrows to one. Details and examples: [docs/multi-account.md](docs/multi-account.md).
 - Type to filter, `-WhatIf` to preview the exact `wt.exe` command line instead of launching.
 
 ## Requirements
