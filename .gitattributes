@@ -1,0 +1,5 @@
+# Unix-executed files must stay LF even when committed from Windows.
+*.py  text eol=lf
+*.sh  text eol=lf
+*.ps1 text
+*.md  text
