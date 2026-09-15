@@ -33,7 +33,7 @@ If you work with several CLI agent sessions at once — one Windows Terminal win
 
 - [PowerShell 7+](https://github.com/PowerShell/PowerShell) and [Claude Code](https://code.claude.com) and/or [Codex CLI](https://github.com/openai/codex)
 - **Windows 10/11**: [Windows Terminal](https://github.com/microsoft/terminal) (multiple selections open as tabs)
-- **macOS / Linux**: run inside [tmux](https://github.com/tmux/tmux) to open multiple selections as tmux windows; without tmux you can still resume one session at a time (it takes over the current terminal). The Codex title overlay needs a resolvable `libsqlite3`; without it, titles fall back to first prompts. *Note: the Unix path is young — feedback welcome.*
+- **macOS / Linux**: use the **native Python version** below (`ccr.py` — real iTerm2/Terminal.app tabs, fzf picker). The PowerShell script also runs there under `pwsh` (tmux windows for multiple selections).
 
 ## Install
 
@@ -112,6 +112,32 @@ No database, no index: the picker enumerates the same on-disk session files the 
 ### A note on Codex titles
 
 Current Codex versions do **not** auto-generate conversation titles — what its own picker shows *is* the first user message. If you `/rename` a thread inside Codex, ccr picks the name up: it reads a private snapshot of Codex's catalog (`state_N.sqlite`, `threads.name` / distinct `title`) via Windows' built-in `winsqlite3.dll`, plus the legacy `session_index.jsonl` where older Codex versions stored thread names, and overlays those on the file-derived title — falling back silently whenever neither is readable. Renaming the Windows Terminal *tab* is invisible to Codex and to ccr; rename the thread inside Codex.
+
+## macOS / Linux — native version
+
+`ccr.py` is a port of the same tool with no PowerShell involved: Python 3 (stdlib only) for the data, [fzf](https://github.com/junegunn/fzf) for the picker, and **real terminal tabs** — iTerm2 and Terminal.app via AppleScript, tmux windows when you're inside tmux. Same files, same rules, same features as the PowerShell version (titles, `(cleared)` tags, `run` flags, Codex catalog titles, delete via `codex delete`, new-conversation flow).
+
+```sh
+brew install fzf          # picker UI (python3 comes with the Xcode command line tools)
+curl -fsSL https://raw.githubusercontent.com/Cepstral/claude-codex-resume/main/install.sh | sh
+ccr
+```
+
+The installer puts `ccr` in `~/.local/bin` (tells you if that isn't on your PATH); re-run it to update.
+
+| | |
+|---|---|
+| `ccr` · `ccr kit` · `ccr -n [name]` · `ccr --tool codex` · `ccr --top 0` · `ccr --new-window` · `ccr --dry-run` | same meanings as the PowerShell flags |
+| type | fuzzy filter (fzf); `cleared` and `run` are searchable words |
+| `Tab` | mark / unmark (fzf convention — Space types into the filter) |
+| `Enter` | open the marked sessions (or the highlighted one); the first takes over the current terminal, the rest become tabs |
+| `Ctrl-N` | new conversation: folder → tool → name |
+| `Del` | delete the highlighted conversation after a confirmation |
+| `Esc` | cancel |
+
+A preview pane shows the full title, folder, last-used time and session id of the highlighted row. Outside iTerm2/Terminal.app/tmux (e.g. a bare SSH shell) only the first selection can start, in the current terminal; ccr says so.
+
+*The Python port is verified against the same session data as the PowerShell version, but the macOS tab scripting (osascript) was written from the iTerm2/Terminal.app dictionaries and not yet exercised on a Mac — report anything odd with `ccr --dry-run`, which prints the exact AppleScript it would run.*
 
 ## License
 
