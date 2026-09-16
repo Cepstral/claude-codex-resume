@@ -29,7 +29,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.45"
+VERSION = "0.46"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -282,7 +282,15 @@ def load_config():
 
 
 def save_config(cfg: dict):
-    """Write ccr.json back. Only the keys ccr owns are touched."""
+    """Write ccr.json back. Only the keys ccr owns are touched. A file that
+    exists but does not parse is never overwritten: it may hold accounts
+    the user can recover by fixing a stray character."""
+    if CONFIG_PATH.is_file():
+        try:
+            json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        except Exception as e:
+            raise RuntimeError(f"ccr: {CONFIG_PATH} exists but cannot be parsed ({e}) - fix or remove it first; "
+                               "nothing overwritten")
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     CONFIG_PATH.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
 
@@ -323,7 +331,8 @@ def tool_env(tool: str, path: str) -> dict:
 
 def login_identity(tool: str, path: str) -> str:
     """Who is logged in inside a config dir, without touching the live
-    default dir: run the tool's own status command with the dir selected."""
+    default dir: run the tool's own status command with the dir selected.
+    A status check that hangs on the network is cut after 60 s."""
     if not Path(path).is_dir():
         return "(dir missing)"
     try:
@@ -346,6 +355,8 @@ def login_identity(tool: str, path: str) -> str:
             if line and not line.startswith("WARNING"):
                 return line
         return "logged in (auth.json present)" if (Path(path) / "auth.json").exists() else "not logged in"
+    except subprocess.TimeoutExpired:
+        return "(no answer in 60s)"
     except Exception:
         return "(unknown)"
 
@@ -1805,14 +1816,19 @@ def self_path() -> str:
 
 
 def channel_of(path: str) -> str:
-    return "test" if os.path.basename(path).endswith("test") else "stable"
+    """'test' for a copy named <name>test (ccrtest, ccrtest.py), else 'stable'."""
+    stem = os.path.splitext(os.path.basename(path))[0]
+    return "test" if stem.endswith("test") else "stable"
 
 
 def channel_path(channel: str, any_copy: str) -> str:
+    """The sibling copy of a channel: ccr <-> ccrtest (an extension, as in a
+    source checkout's ccr.py <-> ccrtest.py, is kept)."""
     d = os.path.dirname(any_copy)
-    base = os.path.basename(any_copy)
-    stem = base[:-4] if base.endswith("test") else base
-    return os.path.join(d, stem + "test" if channel == "test" else stem)
+    stem, ext = os.path.splitext(os.path.basename(any_copy))
+    if stem.endswith("test"):
+        stem = stem[:-4]
+    return os.path.join(d, stem + ("test" if channel == "test" else "") + ext)
 
 
 def file_version(path: str) -> str:
@@ -1923,6 +1939,14 @@ def main():
         show_accounts()
         return
     if a.add_account or a.remove_account or a.disable_accounts:
+        if a.dry_run:
+            # The login flows are external processes, so --dry-run must stop
+            # here (the same notice the picker's account page prints).
+            act = ({"action": "add", "tool": a.tool, "label": a.add_account, "copy": a.copy_settings} if a.add_account
+                   else {"action": "remove", "tool": a.tool, "label": a.remove_account} if a.remove_account
+                   else {"action": "disable"})
+            run_account_action(act, True)
+            return
         try:
             if a.add_account:
                 add_account(a.add_account, a.tool, a.copy_settings)

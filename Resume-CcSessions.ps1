@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.45'
+$script:CcrVersion = '0.46'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -204,31 +204,42 @@ function Get-CcrCodexRoots { Get-CcrRoots -Tool codex }
 # --- account management (ccr -Accounts / -AddAccount / -RemoveAccount) -------
 
 # Who is logged in inside a config dir, without touching the live default
-# dir: run the tool's own status command with the dir selected.
+# dir: run the tool's own status command with the dir selected. The tool
+# runs in a job so a status check that hangs on the network cannot hang
+# ccr: after 60 s the answer is '(no answer in 60s)'.
 function Get-CcrLoginIdentity {
     param([Parameter(Mandatory)][ValidateSet('claude', 'codex')][string]$Tool, [Parameter(Mandatory)][string]$RootPath)
     if (-not (Test-Path -LiteralPath $RootPath)) { return '(dir missing)' }
-    $var = if ($Tool -eq 'claude') { 'CLAUDE_CONFIG_DIR' } else { 'CODEX_HOME' }
-    $prev = [System.Environment]::GetEnvironmentVariable($var)
-    [System.Environment]::SetEnvironmentVariable($var, $RootPath)
-    try {
+    $job = Start-Job -ScriptBlock {
+        param($Tool, $RootPath)
         if ($Tool -eq 'claude') {
-            $raw = & claude auth status --json 2>$null | Out-String
-            try { $j = $raw | ConvertFrom-Json } catch { return '(unknown)' }
+            $env:CLAUDE_CONFIG_DIR = $RootPath
+            & claude auth status --json 2>$null | Out-String
+        }
+        else {
+            # codex writes its status line to stderr.
+            $env:CODEX_HOME = $RootPath
+            & codex login status 2>&1 | ForEach-Object { "$_" }
+        }
+    } -ArgumentList $Tool, $RootPath
+    try {
+        if (-not (Wait-Job $job -Timeout 60)) { return '(no answer in 60s)' }
+        $out = @(Receive-Job $job -ErrorAction SilentlyContinue | ForEach-Object { "$_" })
+        if ($Tool -eq 'claude') {
+            try { $j = ($out -join "`n") | ConvertFrom-Json } catch { return '(unknown)' }
             if (-not $j.loggedIn) { return 'not logged in' }
             $who = if ($j.email) { $j.email } else { $j.authMethod }
             if ($j.subscriptionType) { "$who ($($j.subscriptionType))" } else { "$who" }
         }
         else {
-            # codex writes its status line to stderr.
-            $line = (& codex login status 2>&1 | ForEach-Object { "$_" } | Where-Object { $_ -and $_ -notmatch '^WARNING' } | Select-Object -First 1)
-            if ($line) { "$line".Trim() }
+            $line = @($out | Where-Object { $_.Trim() -and $_ -notmatch '^WARNING' })
+            if ($line.Count) { "$($line[0])".Trim() }
             elseif (Test-Path -LiteralPath (Join-Path $RootPath 'auth.json')) { 'logged in (auth.json present)' }
             else { 'not logged in' }
         }
     }
     catch { '(unknown)' }
-    finally { [System.Environment]::SetEnvironmentVariable($var, $prev) }
+    finally { Remove-Job $job -Force -ErrorAction SilentlyContinue }
 }
 
 # The logged-in email of a config dir, read from the files the tools keep
@@ -276,6 +287,12 @@ function Show-CcrAccounts {
 # Write ccr.json back. Only the keys ccr owns are touched.
 function Save-CcrConfig([object]$Config) {
     if (-not $script:CcrConfigPath) { throw 'ccr: no config path (load the script from a file, or set $env:CCR_CONFIG)' }
+    # A file that exists but does not parse is never overwritten: it may
+    # hold accounts the user can recover by fixing a stray character.
+    if (Test-Path -LiteralPath $script:CcrConfigPath) {
+        try { $null = Get-Content -LiteralPath $script:CcrConfigPath -Raw | ConvertFrom-Json }
+        catch { throw "ccr: $($script:CcrConfigPath) exists but cannot be parsed ($_) - fix or remove it first; nothing overwritten" }
+    }
     $Config | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $script:CcrConfigPath -Encoding utf8NoBOM
 }
 
@@ -2043,6 +2060,14 @@ function Resume-CcSessions {
     # --- account management (multi-account) --------------------------------
     if ($Accounts) { Show-CcrAccounts; return }
     if ($AddAccount -or $RemoveAccount -or $DisableAccounts) {
+        if ($WhatIfPreference) {
+            # The login flows are external processes, so -WhatIf must stop
+            # here (the same notice the picker's account page prints).
+            $what = if ($AddAccount) { "add $Tool account '$AddAccount'$(if ($CopySettings) { ' (copying the default account settings)' })" }
+            elseif ($RemoveAccount) { "remove $Tool account '$RemoveAccount'" } else { 'disable multi-account mode' }
+            Write-Host "WhatIf: would $what." -ForegroundColor Yellow
+            return
+        }
         try {
             if ($AddAccount) { Add-CcrAccount -Label $AddAccount -Tool $Tool -CopySettings:$CopySettings }
             elseif ($RemoveAccount) { Remove-CcrAccount -Label $RemoveAccount -Tool $Tool }

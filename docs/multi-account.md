@@ -38,11 +38,17 @@ From then on `Ctrl+A` shows the account page:
 
 ```
 Accounts  C:\Users\me\OneDrive\.claude\pwsh\ccr.json
-↑↓ move · Enter account mode (number the rows) · + add · Del remove · X turn off · Esc back
-  claude  default  ~\OneDrive\.claude     me@gmail.com (max)    (default)
-  claude  work     ~\.claude-work         me@company.com (max)
-  codex   default  ~\.codex               Logged in using ChatGPT  (default)
+↑↓ move · + add · Del remove · S copy settings from default (claude: statusline, codex: config.toml) · X turn off · Esc back
+  (default)  claude  ~\OneDrive\.claude   me@gmail.com
+  (default)  codex   ~\.codex             me@gmail.com
+  work       claude  ~\.claude-work       me@company.com
+  work       codex   ~\.codex-work        me@company.com
+
+  A session always resumes under the account whose dir it lives in. In the picker, Space cycles the account a row opens under.
 ```
+
+Rows are grouped by account, the default one in parentheses; the email comes from the dir's own
+files (`.claude.json` / `auth.json`), so the page opens instantly. `Enter` and `Esc` go back.
 
 - `+` adds another account (tool, then label, then that tool's login). A checklist offers to
   **copy the default account's settings**: for Claude the status line (the `statusLine` entry is
