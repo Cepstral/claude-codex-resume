@@ -123,6 +123,29 @@ account for the new conversation
 Enter starts `claude --name "<name>"` (or `codex`) in the chosen dir; Esc steps back one level.
 The account question only appears for a tool that has several accounts configured.
 
+## Opening a conversation under another account — Ctrl+M
+
+Press `Ctrl+M` in the picker (Ctrl+A works too, for terminals that deliver Ctrl+M as Enter).
+The hint line turns into the account list, and `Space` now cycles a **number** on the
+highlighted row instead of the dot:
+
+```
+ACCOUNT MODE: 1 personal (me@gmail.com) · 2 work (me@company.com) · Space cycles the number · Enter open · Ctrl+M back
+1 claude work      1h  Billing API pagination          D:epospi-server
+2 claude personal  3h  Home automation bridge          D:epos\home
+  codex  work      5h  migrate build to vite           D:epos\web-app
+```
+
+`Enter` opens every numbered row **under that account**. When the number differs from the
+account the conversation currently belongs to, ccr first **moves** the conversation into that
+account's dir (Claude: the transcript and its sidecar folder into the same project slug;
+Codex: the rollout file into the same `sessions/YYYY/MM/DD` path — the new home indexes it on
+first resume), then resumes it there. From then on it lives in that account. The counter in the
+header shows how many rows will be re-homed, `-WhatIf` lists the moves, and a running session is
+refused (close its tab first). Only accounts that have a dir for the row's tool are offered.
+
+`Ctrl+M` again returns to normal green marks; numbered rows keep their numbers.
+
 ## Moving a conversation to the other account
 
 Claude transcripts are not tied to an account. Move the session's `.jsonl` — and its sidecar

@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.22'
+$script:CcrVersion = '0.23'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -739,6 +739,30 @@ function Remove-CcrSessionData {
     $true
 }
 
+# Re-home a conversation: move its files into another account's data dir.
+# Transcripts are not account-bound and both tools resume a moved file (a
+# codex home indexes it on first resume). Returns the new transcript path.
+function Move-CcrSessionToRoot {
+    param([Parameter(Mandatory)][object]$Session, [Parameter(Mandatory)][object]$TargetRoot)
+    $src = Get-Item -LiteralPath $Session.Source
+    if ($Session.Tool -eq 'claude') {
+        $slug = Split-Path -Leaf $src.DirectoryName
+        $dstDir = Join-Path (Join-Path $TargetRoot.Path 'projects') $slug
+        New-Item -ItemType Directory -Path $dstDir -Force | Out-Null
+        Move-Item -LiteralPath $src.FullName -Destination $dstDir -Force
+        $side = Join-Path $src.DirectoryName $Session.SessionId   # custom title, tool results...
+        if (Test-Path -LiteralPath $side) { Move-Item -LiteralPath $side -Destination $dstDir -Force }
+        return (Join-Path $dstDir $src.Name)
+    }
+    # codex: keep the sessions/YYYY/MM/DD layout relative to the source root.
+    $srcSessions = Join-Path $Session.RootPath 'sessions'
+    $rel = $src.FullName.Substring($srcSessions.Length).TrimStart('\', '/')
+    $dst = Join-Path (Join-Path $TargetRoot.Path 'sessions') $rel
+    New-Item -ItemType Directory -Path (Split-Path -Parent $dst) -Force | Out-Null
+    Move-Item -LiteralPath $src.FullName -Destination $dst -Force
+    $dst
+}
+
 # Full-screen confirmation before deleting; returns $true when the user picked
 # yes. Runs inside the picker's alternate screen buffer. Shows what is cheaply
 # on hand: title, folder, dates, size on disk, and the last prompt (claude) or
@@ -1037,6 +1061,17 @@ function Select-CcrSession {
     }
 
     $sel = [System.Collections.Generic.HashSet[string]]::new()
+    # Account mode (Ctrl+M): Space cycles a numeric mark = the account the row
+    # will be opened under (re-homed first when it differs). Accounts are the
+    # union of labels across both tools, numbered in config order.
+    $acct = @{}
+    $acctMode = $false
+    $accounts = @(@(@($ClaudeRoots) + @($CodexRoots) | ForEach-Object { "$($_.Label)" } | Where-Object { $_ }) | Select-Object -Unique)
+    $acctIdent = @{}   # label -> who is logged in there; filled on first Ctrl+M
+    function Get-CcrAcctAvail([object]$row) {
+        $roots = if ($row.Tool -eq 'codex') { $CodexRoots } else { $ClaudeRoots }
+        @($accounts | Where-Object { $lbl = $_; @($roots | Where-Object { $_.Label -eq $lbl }).Count -gt 0 })
+    }
     $filter = $InitialFilter
     $cursor = 0
     $top = 0
@@ -1076,16 +1111,28 @@ function Select-CcrSession {
             [void]$sb.Append("`e[H")
             $counts = "$($view.Count)/$($Sessions.Count)"
             if ($sel.Count) { $counts += " $([char]0x00B7) $($sel.Count) marked" }
-            if ($NoMultiOpen -and $sel.Count -gt 1) { $counts += " ! only the first will open (no tmux)" }
+            if ($acct.Count) { $counts += " $([char]0x00B7) $($acct.Count) re-homed" }
+            if ($NoMultiOpen -and ($sel.Count + $acct.Count) -gt 1) { $counts += " ! only the first will open (no tmux)" }
             $hdr = "filter> $filter"
             $pad = $w - 1 - $hdr.Length - $counts.Length - 2
             if ($pad -lt 1) { $pad = 1 }
             $line1 = $hdr + (' ' * $pad) + $counts
             if ($line1.Length -gt $w - 1) { $line1 = $line1.Substring(0, $w - 1) }
             [void]$sb.Append($line1).Append("`e[K`n")
-            $hint = "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space mark $([char]0x00B7) Enter open $([char]0x00B7) Ctrl+N new $([char]0x00B7) Del delete $([char]0x00B7) Esc cancel $([char]0x00B7) type to filter $([char]0x00B7) v$script:CcrVersion"
-            if ($hint.Length -gt $w - 1) { $hint = $hint.Substring(0, $w - 1) }
-            [void]$sb.Append("`e[2m").Append($hint).Append("`e[22m`e[K")
+            if ($acctMode) {
+                $legend = for ($ai = 0; $ai -lt $accounts.Count; $ai++) {
+                    $who = if ($acctIdent[$accounts[$ai]]) { " ($($acctIdent[$accounts[$ai]]))" } else { '' }
+                    "$($ai + 1) $($accounts[$ai])$who"
+                }
+                $hint = "ACCOUNT MODE: $($legend -join " $([char]0x00B7) ") $([char]0x00B7) Space cycles the number $([char]0x00B7) Enter open $([char]0x00B7) Ctrl+M back"
+                if ($hint.Length -gt $w - 1) { $hint = $hint.Substring(0, $w - 1) }
+                [void]$sb.Append("`e[35m").Append($hint).Append("`e[39m`e[K")
+            }
+            else {
+                $hint = "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space mark $([char]0x00B7) Enter open $([char]0x00B7) Ctrl+N new $([char]0x00B7) Del delete$(if ($accounts.Count -gt 1) { " $([char]0x00B7) Ctrl+M accounts" }) $([char]0x00B7) Esc cancel $([char]0x00B7) type to filter $([char]0x00B7) v$script:CcrVersion"
+                if ($hint.Length -gt $w - 1) { $hint = $hint.Substring(0, $w - 1) }
+                [void]$sb.Append("`e[2m").Append($hint).Append("`e[22m`e[K")
+            }
 
             if ($view.Count -eq 0) {
                 [void]$sb.Append("`n`e[2m  (no matches)`e[22m`e[K")
@@ -1097,7 +1144,11 @@ function Select-CcrSession {
                     $key = "$($s.Tool)|$($s.SessionId)"
                     # Green dot = marked for opening. Running sessions show a
                     # red "run" in the age column (informational only).
-                    $mark = if ($sel.Contains($key)) { "`e[32m$([char]0x25CF)`e[39m" } else { ' ' }
+                    # Green dot = open as is; magenta digit = open under account N
+                    # (moving the conversation there first).
+                    $mark = if ($acct.ContainsKey($key)) { "`e[1;35m$([array]::IndexOf($accounts, $acct[$key]) + 1)`e[22;39m" }
+                    elseif ($sel.Contains($key)) { "`e[32m$([char]0x25CF)`e[39m" }
+                    else { ' ' }
                     $toolColor = if ($s.Tool -eq 'claude') { "`e[38;5;208m" } else { "`e[36m" }
                     $age = if ($s.Running) { "`e[31m" + 'run'.PadLeft(6) + "`e[39m" } else { (Format-CcrAge $s.LastActivity).PadLeft(6) }
                     # "(cleared)" in yellow after the title when a /clear replaced
@@ -1129,7 +1180,27 @@ function Select-CcrSession {
             # --- input ---
             $k = [Console]::ReadKey($true)
             if ($k.Key -eq [ConsoleKey]::C -and ($k.Modifiers -band [ConsoleModifiers]::Control)) { return $null }
-            if ($k.Key -eq [ConsoleKey]::N -and ($k.Modifiers -band [ConsoleModifiers]::Control)) {
+            $ctrl = [bool]($k.Modifiers -band [ConsoleModifiers]::Control)
+            # Ctrl+M toggles account mode. Some terminals deliver Ctrl+M as Enter
+            # with Control set (it is the CR byte); Ctrl+A is an alias that
+            # survives every terminal.
+            if ($ctrl -and ($k.Key -in [ConsoleKey]::M, [ConsoleKey]::A, [ConsoleKey]::Enter)) {
+                if ($accounts.Count -lt 2) {
+                    Show-CcrNotice "ccr: no accounts configured - set one up with: ccr -AddAccount <label>" '33'
+                    continue
+                }
+                $acctMode = -not $acctMode
+                if ($acctMode -and $acctIdent.Count -eq 0) {
+                    foreach ($lbl in $accounts) {
+                        $r = @($ClaudeRoots | Where-Object { $_.Label -eq $lbl })
+                        $t = 'claude'
+                        if ($r.Count -eq 0) { $r = @($CodexRoots | Where-Object { $_.Label -eq $lbl }); $t = 'codex' }
+                        if ($r.Count) { $acctIdent[$lbl] = (Get-CcrLoginIdentity -Tool $t -RootPath $r[0].Path) -replace ' \(.*\)$', '' }
+                    }
+                }
+                continue
+            }
+            if ($k.Key -eq [ConsoleKey]::N -and $ctrl) {
                 # Ctrl+N: pick a folder (and tool, and account) for a brand-new conversation.
                 $newPick = Select-CcrPath -Sessions $Sessions -ClaudeRoots $ClaudeRoots -CodexRoots $CodexRoots
                 if ($newPick) { return [pscustomobject]@{ NewSessionPath = $newPick.Path; NewSessionTool = $newPick.Tool; NewSessionName = $newPick.Name; NewSessionRoot = $newPick.Root } }
@@ -1144,12 +1215,34 @@ function Select-CcrSession {
                 'End' { $cursor = [Math]::Max($view.Count - 1, 0) }
                 'Spacebar' {
                     if ($view.Count -gt 0) {
-                        $key = "$($view[$cursor].Tool)|$($view[$cursor].SessionId)"
-                        if (-not $sel.Add($key)) { [void]$sel.Remove($key) }
+                        $row = $view[$cursor]
+                        $key = "$($row.Tool)|$($row.SessionId)"
+                        if ($acctMode) {
+                            # none -> 1 -> 2 -> ... -> none, over the accounts that
+                            # have a dir for this row's tool.
+                            $avail = Get-CcrAcctAvail $row
+                            if ($avail.Count -eq 0) { Show-CcrNotice "ccr: no account has a $($row.Tool) dir configured" '33' }
+                            else {
+                                $cur = if ($acct.ContainsKey($key)) { [array]::IndexOf($avail, $acct[$key]) } else { -1 }
+                                if ($cur + 1 -ge $avail.Count) { $acct.Remove($key) } else { $acct[$key] = $avail[$cur + 1] }
+                                [void]$sel.Remove($key)
+                            }
+                        }
+                        else {
+                            if (-not $sel.Add($key)) { [void]$sel.Remove($key) }
+                            $acct.Remove($key)
+                        }
                     }
                 }
                 'Enter' {
-                    $marked = @($Sessions | Where-Object { $sel.Contains("$($_.Tool)|$($_.SessionId)") })
+                    # Marked rows carry TargetRoot: an account label to open under
+                    # (re-homing first), or $null for "as is".
+                    $marked = @()
+                    foreach ($s in $Sessions) {
+                        $key = "$($s.Tool)|$($s.SessionId)"
+                        if ($acct.ContainsKey($key)) { $s | Add-Member -NotePropertyName TargetRoot -NotePropertyValue $acct[$key] -Force; $marked += $s }
+                        elseif ($sel.Contains($key)) { $s | Add-Member -NotePropertyName TargetRoot -NotePropertyValue $null -Force; $marked += $s }
+                    }
                     if ($marked.Count -gt 0) { return $marked }
                     if ($view.Count -gt 0) { return @($view[$cursor]) }   # bare Enter: cursor row
                 }
@@ -1273,6 +1366,15 @@ function Resume-CcSessions {
         first time it also asks for a label for the current login (e.g.
         "personal"). ccr -Accounts shows who is logged in where;
         ccr -RemoveAccount work forgets the entry (nothing is deleted).
+    .EXAMPLE
+        ccr   then Ctrl+M
+        Account mode (several accounts configured): the hint line lists the
+        accounts as 1, 2, ...; Space cycles a number on the highlighted row
+        (none -> 1 -> 2 -> none) instead of the dot. Enter opens each row
+        under the chosen account, moving the conversation into that account's
+        dir first when it differs (both claude and codex; running sessions
+        are refused). Ctrl+M again returns to normal marks. Ctrl+A is an
+        alias for terminals that deliver Ctrl+M as Enter.
     .EXAMPLE
         ccr -Root work
         With several accounts configured, list only the "work" account's
@@ -1473,7 +1575,18 @@ function Resume-CcSessions {
         $cmd = if ($s.Tool -eq 'claude') { "claude --resume $($s.SessionId)" }
         else { "codex resume $($s.SessionId)" }
         $rootPath = if ($s.PSObject.Properties['RootPath']) { $s.RootPath } else { $null }
-        $launch.Add([pscustomobject]@{ Tool = $s.Tool; Title = $s.Title; Cwd = $cwd; Command = $cmd; RootPath = $rootPath })
+        # Account mode: a TargetRoot label different from the row's own account
+        # means "move this conversation there, then open it there".
+        $moveTo = $null
+        $tgt = if ($s.PSObject.Properties['TargetRoot']) { "$($s.TargetRoot)" } else { '' }
+        if ($tgt -and $tgt -ne "$($s.Root)") {
+            $pool = if ($s.Tool -eq 'codex') { $allCodexRoots } else { $allClaudeRoots }
+            $moveTo = @($pool | Where-Object { $_.Label -eq $tgt } | Select-Object -First 1)[0]
+            if (-not $moveTo) { Write-Warning "ccr: no $($s.Tool) dir for account '$tgt' - '$($s.Title)' stays under '$($s.Root)'" }
+            elseif ($s.Running) { Write-Warning "ccr: '$($s.Title)' is running - close it before moving it to '$tgt'; skipped"; continue }
+            else { $rootPath = $moveTo.Path }
+        }
+        $launch.Add([pscustomobject]@{ Tool = $s.Tool; Title = $s.Title; Cwd = $cwd; Command = $cmd; RootPath = $rootPath; Session = $s; MoveTo = $moveTo })
     }
     if ($launch.Count -eq 0) { Write-Warning 'ccr: nothing to open.'; return }
 
@@ -1509,8 +1622,17 @@ function Resume-CcSessions {
         }
     }
 
-    $what = ($launch | ForEach-Object { "$($_.Tool):$($_.Title)" }) -join ', '
-    if ($PSCmdlet.ShouldProcess($what, 'open as terminal tabs')) {
+    $moves = @($launch | Where-Object MoveTo)
+    $what = ($launch | ForEach-Object { "$($_.Tool):$($_.Title)$(if ($_.MoveTo) { " -> account $($_.MoveTo.Label)" })" }) -join ', '
+    if ($PSCmdlet.ShouldProcess($what, "open as terminal tabs$(if ($moves.Count) { ", re-homing $($moves.Count)" })")) {
+        # Re-home first, so the resume finds the transcript in its new dir.
+        foreach ($m in $moves) {
+            try {
+                $null = Move-CcrSessionToRoot -Session $m.Session -TargetRoot $m.MoveTo
+                Write-Host "ccr: moved '$($m.Title)' to account '$($m.MoveTo.Label)'"
+            }
+            catch { Write-Warning "ccr: could not move '$($m.Title)' to '$($m.MoveTo.Label)': $_ - it will not resume there" }
+        }
         if ($tabs.Count -gt 0) {
             if ($IsWindows) { wt.exe @wtArgs }
             else {
@@ -1534,6 +1656,7 @@ function Resume-CcSessions {
         }
     }
     else {
+        foreach ($m in $moves) { "move: $($m.Tool) $([char]0x00B7) $($m.Title)  ->  account '$($m.MoveTo.Label)' ($($m.MoveTo.Path))" }
         if ($inline) { "this tab: $(Get-CcrRootPrefix $inline.Tool $inline.RootPath 'pwsh')$($inline.Command)   (cd $($inline.Cwd))" }
         if ($tabs.Count -gt 0) {
             if ($IsWindows) { "wt.exe $($wtArgs -join ' ')" }
