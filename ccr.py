@@ -22,6 +22,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -29,7 +30,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.48"
+VERSION = "0.49"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -1176,8 +1177,12 @@ def session_rows(sessions, index, ctx: Ctx):
     return rows
 
 
-def picker_hint(ctx: Ctx) -> str:
-    lines = ctx.legend() if ctx.multi_root else []
+def picker_hint(ctx: Ctx, upd_note: str = "") -> str:
+    lines = []
+    if ">" in upd_note:
+        f, t = upd_note.split(">", 1)
+        lines.append(f"{BOLD}{GREEN}ccr updated v{f} -> v{t}{RESET}")
+    lines += ctx.legend() if ctx.multi_root else []
     keys = [("↑↓", "move"), ("Tab", "mark"), ("Enter", "open")]
     if ctx.multi_root:
         keys.append(("Ctrl-O", "open under another account"))
@@ -1873,50 +1878,129 @@ def file_version(path: str) -> str:
         return "none"
 
 
-def update_self(channel: str, target: str, dry: bool):
-    branch = CHANNELS.get(channel)
-    if not branch:
-        sys.exit(f"ccr: unknown channel '{channel}' (known: {', '.join(CHANNELS)})")
-    # GitHub's raw CDN serves a branch URL from cache for minutes after a
-    # push (and ignores query strings), so resolve the branch head through
-    # the API - never cached - and fetch the file by commit, which is
-    # immutable. Falls back to the branch URL when the API is unreachable.
-    sha = None
+def branch_head(branch: str, timeout: int = 15):
+    """The branch head through the API - never cached, unlike the raw CDN,
+    which serves a branch URL from cache for minutes after a push. None
+    when the API is unreachable."""
     try:
         req = urllib.request.Request(f"https://api.github.com/repos/{REPO}/commits/{branch}",
                                      headers={"User-Agent": "ccr"})
-        with urllib.request.urlopen(req, timeout=15) as r:
-            sha = json.loads(r.read().decode("utf-8")).get("sha")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8")).get("sha")
     except Exception:
-        pass
-    ref = sha or branch
+        return None
+
+
+def fetch_script(ref: str, timeout: int = 30):
+    """Download one revision of this script and compile-check it. Returns
+    (source, version); raises RuntimeError when it cannot be used."""
     url = f"https://raw.githubusercontent.com/{REPO}/{ref}/ccr.py"
-    at = f"branch {branch} @ {sha[:7]}" if sha else f"branch {branch} (head unknown, raw URL may lag)"
-    if dry:
-        print(f"would download {at} -> {target}")
-        return
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "ccr"})
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             src = r.read().decode("utf-8")
     except Exception as e:
-        sys.exit(f"ccr: download failed: {e}")
+        raise RuntimeError(f"download failed: {e}")
     try:
         compile(src, "ccr.py", "exec")
     except SyntaxError as e:
-        sys.exit(f"ccr: the downloaded file does not parse ({e}) - nothing replaced")
+        raise RuntimeError(f"the downloaded file does not parse ({e}) - nothing replaced")
     m = re.search(r'VERSION = "([^"]+)"', src)
-    new_ver = m.group(1) if m else "?"
-    had = file_version(target)
+    return src, (m.group(1) if m else "?")
+
+
+def install_script(src: str, target: str):
     tmp = target + ".new"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(src)
     os.chmod(tmp, 0o755)
     os.replace(tmp, target)
+
+
+def update_self(channel: str, target: str, dry: bool):
+    branch = CHANNELS.get(channel)
+    if not branch:
+        sys.exit(f"ccr: unknown channel '{channel}' (known: {', '.join(CHANNELS)})")
+    # Fetch by commit, which is immutable; fall back to the branch URL when
+    # the API is unreachable.
+    sha = branch_head(branch, 15)
+    ref = sha or branch
+    at = f"branch {branch} @ {sha[:7]}" if sha else f"branch {branch} (head unknown, raw URL may lag)"
+    if dry:
+        print(f"would download {at} -> {target}")
+        return
+    try:
+        src, new_ver = fetch_script(ref)
+    except RuntimeError as e:
+        sys.exit(f"ccr: {e}")
+    had = file_version(target)
+    install_script(src, target)
+    if sha:
+        set_channel_state(channel, sha=sha)
     cmd = "ccrtest" if channel == "test" else "ccr"
     print(f"{GREEN}ccr: channel '{channel}' ({at}) v{had} -> v{new_ver} at {target}. Run: {cmd}{RESET}")
     if new_ver == had:
         print("ccr: same version as before - nothing newer on that branch.")
+
+
+# --- auto-update -------------------------------------------------------------
+# Once an hour per channel, ccr asks GitHub for the branch head at start;
+# when the installed commit differs, the new file is downloaded,
+# compile-checked and swapped in before the run - with a message - and the
+# picker's first line says "updated vX -> vY" for that run only.
+# ccr.state.json next to ccr.json remembers the installed commit and the
+# last check. CCR_AUTO_UPDATE=0 turns it off.
+AUTO_UPDATE_HOURS = 1
+
+
+def state_path() -> Path:
+    return CONFIG_PATH.parent / "ccr.state.json"
+
+
+def load_state() -> dict:
+    try:
+        st = json.loads(state_path().read_text(encoding="utf-8"))
+        return st if isinstance(st, dict) else {}
+    except Exception:
+        return {}
+
+
+def set_channel_state(channel: str, **values):
+    state = load_state()
+    st = state.get(channel) if isinstance(state.get(channel), dict) else {}
+    st.update(values)
+    state[channel] = st
+    state_path().parent.mkdir(parents=True, exist_ok=True)
+    state_path().write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+
+
+def auto_update(channel: str, me: str):
+    """(had, new) when a newer version was installed, else None."""
+    if os.environ.get("CCR_AUTO_UPDATE") == "0":
+        return None
+    branch = CHANNELS.get(channel)
+    if not branch:
+        return None
+    st = load_state().get(channel) or {}
+    now = int(time.time())
+    if now - int(st.get("checked") or 0) < AUTO_UPDATE_HOURS * 3600:
+        return None
+    # Recorded before the network call, also when it fails: a slow or
+    # offline network costs one short timeout per hour, not one per run.
+    set_channel_state(channel, checked=now)
+    sha = branch_head(branch, 3)
+    if not sha or sha == st.get("sha"):
+        return None
+    target = channel_path(channel, me)
+    src, new_ver = fetch_script(sha, 10)
+    had = file_version(target)
+    if new_ver == had:   # e.g. a docs-only commit
+        set_channel_state(channel, sha=sha)
+        return None
+    print(f"{YELLOW}ccr: auto-updating channel '{channel}' v{had} -> v{new_ver} (branch {branch} @ {sha[:7]})...{RESET}")
+    install_script(src, target)
+    set_channel_state(channel, sha=sha)
+    return had, new_ver
 
 
 # ----------------------------------------------------------------------------
@@ -1967,6 +2051,21 @@ def main():
         ch = a.channel or channel_of(me)
         update_self(ch, channel_path(ch, me), a.dry_run)
         return
+    # Auto-update (throttled; a message only when something is installed),
+    # then run the freshly installed file with the same arguments. The
+    # banner the picker shows for this one run travels in an env var.
+    upd_note = os.environ.pop("CCR_UPDATED_FROM", "")
+    if not a.dry_run and not upd_note:
+        me = self_path()
+        try:
+            upd = auto_update(channel_of(me), me)
+        except Exception as e:
+            print(f"ccr: auto-update failed: {e}", file=sys.stderr)
+            upd = None
+        if upd:
+            env = dict(os.environ)
+            env["CCR_UPDATED_FROM"] = f"{upd[0]}>{upd[1]}"
+            os.execve(sys.executable, [sys.executable, channel_path(channel_of(me), me)] + sys.argv[1:], env)
     if a.accounts:
         show_accounts()
         return
@@ -2014,7 +2113,7 @@ def main():
         while not restart:
             index = {}
             rows = session_rows(sessions, index, ctx)
-            res = run_fzf(rows, picker_hint(ctx), query=query, expect=["del", "ctrl-n", "ctrl-a", "ctrl-o"])
+            res = run_fzf(rows, picker_hint(ctx, upd_note), query=query, expect=["del", "ctrl-n", "ctrl-a", "ctrl-o"])
             if res is None:
                 print("ccr: cancelled.")
                 return
@@ -2033,6 +2132,7 @@ def main():
                     run_account_action(act, a.dry_run)
                     pause()
                     restart = True
+                    upd_note = ""   # the banner is for the first listing only
                 continue
             if key == "del":
                 if not picked:

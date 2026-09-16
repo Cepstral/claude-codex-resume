@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.48'
+$script:CcrVersion = '0.49'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -1558,6 +1558,10 @@ function Select-CcrSession {
     }
     $acctIdent = @{}   # "tool|label" -> who is logged in there; filled by the account page
     $acctQuick = @{}   # "tool|label" -> email from the dir's own files; filled by the legend
+    # One-run banner after an auto-update (set by Invoke-CcrAutoUpdate in the
+    # run that installed it; cleared here so tabs ccr opens do not inherit it).
+    $updNote = "$env:CCR_UPDATED_FROM"
+    if ($updNote) { Remove-Item Env:CCR_UPDATED_FROM -ErrorAction SilentlyContinue }
     function Get-CcrAcctAvail([object]$row) { @($entries | Where-Object { $_.Tool -eq $row.Tool } | ForEach-Object Label) }
     function Get-CcrAcctNumber([string]$tool, [string]$label) {
         $e = @($entries | Where-Object { $_.Tool -eq $tool -and $_.Label -eq $label })
@@ -1587,7 +1591,7 @@ function Select-CcrSession {
             # --- layout ---
             $w = [Console]::WindowWidth
             $h = [Console]::WindowHeight
-            $viewH = [Math]::Max(1, $h - 2 - $(if ($acctMode) { $entries.Count + 1 } else { 0 }))
+            $viewH = [Math]::Max(1, $h - 2 - $(if ($acctMode) { $entries.Count + 1 } else { 0 }) - $(if ($updNote) { 1 } else { 0 }))
             if ($cursor -gt $view.Count - 1) { $cursor = [Math]::Max(0, $view.Count - 1) }
             if ($cursor -lt $top) { $top = $cursor }
             elseif ($cursor -ge $top + $viewH) { $top = $cursor - $viewH + 1 }
@@ -1601,6 +1605,10 @@ function Select-CcrSession {
             # --- render one full frame ---
             $sb = [System.Text.StringBuilder]::new()
             [void]$sb.Append("`e[H")
+            if ($updNote) {
+                $uFrom, $uTo = $updNote -split '>', 2
+                [void]$sb.Append("`e[1;32mccr updated v$uFrom -> v$uTo`e[22;39m`e[K`n")
+            }
             $counts = "$($view.Count)/$($Sessions.Count)"
             $nMove = 0; $nSame = 0
             foreach ($s in $Sessions) { $k2 = "$($s.Tool)|$($s.SessionId)"; if ($acct.ContainsKey($k2)) { if ($acct[$k2] -eq "$($s.Root)") { $nSame++ } else { $nMove++ } } }
@@ -1844,6 +1852,40 @@ function Get-CcrChannelPath([string]$Channel, [string]$AnyCopyPath) {
     if ($Channel -eq 'test') { Join-Path $dir 'Resume-CcSessions.test.ps1' } else { Join-Path $dir 'Resume-CcSessions.ps1' }
 }
 
+function Get-CcrFileVersion([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return 'none' }
+    $m = [regex]::Match(((Get-Content -LiteralPath $Path -TotalCount 30) -join "`n"), "CcrVersion = '([^']+)'")
+    if ($m.Success) { $m.Groups[1].Value } else { '?' }
+}
+
+# The branch head through the API - never cached, unlike the raw CDN, which
+# serves a branch URL from cache for minutes after a push. $null when the
+# API is unreachable.
+function Get-CcrBranchHead([string]$Branch, [int]$TimeoutSec = 15) {
+    try { (Invoke-RestMethod -Uri "https://api.github.com/repos/Cepstral/claude-codex-resume/commits/$Branch" -Headers @{ 'User-Agent' = 'ccr' } -TimeoutSec $TimeoutSec).sha }
+    catch { $null }
+}
+
+# Download one revision of this script to a temp file and parse-check it.
+# Returns @{ Tmp; Version }; the caller removes Tmp.
+function Receive-CcrScript([string]$Ref, [int]$TimeoutSec = 30) {
+    $url = "https://raw.githubusercontent.com/Cepstral/claude-codex-resume/$Ref/Resume-CcSessions.ps1"
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) "ccr-update-$PID.ps1"
+    Invoke-WebRequest -Uri $url -OutFile $tmp -UseBasicParsing -TimeoutSec $TimeoutSec
+    $errs = $null
+    [void][System.Management.Automation.Language.Parser]::ParseFile($tmp, [ref]$null, [ref]$errs)
+    if ($errs) {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        throw "the downloaded file does not parse ($($errs[0].Message)) - nothing replaced"
+    }
+    @{ Tmp = $tmp; Version = (Get-CcrFileVersion $tmp) }
+}
+
+function Install-CcrScript([string]$Tmp, [string]$TargetPath) {
+    Copy-Item -LiteralPath $Tmp -Destination $TargetPath -Force
+    if ($IsWindows) { Unblock-File -LiteralPath $TargetPath -ErrorAction SilentlyContinue }
+}
+
 function Update-CcrSelf {
     param(
         [Parameter(Mandatory)][string]$Channel,
@@ -1852,38 +1894,82 @@ function Update-CcrSelf {
     )
     $branch = $script:CcrChannels[$Channel]
     if (-not $branch) { throw "ccr: unknown channel '$Channel' (known: $($script:CcrChannels.Keys -join ', '))" }
-    # GitHub's raw CDN serves a branch URL from cache for minutes after a
-    # push (and ignores query strings), so resolve the branch head through
-    # the API - never cached - and fetch the file by commit, which is
-    # immutable. Falls back to the branch URL when the API is unreachable.
-    $sha = $null
-    try {
-        $sha = (Invoke-RestMethod -Uri "https://api.github.com/repos/Cepstral/claude-codex-resume/commits/$branch" -Headers @{ 'User-Agent' = 'ccr' } -TimeoutSec 15).sha
-    }
-    catch { }
+    # Fetch by commit, which is immutable; fall back to the branch URL when
+    # the API is unreachable.
+    $sha = Get-CcrBranchHead $branch 15
     $ref = if ($sha) { $sha } else { $branch }
-    $url = "https://raw.githubusercontent.com/Cepstral/claude-codex-resume/$ref/Resume-CcSessions.ps1"
     $at = if ($sha) { "branch $branch @ $($sha.Substring(0, 7))" } else { "branch $branch (head unknown, raw URL may lag)" }
     if ($WhatIf) { "would download $at -> $TargetPath"; return }
-    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) "ccr-update-$PID.ps1"
+    $got = Receive-CcrScript -Ref $ref
     try {
-        Invoke-WebRequest -Uri $url -OutFile $tmp -UseBasicParsing
-        $errs = $null
-        [void][System.Management.Automation.Language.Parser]::ParseFile($tmp, [ref]$null, [ref]$errs)
-        if ($errs) { throw "the downloaded file does not parse ($($errs[0].Message)) - nothing replaced" }
-        $m = [regex]::Match(((Get-Content -LiteralPath $tmp -TotalCount 30) -join "`n"), "CcrVersion = '([^']+)'")
-        $newVer = if ($m.Success) { $m.Groups[1].Value } else { '?' }
-        $had = if (Test-Path -LiteralPath $TargetPath) {
-            $mm = [regex]::Match(((Get-Content -LiteralPath $TargetPath -TotalCount 30) -join "`n"), "CcrVersion = '([^']+)'")
-            if ($mm.Success) { $mm.Groups[1].Value } else { '?' }
-        } else { 'none' }
-        Copy-Item -LiteralPath $tmp -Destination $TargetPath -Force
-        if ($IsWindows) { Unblock-File -LiteralPath $TargetPath -ErrorAction SilentlyContinue }
+        $had = Get-CcrFileVersion $TargetPath
+        Install-CcrScript $got.Tmp $TargetPath
+        if ($sha) { Set-CcrChannelState $Channel @{ sha = $sha } }
         $cmd = if ($Channel -eq 'test') { 'ccrtest' } else { 'ccr' }
-        Write-Host "ccr: channel '$Channel' ($at) v$had -> v$newVer at $TargetPath. Run: $cmd" -ForegroundColor Green
-        if ($newVer -eq $had) { Write-Host "ccr: same version as before - nothing newer on that branch." }
+        Write-Host "ccr: channel '$Channel' ($at) v$had -> v$($got.Version) at $TargetPath. Run: $cmd" -ForegroundColor Green
+        if ($got.Version -eq $had) { Write-Host "ccr: same version as before - nothing newer on that branch." }
     }
-    finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+    finally { Remove-Item -LiteralPath $got.Tmp -Force -ErrorAction SilentlyContinue }
+}
+
+# --- auto-update -------------------------------------------------------------
+# Once an hour per channel, ccr asks GitHub for the branch head at start;
+# when the installed commit differs, the new file is downloaded,
+# parse-checked and swapped in before the run - with a message - and the
+# picker's first line says "updated vX -> vY" for that run only.
+# ccr.state.json next to ccr.json remembers the installed commit and the
+# last check. $env:CCR_AUTO_UPDATE = '0' turns it off.
+$script:CcrAutoUpdateHours = 1
+
+function Get-CcrStatePath { if ($script:CcrConfigPath) { Join-Path (Split-Path -Parent $script:CcrConfigPath) 'ccr.state.json' } }
+
+function Get-CcrState {
+    $p = Get-CcrStatePath
+    if ($p -and (Test-Path -LiteralPath $p)) {
+        try { return (Get-Content -LiteralPath $p -Raw | ConvertFrom-Json -AsHashtable) } catch { }
+    }
+    @{}
+}
+
+function Set-CcrChannelState([string]$Channel, [hashtable]$Values) {
+    $p = Get-CcrStatePath
+    if (-not $p) { return }
+    $state = Get-CcrState
+    $st = if ($state[$Channel] -is [System.Collections.IDictionary]) { $state[$Channel] } else { @{} }
+    foreach ($k in $Values.Keys) { $st[$k] = $Values[$k] }
+    $state[$Channel] = $st
+    $state | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $p -Encoding utf8NoBOM
+}
+
+# Returns @{ From; To } when a newer version was installed, else $null.
+function Invoke-CcrAutoUpdate([string]$Channel, [string]$SelfPath) {
+    if ($env:CCR_AUTO_UPDATE -eq '0' -or -not (Get-CcrStatePath)) { return $null }
+    $branch = $script:CcrChannels[$Channel]
+    if (-not $branch) { return $null }
+    $st = (Get-CcrState)[$Channel]
+    if ($st -isnot [System.Collections.IDictionary]) { $st = @{} }
+    $last = if ($st['checked']) { [long]$st['checked'] } else { 0L }
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    if ($now - $last -lt $script:CcrAutoUpdateHours * 3600) { return $null }
+    # Recorded before the network call, also when it fails: a slow or
+    # offline network costs one short timeout per hour, not one per run.
+    Set-CcrChannelState $Channel @{ checked = $now }
+    $sha = Get-CcrBranchHead $branch 3
+    if (-not $sha -or $sha -eq "$($st['sha'])") { return $null }
+    $target = Get-CcrChannelPath $Channel $SelfPath
+    $got = Receive-CcrScript -Ref $sha -TimeoutSec 10
+    try {
+        $had = Get-CcrFileVersion $target
+        if ($got.Version -eq $had) {   # e.g. a docs-only commit
+            Set-CcrChannelState $Channel @{ sha = $sha }
+            return $null
+        }
+        Write-Host "ccr: auto-updating channel '$Channel' v$had -> v$($got.Version) (branch $branch @ $($sha.Substring(0, 7)))..." -ForegroundColor Yellow
+        Install-CcrScript $got.Tmp $target
+        Set-CcrChannelState $Channel @{ sha = $sha }
+        @{ From = $had; To = $got.Version }
+    }
+    finally { Remove-Item -LiteralPath $got.Tmp -Force -ErrorAction SilentlyContinue }
 }
 
 # The test channel, side by side with the stable one: its functions are
@@ -2009,6 +2095,10 @@ function Resume-CcSessions {
         ccr -Update
         Refresh this (stable) copy from the main branch on GitHub. Open tabs
         pick the new version up by themselves on their next ccr.
+        ccr also checks its channel once an hour when it starts: a newer
+        version is installed before the run (with a message) and the
+        picker's first line says "ccr updated vX -> vY" for that run.
+        $env:CCR_AUTO_UPDATE = '0' turns the check off.
     .EXAMPLE
         ccr -Channel test   then   ccrtest
         Install the test channel (the repo's test branch) as a side-by-side
@@ -2063,14 +2153,26 @@ function Resume-CcSessions {
         return
     }
 
+    # --- auto-update (throttled; a message only when something is installed) --
+    # Runs before the self-heal below, which then delegates this invocation
+    # to the freshly installed file. The banner the picker shows for this
+    # one run travels in an env var that the picker clears.
+    $selfPath = $MyInvocation.MyCommand.ScriptBlock.File
+    if (-not $selfPath) { $selfPath = Join-Path (Split-Path -Parent $PROFILE) 'Resume-CcSessions.ps1' }
+    if (-not $WhatIfPreference) {
+        try {
+            $upd = Invoke-CcrAutoUpdate -Channel (Get-CcrChannelOf $selfPath) -SelfPath $selfPath
+            if ($upd) { $env:CCR_UPDATED_FROM = "$($upd.From)>$($upd.To)" }
+        }
+        catch { Write-Warning "ccr: auto-update failed: $_" }
+    }
+
     # --- stale-shell self-heal ---------------------------------------------
     # A shell loads this file once, at startup; after an update every already
     # open tab (including tabs ccr itself opened) keeps the old function. If
     # the file on disk carries a different version, reload it and delegate
     # this invocation to the fresh code. The path comes from the function's
     # own definition, so it follows wherever the profile loads the file from.
-    $selfPath = $MyInvocation.MyCommand.ScriptBlock.File
-    if (-not $selfPath) { $selfPath = Join-Path (Split-Path -Parent $PROFILE) 'Resume-CcSessions.ps1' }
     try {
         $m = [regex]::Match(((Get-Content -LiteralPath $selfPath -TotalCount 30 -ErrorAction Stop) -join "`n"),
             "CcrVersion = '([^']+)'")
