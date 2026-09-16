@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.35'
+$script:CcrVersion = '0.36'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -1460,28 +1460,38 @@ function Select-CcrSession {
             if ($acctMode) {
                 # Legend, one line per account: number, label, and per tool
                 # the dir and the email logged in there (from the tools' own
-                # files, see Get-CcrQuickIdentity). Dirs are dropped when the
-                # line would not fit.
+                # files, see Get-CcrQuickIdentity). Columns are aligned across
+                # accounts; dirs are dropped when the lines would not fit.
                 [void]$sb.Append("`e[1;35mMulti-account mode active.`e[22;39m`e[K`n")
                 $lblW = ($accounts | ForEach-Object Length | Measure-Object -Maximum).Maximum
-                for ($ai = 0; $ai -lt $accounts.Count; $ai++) {
-                    $lbl = $accounts[$ai]
-                    $full = [System.Collections.Generic.List[string]]::new()
-                    $short = [System.Collections.Generic.List[string]]::new()
-                    $plainLen = 0
-                    foreach ($t in 'claude', 'codex') {
+                $cells = @{}   # "tool|label" -> @{ Dir; Who }
+                $colW = @{}    # tool -> @{ Dir; Who } max widths
+                foreach ($t in 'claude', 'codex') {
+                    $colW[$t] = @{ Dir = 0; Who = 0 }
+                    foreach ($lbl in $accounts) {
                         $r = @(@(if ($t -eq 'claude') { $ClaudeRoots } else { $CodexRoots }) | Where-Object { $_.Label -eq $lbl })
                         if ($r.Count -eq 0) { continue }
-                        $tc = if ($t -eq 'claude') { "`e[38;5;208m" } else { "`e[36m" }
                         $qk = "$t|$lbl"
                         if (-not $acctQuick.ContainsKey($qk)) { $acctQuick[$qk] = Get-CcrQuickIdentity -Tool $t -RootPath $r[0].Path }
-                        $who = if ($acctQuick[$qk]) { $acctQuick[$qk] } else { 'not logged in' }
-                        $dir = Format-CcrCwd $r[0].Path 28
-                        $full.Add("$tc$t`e[39m $dir `e[2m$who`e[22m")
-                        $short.Add("$tc$t`e[39m `e[2m$who`e[22m")
-                        $plainLen += $t.Length + 1 + $dir.Length + 1 + $who.Length + 2
+                        $cell = @{ Dir = (Format-CcrCwd $r[0].Path 28); Who = $(if ($acctQuick[$qk]) { $acctQuick[$qk] } else { 'not logged in' }) }
+                        $cells[$qk] = $cell
+                        if ($cell.Dir.Length -gt $colW[$t].Dir) { $colW[$t].Dir = $cell.Dir.Length }
+                        if ($cell.Who.Length -gt $colW[$t].Who) { $colW[$t].Who = $cell.Who.Length }
                     }
-                    $parts = if (4 + $lblW + 2 + $plainLen -gt $w - 1) { $short } else { $full }
+                }
+                $fullLen = 4 + $lblW + 2 + (('claude', 'codex' | ForEach-Object { if ($colW[$_].Who) { $_.Length + 1 + $colW[$_].Dir + 1 + $colW[$_].Who + 2 } else { 0 } } | Measure-Object -Sum).Sum)
+                $withDirs = $fullLen -le $w - 1
+                for ($ai = 0; $ai -lt $accounts.Count; $ai++) {
+                    $lbl = $accounts[$ai]
+                    $parts = foreach ($t in 'claude', 'codex') {
+                        if (-not $colW[$t].Who) { continue }
+                        $tc = if ($t -eq 'claude') { "`e[38;5;208m" } else { "`e[36m" }
+                        $cell = $cells["$t|$lbl"]
+                        $dir = if ($cell) { $cell.Dir } else { '' }
+                        $who = if ($cell) { $cell.Who } else { '' }
+                        if ($withDirs) { "$tc$t`e[39m $($dir.PadRight($colW[$t].Dir)) `e[2m$($who.PadRight($colW[$t].Who))`e[22m" }
+                        else { "$tc$t`e[39m `e[2m$($who.PadRight($colW[$t].Who))`e[22m" }
+                    }
                     $line = "  `e[1;35m$($ai + 1)`e[22m $($lbl.PadRight($lblW))`e[39m  $($parts -join '  ')"
                     [void]$sb.Append($line).Append("`e[K`n")
                 }
