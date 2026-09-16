@@ -824,8 +824,9 @@ def launch(picked: list, new_window: bool, dry: bool, terminal: bool = False, ta
     if not launch_list:
         return
     # First terminal selection takes over this terminal; the rest open as tabs.
-    inline, tabs = (None, launch_list) if new_window else (launch_list[0], launch_list[1:])
-    for s, cwd, argv in tabs:
+    # (`rest`, not `tabs`: that name is the --tabs flag passed to open_tab.)
+    inline, rest = (None, launch_list) if new_window else (launch_list[0], launch_list[1:])
+    for s, cwd, argv in rest:
         if not open_tab(cwd, " ".join(shlex.quote(a) for a in argv), new_window, dry, tabs):
             print("ccr: opening several sessions needs iTerm2, Terminal.app or tmux - only the first starts.",
                   file=sys.stderr)
