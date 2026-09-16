@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.36'
+$script:CcrVersion = '0.37'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -1060,13 +1060,19 @@ function Show-CcrAccountPage {
     }
 
     # --- list page ---
-    $missing = @($rows | Where-Object { -not $Identity.ContainsKey("$($_.Tool)|$($_.Label)") })
-    if ($missing.Count) {
-        Write-CcrScreen @("`e[1mAccounts`e[22m", '', "  `e[2mchecking who is logged in where ($($missing.Count) dir(s))...`e[22m")
-        foreach ($r in $missing) { $Identity["$($r.Tool)|$($r.Label)"] = Get-CcrLoginIdentity -Tool $r.Tool -RootPath $r.Path }
+    # Who is logged in where comes from the dirs' own files (instant); the
+    # slow tool-side check is only for ccr -Accounts.
+    foreach ($r in $rows) {
+        $ik = "$($r.Tool)|$($r.Label)"
+        if (-not $Identity.ContainsKey($ik)) {
+            $q = Get-CcrQuickIdentity -Tool $r.Tool -RootPath $r.Path
+            $Identity[$ik] = if ($q) { $q } else { 'not logged in' }
+        }
     }
     $cursor = 0
     $labelW = [Math]::Max(7, ($rows | ForEach-Object { $_.Label.Length } | Measure-Object -Maximum).Maximum)
+    $dirW = [Math]::Min(40, ($rows | ForEach-Object { (Format-CcrCwd $_.Path 40).Length } | Measure-Object -Maximum).Maximum)
+    $whoW = ($rows | ForEach-Object { "$($Identity["$($_.Tool)|$($_.Label)"])".Length } | Measure-Object -Maximum).Maximum
     while ($true) {
         $lines = [System.Collections.Generic.List[string]]::new()
         $lines.Add("`e[1mAccounts`e[22m  `e[2m$($script:CcrConfigPath)`e[22m")
@@ -1075,7 +1081,7 @@ function Show-CcrAccountPage {
             $r = $rows[$i]
             $toolColor = if ($r.Tool -eq 'claude') { "`e[38;5;208m" } else { "`e[36m" }
             $who = $Identity["$($r.Tool)|$($r.Label)"]
-            $row = "  `e[35m$($r.Label.PadRight($labelW))`e[39m  $toolColor$($r.Tool.PadRight(7))`e[39m $((Format-CcrCwd $r.Path 40).PadRight(40))  $who$(if ($r.Default) { "  `e[2m(default)`e[22m" })"
+            $row = "  `e[35m$($r.Label.PadRight($labelW))`e[39m  $toolColor$($r.Tool.PadRight(6))`e[39m  $((Format-CcrCwd $r.Path 40).PadRight($dirW))  `e[2m$("$who".PadRight($whoW))`e[22m$(if ($r.Default) { "  `e[2m(default)`e[22m" })"
             if ($i -eq $cursor) { $row = "`e[7m$row`e[27m" }
             $lines.Add($row)
         }
