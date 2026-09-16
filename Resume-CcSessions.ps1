@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.21'
+$script:CcrVersion = '0.24'
 
 # PowerShell 5.1 has no $IsWindows automatic variable (and only runs on
 # Windows). pwsh 6+ provides it read-only.
@@ -965,6 +965,43 @@ function Select-CcrSession {
 }
 
 # =============================================================================
+#  self-update from a release channel
+# =============================================================================
+
+# Channels are branches of the public repo; GitHub serves the raw file. The
+# download replaces the LOADED copy (wherever the profile loads it from), and
+# the stale-shell self-heal then picks the new version up in every open tab.
+$script:CcrChannels = [ordered]@{ stable = 'main'; test = 'test' }
+
+function Update-CcrSelf {
+    param(
+        [Parameter(Mandatory)][string]$Channel,
+        [Parameter(Mandatory)][string]$SelfPath,
+        [switch]$WhatIf
+    )
+    $branch = $script:CcrChannels[$Channel]
+    if (-not $branch) { throw "ccr: unknown channel '$Channel' (known: $($script:CcrChannels.Keys -join ', '))" }
+    $url = "https://raw.githubusercontent.com/Cepstral/claude-codex-resume/$branch/Resume-CcSessions.ps1"
+    $channelFile = Join-Path (Split-Path -Parent $SelfPath) 'ccr.channel'
+    if ($WhatIf) { "would download $url -> $SelfPath and record channel '$Channel' in $channelFile"; return }
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) "ccr-update-$PID.ps1"
+    try {
+        Invoke-WebRequest -Uri $url -OutFile $tmp -UseBasicParsing
+        $errs = $null
+        [void][System.Management.Automation.Language.Parser]::ParseFile($tmp, [ref]$null, [ref]$errs)
+        if ($errs) { throw "the downloaded file does not parse ($($errs[0].Message)) - nothing replaced" }
+        $m = [regex]::Match(((Get-Content -LiteralPath $tmp -TotalCount 30) -join "`n"), "CcrVersion = '([^']+)'")
+        $newVer = if ($m.Success) { $m.Groups[1].Value } else { '?' }
+        Copy-Item -LiteralPath $tmp -Destination $SelfPath -Force
+        if ($IsWindows) { Unblock-File -LiteralPath $SelfPath -ErrorAction SilentlyContinue }
+        Set-Content -LiteralPath $channelFile -Value $Channel -Encoding utf8NoBOM -NoNewline
+        Write-Host "ccr: channel '$Channel' ($branch) -> v$newVer installed at $SelfPath (this shell had v$($script:CcrVersion)). Open tabs reload on their next ccr." -ForegroundColor Green
+        if ($newVer -eq $script:CcrVersion) { Write-Host "ccr: same version as before - GitHub's raw cache can lag a few minutes after a push." }
+    }
+    finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+}
+
+# =============================================================================
 #  public entry point
 # =============================================================================
 
@@ -1027,6 +1064,13 @@ function Resume-CcSessions {
     .EXAMPLE
         ccr -WhatIf
         Run the picker, then print the wt.exe command line instead of launching.
+    .EXAMPLE
+        ccr -Channel test
+        Switch to the "test" release channel: download that branch's script
+        from GitHub over the loaded copy and remember the choice (ccr.channel
+        next to the script). ccr -Update refreshes the current channel;
+        ccr -Channel stable goes back to main. Open tabs pick the new version
+        up by themselves on their next ccr.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     [Alias('ccr')]
@@ -1041,9 +1085,27 @@ function Resume-CcSessions {
         # inside the picker). The exact alias 'n' avoids the -New/-NewWindow
         # prefix ambiguity: `ccr -n` works.
         [Alias('n')][switch]$New,
-        [switch]$NewWindow
+        [switch]$NewWindow,
+        # Self-update: -Channel stable|test downloads that branch's script over
+        # the loaded copy and remembers the channel; -Update refreshes the
+        # remembered channel (stable if none was ever chosen).
+        [ValidateSet('stable', 'test')][string]$Channel = '',
+        [switch]$Update
     )
     $filterText = if ($Filter) { ($Filter -join ' ').Trim() } else { '' }
+
+    # --- self-update from a channel (before the self-heal, on purpose) ------
+    if ($Update -or $Channel) {
+        $selfPath = $MyInvocation.MyCommand.ScriptBlock.File
+        if (-not $selfPath) { $selfPath = Join-Path (Split-Path -Parent $PROFILE) 'Resume-CcSessions.ps1' }
+        $ch = $Channel
+        if (-not $ch) {
+            $chFile = Join-Path (Split-Path -Parent $selfPath) 'ccr.channel'
+            $ch = if (Test-Path -LiteralPath $chFile) { (Get-Content -LiteralPath $chFile -Raw).Trim() } else { 'stable' }
+        }
+        Update-CcrSelf -Channel $ch -SelfPath $selfPath -WhatIf:$WhatIfPreference
+        return
+    }
 
     # --- stale-shell self-heal ---------------------------------------------
     # A shell loads this file once, at startup; after an update every already
