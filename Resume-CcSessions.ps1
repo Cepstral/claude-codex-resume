@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.49'
+$script:CcrVersion = '0.50'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -1913,13 +1913,15 @@ function Update-CcrSelf {
 }
 
 # --- auto-update -------------------------------------------------------------
-# Once an hour per channel, ccr asks GitHub for the branch head at start;
-# when the installed commit differs, the new file is downloaded,
-# parse-checked and swapped in before the run - with a message - and the
-# picker's first line says "updated vX -> vY" for that run only.
-# ccr.state.json next to ccr.json remembers the installed commit and the
-# last check. $env:CCR_AUTO_UPDATE = '0' turns it off.
+# On the first run in a shell, and then once an hour per channel, ccr asks
+# GitHub for the branch head at start; when the installed commit differs,
+# the new file is downloaded, parse-checked and swapped in before the run
+# - with a message - and the picker's first line says "updated vX -> vY"
+# for that run only. ccr.state.json next to ccr.json remembers the
+# installed commit and the last check. $env:CCR_AUTO_UPDATE = '0' turns
+# it off.
 $script:CcrAutoUpdateHours = 1
+$script:CcrAutoChecked = $false   # this shell has checked at least once
 
 function Get-CcrStatePath { if ($script:CcrConfigPath) { Join-Path (Split-Path -Parent $script:CcrConfigPath) 'ccr.state.json' } }
 
@@ -1950,9 +1952,10 @@ function Invoke-CcrAutoUpdate([string]$Channel, [string]$SelfPath) {
     if ($st -isnot [System.Collections.IDictionary]) { $st = @{} }
     $last = if ($st['checked']) { [long]$st['checked'] } else { 0L }
     $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-    if ($now - $last -lt $script:CcrAutoUpdateHours * 3600) { return $null }
+    if ($script:CcrAutoChecked -and $now - $last -lt $script:CcrAutoUpdateHours * 3600) { return $null }
     # Recorded before the network call, also when it fails: a slow or
     # offline network costs one short timeout per hour, not one per run.
+    $script:CcrAutoChecked = $true
     Set-CcrChannelState $Channel @{ checked = $now }
     $sha = Get-CcrBranchHead $branch 3
     if (-not $sha -or $sha -eq "$($st['sha'])") { return $null }
@@ -2095,9 +2098,10 @@ function Resume-CcSessions {
         ccr -Update
         Refresh this (stable) copy from the main branch on GitHub. Open tabs
         pick the new version up by themselves on their next ccr.
-        ccr also checks its channel once an hour when it starts: a newer
-        version is installed before the run (with a message) and the
-        picker's first line says "ccr updated vX -> vY" for that run.
+        ccr also checks its channel by itself - on the first run in a
+        shell, then once an hour: a newer version is installed before the
+        run (with a message) and the picker's first line says
+        "ccr updated vX -> vY" for that run.
         $env:CCR_AUTO_UPDATE = '0' turns the check off.
     .EXAMPLE
         ccr -Channel test   then   ccrtest
@@ -2159,7 +2163,7 @@ function Resume-CcSessions {
     # one run travels in an env var that the picker clears.
     $selfPath = $MyInvocation.MyCommand.ScriptBlock.File
     if (-not $selfPath) { $selfPath = Join-Path (Split-Path -Parent $PROFILE) 'Resume-CcSessions.ps1' }
-    if (-not $WhatIfPreference) {
+    if (-not $WhatIfPreference -and -not $env:CCR_UPDATED_FROM) {   # not again in the run that was just updated
         try {
             $upd = Invoke-CcrAutoUpdate -Channel (Get-CcrChannelOf $selfPath) -SelfPath $selfPath
             if ($upd) { $env:CCR_UPDATED_FROM = "$($upd.From)>$($upd.To)" }

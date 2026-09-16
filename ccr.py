@@ -30,7 +30,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.49"
+VERSION = "0.50"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -1944,12 +1944,13 @@ def update_self(channel: str, target: str, dry: bool):
 
 
 # --- auto-update -------------------------------------------------------------
-# Once an hour per channel, ccr asks GitHub for the branch head at start;
-# when the installed commit differs, the new file is downloaded,
-# compile-checked and swapped in before the run - with a message - and the
-# picker's first line says "updated vX -> vY" for that run only.
-# ccr.state.json next to ccr.json remembers the installed commit and the
-# last check. CCR_AUTO_UPDATE=0 turns it off.
+# On the first run in a shell (a new parent process), and then once an hour
+# per channel, ccr asks GitHub for the branch head at start; when the
+# installed commit differs, the new file is downloaded, compile-checked and
+# swapped in before the run - with a message - and the picker's first line
+# says "updated vX -> vY" for that run only. ccr.state.json next to ccr.json
+# remembers the installed commit, the last check and the shell it was made
+# from. CCR_AUTO_UPDATE=0 turns it off.
 AUTO_UPDATE_HOURS = 1
 
 
@@ -1983,11 +1984,12 @@ def auto_update(channel: str, me: str):
         return None
     st = load_state().get(channel) or {}
     now = int(time.time())
-    if now - int(st.get("checked") or 0) < AUTO_UPDATE_HOURS * 3600:
+    shell = os.getppid()
+    if st.get("shell") == shell and now - int(st.get("checked") or 0) < AUTO_UPDATE_HOURS * 3600:
         return None
     # Recorded before the network call, also when it fails: a slow or
     # offline network costs one short timeout per hour, not one per run.
-    set_channel_state(channel, checked=now)
+    set_channel_state(channel, checked=now, shell=shell)
     sha = branch_head(branch, 3)
     if not sha or sha == st.get("sha"):
         return None
