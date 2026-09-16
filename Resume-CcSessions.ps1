@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.28'
+$script:CcrVersion = '0.29'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -294,7 +294,7 @@ function Add-CcrAccount {
         [Parameter(Mandatory)][string]$Label,
         [ValidateSet('claude', 'codex', 'all')][string]$Tool = 'all'
     )
-    if ($Label -notmatch '^[A-Za-z0-9_-]{1,20}$') { throw "ccr: account label must be 1-20 letters/digits/_/- (got '$Label')" }
+    if ($Label -notmatch '^[A-Za-z0-9_-]{1,12}$') { throw "ccr: account label must be 1-12 letters/digits/_/- (got '$Label')" }
     if ($Label -eq $script:CcrDefaultLabel) { throw "ccr: '$Label' is the label of the dirs in use today - pick another one" }
     $cfg = Enable-CcrMultiAccount
     $tools = if ($Tool -eq 'all') { @('claude', 'codex') } else { @($Tool) }
@@ -906,7 +906,7 @@ function Write-CcrScreen([string[]]$Lines) {
 function Show-CcrAccountPage {
     param([object[]]$ClaudeRoots = @(), [object[]]$CodexRoots = @(), [hashtable]$Identity = @{})
     $dot = [char]0x00B7
-    $labelHint = "1-20 letters/digits/_/- $dot Enter $dot Esc back"
+    $labelHint = "1-12 letters/digits/_/- $dot Enter $dot Esc back"
     $def = $script:CcrDefaultLabel
 
     function Read-CcrNewAccount {
@@ -917,7 +917,7 @@ function Show-CcrAccountPage {
         while ($true) {
             $label = Read-CcrInput -Prompt "label for the new $tool account (e.g. work)> " -Hint $labelHint
             if ($null -eq $label) { return $null }
-            if ($label -notmatch '^[A-Za-z0-9_-]{1,20}$') { Show-CcrNotice "ccr: invalid label '$label' ($labelHint)" '33'; continue }
+            if ($label -notmatch '^[A-Za-z0-9_-]{1,12}$') { Show-CcrNotice "ccr: invalid label '$label' ($labelHint)" '33'; continue }
             if ($label -eq $def -or $label -in $taken) { Show-CcrNotice "ccr: $tool account '$label' already exists" '33'; continue }
             return [pscustomobject]@{ Action = 'add'; Tool = $tool; Label = $label }
         }
@@ -1263,7 +1263,7 @@ function Select-CcrSession {
     )
     $multiRoot = ($ClaudeRoots.Count -gt 1) -or ($CodexRoots.Count -gt 1)
     $rootW = if ($multiRoot) {
-        [Math]::Min(10, (@($ClaudeRoots) + @($CodexRoots) | ForEach-Object { "$($_.Label)".Length } | Measure-Object -Maximum).Maximum)
+        [Math]::Min(12, (@($ClaudeRoots) + @($CodexRoots) | ForEach-Object { "$($_.Label)".Length } | Measure-Object -Maximum).Maximum)
     }
     else { 0 }
 
@@ -1379,7 +1379,7 @@ function Select-CcrSession {
                     # session lives in; codex rows have none.
                     $rootTxt = if ($multiRoot) {
                         $lbl = "$($s.Root)"; if ($lbl.Length -gt $rootW) { $lbl = $lbl.Substring(0, $rootW) }
-                        "`e[35m$($lbl.PadRight($rootW))`e[39m "
+                        "`e[35m $($lbl.PadRight($rootW))`e[39m"
                     }
                     else { '' }
                     $row = "$mark $toolColor$($s.Tool.PadRight(6))`e[39m$rootTxt$age  $titleTxt  `e[2m$cwdTxt`e[22m"
