@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.41'
+$script:CcrVersion = '0.42'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -1331,14 +1331,18 @@ function Select-CcrPath {
             $latest = ($_.Group | Sort-Object LastActivity -Descending)[0]
             [pscustomobject]@{ Path = $latest.Cwd; LastActivity = $latest.LastActivity; Count = $_.Count }
         } | Sort-Object LastActivity -Descending)
+    # The folder ccr was started from is always the first row ("here"),
+    # known or not, and stays there whatever the filter says.
+    $here = [pscustomobject]@{ Path = (Get-Location).ProviderPath; LastActivity = $null; Count = 0; Here = $true }
+    $groups = @($groups | Where-Object { $_.Path.TrimEnd('', '/') -ine $here.Path.TrimEnd('', '/') })
     $filter = ''
     $cursor = 0
     $top = 0
     while ($true) {
-        $view = if ($filter) {
-            @($groups | Where-Object { $_.Path.IndexOf($filter, [StringComparison]::OrdinalIgnoreCase) -ge 0 })
-        }
-        else { $groups }
+        $view = @($here) + @(if ($filter) {
+                $groups | Where-Object { $_.Path.IndexOf($filter, [StringComparison]::OrdinalIgnoreCase) -ge 0 }
+            }
+            else { $groups })
 
         $w = [Console]::WindowWidth
         $h = [Console]::WindowHeight
@@ -1351,7 +1355,7 @@ function Select-CcrPath {
         $sb = [System.Text.StringBuilder]::new()
         [void]$sb.Append("`e[H")
         $hdr = "new session in> $filter"
-        $counts = "$($view.Count)/$($groups.Count)"
+        $counts = "$($view.Count - 1)/$($groups.Count)"
         $pad = [Math]::Max(1, $w - 1 - $hdr.Length - $counts.Length - 2)
         $line1 = $hdr + (' ' * $pad) + $counts
         if ($line1.Length -gt $w - 1) { $line1 = $line1.Substring(0, $w - 1) }
@@ -1367,10 +1371,13 @@ function Select-CcrPath {
             $end = [Math]::Min($top + $viewH, $view.Count)
             for ($i = $top; $i -lt $end; $i++) {
                 $g = $view[$i]
-                $age = (Format-CcrAge $g.LastActivity).PadLeft(6)
-                $cnt = "$($g.Count)".PadLeft(3)
                 $pathTxt = Format-CcrCwd $g.Path ([Math]::Max(10, $w - 16))
-                $row = "$age  `e[2m$cnt$([char]0x00D7)`e[22m  $pathTxt"
+                $row = if ($g.PSObject.Properties['Here']) { "`e[32m$('here'.PadLeft(6))`e[39m        $pathTxt" }
+                else {
+                    $age = (Format-CcrAge $g.LastActivity).PadLeft(6)
+                    $cnt = "$($g.Count)".PadLeft(3)
+                    "$age  `e[2m$cnt$([char]0x00D7)`e[22m  $pathTxt"
+                }
                 if ($i -eq $cursor) { $row = "`e[7m$row`e[27m" }
                 [void]$sb.Append("`n").Append($row).Append("`e[K")
             }

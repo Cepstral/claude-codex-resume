@@ -95,7 +95,7 @@ ccr -WhatIf            # print the wt.exe command line, launch nothing
 | `↑` `↓` `PgUp` `PgDn` `Home` `End` | move |
 | `Space` | mark / unmark |
 | `Enter` | open all marked (or the highlighted row if none marked) |
-| `Ctrl+N` | start a **new conversation**: a menu lists every folder past sessions used, most recently used first (with session counts, filterable). `Enter` on a folder asks **which tool** — `claude` or `codex` (`c` / `x` jump straight there) — then, for Claude, a session name (empty = auto title) and starts `claude --name <name>` in the current tab; Codex starts directly (no start-name flag — `/rename` inside). `Esc` steps back one level. `ccr -n` jumps straight to this menu, and `ccr -n TEXT` prefills the name box with TEXT. |
+| `Ctrl+N` | start a **new conversation**: a menu lists the folder ccr was started from first (`here`, known or not), then every folder past sessions used, most recently used first (with session counts, filterable). `Enter` on a folder asks **which tool** — `claude` or `codex` (`c` / `x` jump straight there) — then, for Claude, a session name (empty = auto title) and starts `claude --name <name>` in the current tab; Codex starts directly (no start-name flag — `/rename` inside). `Esc` steps back one level. `ccr -n` jumps straight to this menu, and `ccr -n TEXT` prefills the name box with TEXT. |
 | `Del` | **permanently delete** the highlighted conversation, after a full-screen confirmation showing title, folder, dates, size and the last prompt/reply. Claude: removes the transcript and its sidecar folder; Codex: goes through `codex delete` so the catalog stays consistent. Running sessions are refused. No undo. |
 | any character | filter (matches tool, title and path) |
 | `Backspace` | edit filter |
