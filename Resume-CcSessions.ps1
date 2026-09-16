@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.30'
+$script:CcrVersion = '0.31'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -1560,9 +1560,19 @@ function Update-CcrSelf {
     )
     $branch = $script:CcrChannels[$Channel]
     if (-not $branch) { throw "ccr: unknown channel '$Channel' (known: $($script:CcrChannels.Keys -join ', '))" }
-    # Cache-buster: GitHub's raw CDN can serve a minutes-old file after a push.
-    $url = "https://raw.githubusercontent.com/Cepstral/claude-codex-resume/$branch/Resume-CcSessions.ps1?t=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())"
-    if ($WhatIf) { "would download branch '$branch' -> $TargetPath"; return }
+    # GitHub's raw CDN serves a branch URL from cache for minutes after a
+    # push (and ignores query strings), so resolve the branch head through
+    # the API - never cached - and fetch the file by commit, which is
+    # immutable. Falls back to the branch URL when the API is unreachable.
+    $sha = $null
+    try {
+        $sha = (Invoke-RestMethod -Uri "https://api.github.com/repos/Cepstral/claude-codex-resume/commits/$branch" -Headers @{ 'User-Agent' = 'ccr' } -TimeoutSec 15).sha
+    }
+    catch { }
+    $ref = if ($sha) { $sha } else { $branch }
+    $url = "https://raw.githubusercontent.com/Cepstral/claude-codex-resume/$ref/Resume-CcSessions.ps1"
+    $at = if ($sha) { "branch $branch @ $($sha.Substring(0, 7))" } else { "branch $branch (head unknown, raw URL may lag)" }
+    if ($WhatIf) { "would download $at -> $TargetPath"; return }
     $tmp = Join-Path ([System.IO.Path]::GetTempPath()) "ccr-update-$PID.ps1"
     try {
         Invoke-WebRequest -Uri $url -OutFile $tmp -UseBasicParsing
@@ -1578,8 +1588,8 @@ function Update-CcrSelf {
         Copy-Item -LiteralPath $tmp -Destination $TargetPath -Force
         if ($IsWindows) { Unblock-File -LiteralPath $TargetPath -ErrorAction SilentlyContinue }
         $cmd = if ($Channel -eq 'test') { 'ccrtest' } else { 'ccr' }
-        Write-Host "ccr: channel '$Channel' (branch $branch) v$had -> v$newVer at $TargetPath. Run: $cmd" -ForegroundColor Green
-        if ($newVer -eq $had) { Write-Host "ccr: same version as before - nothing newer on that branch yet." }
+        Write-Host "ccr: channel '$Channel' ($at) v$had -> v$newVer at $TargetPath. Run: $cmd" -ForegroundColor Green
+        if ($newVer -eq $had) { Write-Host "ccr: same version as before - nothing newer on that branch." }
     }
     finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
 }
