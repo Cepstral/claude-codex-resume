@@ -32,10 +32,12 @@ express something the same way (fzf vs. the hand-drawn console picker), pick
 the nearest fzf equivalent and note it in the reply and in the README's
 macOS section; never leave a feature out silently.
 
-Key mapping between the two pickers (fzf cannot tell Ctrl-M from Enter, and
-Space types into its filter): Ctrl+M/Ctrl+A account page ↔ `Ctrl-A`; Space
-cycling the account per row ↔ `Tab` mark + `Ctrl-O` (one target account for
-the marked rows); `+`/`X` on the account page ↔ rows picked with Enter;
+Keys are the same on both sides wherever the terminal allows it, and when
+fzf cannot take a key the PowerShell picker adopts fzf's choice (the account
+page is Ctrl+A everywhere because fzf cannot tell Ctrl-M from Enter).
+Remaining differences, because Space types into fzf's filter: Space cycling
+the account per row ↔ `Tab` mark + `Ctrl-O` (one target account for the
+marked rows); `+`/`X` on the account page ↔ rows picked with Enter;
 `S` ↔ `Ctrl-S`. The mapping table lives in `docs/multi-account.md`.
 
 Known asymmetries (2026-09-16): `ccr.py` has Codex desktop-app support

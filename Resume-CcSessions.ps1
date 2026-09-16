@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.44'
+$script:CcrVersion = '0.45'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -1053,7 +1053,7 @@ function Select-CcrChecklist {
     }
 }
 
-# Account page (Ctrl+M in the picker). The first time it explains what
+# Account page (Ctrl+A in the picker). The first time it explains what
 # turning multi-account mode on does and goes straight to adding the first
 # extra account (tool, then label). Afterwards it lists the accounts per
 # account - with who is logged in where - and offers: + = add an account,
@@ -1119,7 +1119,7 @@ function Show-CcrAccountPage {
             '  fresh dir for it next to the one the tool uses today (.claude-<label> or',
             "  .codex-<label>) and runs that tool's own login there, so each account keeps",
             '  its own credentials and settings.',
-            '  Afterwards Ctrl+M lists the accounts, adds more, or turns the mode off again.',
+            '  Afterwards Ctrl+A lists the accounts, adds more, or turns the mode off again.',
             '',
             "  `e[32m[Enter]`e[39m continue    `e[2mEsc: back, nothing changes`e[22m")
         while ($true) {
@@ -1466,7 +1466,7 @@ function Select-CcrSession {
         # tool adds an account column and an account step to Ctrl+N.
         [object[]]$ClaudeRoots = @(),
         [object[]]$CodexRoots = @(),
-        # Every configured account, for the Ctrl+M page: -Root narrows the
+        # Every configured account, for the Ctrl+A page: -Root narrows the
         # listing (the lists above) but account management must still see
         # all of them, or the page shows one row and refuses Del/S/X on it.
         [object[]]$AllClaudeRoots = $null,
@@ -1590,12 +1590,12 @@ function Select-CcrSession {
                     $line = "  `e[1;35m$($ai + 1)`e[22m $((Format-CcrAcctLabel $lbl $isDef[$lbl]).PadRight($lblW))`e[39m  $($parts -join '  ')"
                     [void]$sb.Append($line).Append("`e[K`n")
                 }
-                $hint = "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space cycles the account (dot = as is) $([char]0x00B7) Enter open $([char]0x00B7) Ctrl+N new $([char]0x00B7) Ctrl+M accounts $([char]0x00B7) Del delete $([char]0x00B7) Esc cancel $([char]0x00B7) v$script:CcrVersion"
+                $hint = "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space cycles the account (dot = as is) $([char]0x00B7) Enter open $([char]0x00B7) Ctrl+N new $([char]0x00B7) Ctrl+A accounts $([char]0x00B7) Del delete $([char]0x00B7) Esc cancel $([char]0x00B7) v$script:CcrVersion"
                 if ($hint.Length -gt $w - 1) { $hint = $hint.Substring(0, $w - 1) }
                 [void]$sb.Append("`e[2m").Append($hint).Append("`e[22m`e[K")
             }
             else {
-                $hint = "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space mark $([char]0x00B7) Enter open $([char]0x00B7) Ctrl+N new $([char]0x00B7) Del delete $([char]0x00B7) Ctrl+M accounts $([char]0x00B7) Esc cancel $([char]0x00B7) type to filter $([char]0x00B7) v$script:CcrVersion"
+                $hint = "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space mark $([char]0x00B7) Enter open $([char]0x00B7) Ctrl+N new $([char]0x00B7) Del delete $([char]0x00B7) Ctrl+A accounts $([char]0x00B7) Esc cancel $([char]0x00B7) type to filter $([char]0x00B7) v$script:CcrVersion"
                 if ($hint.Length -gt $w - 1) { $hint = $hint.Substring(0, $w - 1) }
                 [void]$sb.Append("`e[2m").Append($hint).Append("`e[22m`e[K")
             }
@@ -1647,10 +1647,9 @@ function Select-CcrSession {
             $k = [Console]::ReadKey($true)
             if ($k.Key -eq [ConsoleKey]::C -and ($k.Modifiers -band [ConsoleModifiers]::Control)) { return $null }
             $ctrl = [bool]($k.Modifiers -band [ConsoleModifiers]::Control)
-            # Ctrl+M: the account page. Some terminals deliver Ctrl+M as Enter
-            # with Control set (it is the CR byte); Ctrl+A is an alias that
-            # survives every terminal.
-            if ($ctrl -and ($k.Key -in [ConsoleKey]::M, [ConsoleKey]::A, [ConsoleKey]::Enter)) {
+            # Ctrl+A: the account page (the same key as the fzf picker of
+            # ccr.py, where Ctrl+M is indistinguishable from Enter).
+            if ($ctrl -and $k.Key -eq [ConsoleKey]::A) {
                 $act = Show-CcrAccountPage -ClaudeRoots $AllClaudeRoots -CodexRoots $AllCodexRoots -Identity $acctIdent
                 if ($null -eq $act) { continue }
                 # add / remove / disable: leave the alt buffer (login flows and
@@ -1929,7 +1928,7 @@ function Resume-CcSessions {
         ccr -DisableAccounts does that for every account and turns
         multi-account mode off. Dirs and logins are never deleted.
     .EXAMPLE
-        ccr   then Ctrl+M
+        ccr   then Ctrl+A
         The account page. The first time it explains that the dirs in use
         today become the "default" account and asks tool + label for the
         additional one, then runs that tool's login (like ccr -AddAccount).
@@ -1945,8 +1944,7 @@ function Resume-CcSessions {
         the others (magenta digit, see the hint line), then none. Enter
         opens each row under the chosen account, moving the conversation
         into that account's dir first when it differs (both claude and
-        codex; running sessions are refused). Ctrl+A is an alias for
-        terminals that deliver Ctrl+M as Enter.
+        codex; running sessions are refused).
     .EXAMPLE
         ccr -Root work
         With several accounts configured, list only the "work" account's

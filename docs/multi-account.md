@@ -9,7 +9,7 @@ right account with no bookkeeping — and ccr never touches a credential.
 
 ## Setup (once) — from inside the picker, or from the command line
 
-Press `Ctrl+M` in the picker. The first time you get the activation page:
+Press `Ctrl+A` in the picker. The first time you get the activation page:
 
 ```
 Multi-account mode
@@ -23,7 +23,7 @@ Multi-account mode
   Next you choose a tool and a label for the additional account. ccr creates a
   dir for it next to the default one (.claude-<label> / .codex-<label>) and runs that tool's
   own login there, so each account keeps its own credentials and settings.
-  Afterwards Ctrl+M lists the accounts, adds more, or turns the mode off again.
+  Afterwards Ctrl+A lists the accounts, adds more, or turns the mode off again.
 
   [Enter] continue    Esc: back, nothing changes
 ```
@@ -34,7 +34,7 @@ that tool's own interactive login **in the fresh dir** (`claude auth login` / `c
 browser opens, you sign in with the work account). The entry lands in `ccr.json` next to
 `Resume-CcSessions.ps1`, and the picker reopens with an account column.
 
-From then on `Ctrl+M` shows the account page:
+From then on `Ctrl+A` shows the account page:
 
 ```
 Accounts  C:\Users\me\OneDrive\.claude\pwsh\ccr.json
@@ -173,7 +173,7 @@ account first (a green dot — a plain open), then the others (a magenta digit),
 filter>                                                              198/198 · 1 marked · 1 re-homed
   1 default    claude ~\OneDrive\.claude  codex ~\.codex        me@company.com
   2 personal   claude ~\OneDrive\.claude-personal  codex ~\.codex-personal  me@gmail.com
-↑↓ move · Space cycles the account (dot = as is) · Enter open · Ctrl+N new · Ctrl+M accounts · Del delete · Esc cancel
+↑↓ move · Space cycles the account (dot = as is) · Enter open · Ctrl+N new · Ctrl+A accounts · Del delete · Esc cancel
 2 claude default    1h  Billing API pagination          D:\repos\api-server
 ● claude personal   3h  Home automation bridge          D:\repos\home
   codex  default    5h  migrate build to vite           D:\repos\web-app
@@ -186,7 +186,7 @@ rollout file into the same `sessions/YYYY/MM/DD` path — the new home indexes i
 resume), then resumes it there. From then on it lives in that account. The header counts the
 rows to be re-homed, `-WhatIf` lists the moves, and a running session is refused (close its tab
 first). Only accounts that have a dir for the row's tool are offered. The identity next to each
-account appears once the account page (`Ctrl+M`) has looked it up.
+account appears once the account page (`Ctrl+A`) has looked it up.
 
 This is not a mode you switch on per run: it is simply how the picker works while accounts are
 configured. `X` on the account page turns it off and moves every conversation back to `default`.
@@ -209,7 +209,7 @@ Everything above exists in the Python version with the same `ccr.json` keys (fil
 | PowerShell                              | Python                                          |
 |-----------------------------------------|-------------------------------------------------|
 | `-Root work` · `-Accounts` · `-AddAccount work -CopySettings` · `-RemoveAccount work` · `-DisableAccounts` | `--root work` · `--accounts` · `--add-account work --copy-settings` · `--remove-account work` · `--disable-accounts` |
-| `Ctrl+M` (or `Ctrl+A`) account page: `+` add, `Del` remove, `S` copy settings, `X` off | `Ctrl-A` account page: `+` and `X` are rows you pick with Enter, `Del` removes, `Ctrl-S` copies settings (fzf delivers Ctrl-M as Enter) |
+| `Ctrl+A` account page: `+` add, `Del` remove, `S` copy settings, `X` off | `Ctrl-A` account page: `+` and `X` are rows you pick with Enter, `Del` removes, `Ctrl-S` copies settings |
 | `Space` cycles the account a row opens under (per row) | `Tab` marks rows as usual, `Ctrl-O` opens the marked rows under an account chosen from a menu (one target for the whole selection) |
 | account column and legend in the picker | the same; the label is part of the fuzzy-searchable text |
 | `-WhatIf` lists the moves and the `$env:` prefixes | `--dry-run` lists the moves and the `CLAUDE_CONFIG_DIR='…'` / `CODEX_HOME='…'` prefixes |
