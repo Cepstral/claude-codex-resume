@@ -43,7 +43,7 @@ One line, no admin rights (it copies the script next to your PowerShell profile 
 irm https://raw.githubusercontent.com/Cepstral/claude-codex-resume/main/install.ps1 | iex
 ```
 
-From a clone: `.\install.ps1`. To update later, run **`ccr -Update`** — it downloads the current release channel's script from GitHub over the installed copy; `ccr -Channel test` switches to the `test` branch (what's being tried out next), `ccr -Channel stable` back to `main`. Open tabs pick the new version up by themselves on the next `ccr`.
+From a clone: `.\install.ps1`. To update later, run **`ccr -Update`** — it downloads `main`'s script from GitHub over the installed copy, and open tabs pick the new version up by themselves on the next `ccr`. To try what's coming next without touching your daily `ccr`: **`ccr -Channel test`** installs the `test` branch as a side-by-side copy and **`ccrtest`** runs it (same parameters and keys); `ccrtest -Update` refreshes it.
 
 If the raw URL isn't reachable (e.g. a private fork), install through the authenticated [GitHub CLI](https://cli.github.com) instead — the installer then also downloads the script via `gh`:
 
