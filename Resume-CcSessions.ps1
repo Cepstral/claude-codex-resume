@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.42'
+$script:CcrVersion = '0.43'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -1334,7 +1334,7 @@ function Select-CcrPath {
     # The folder ccr was started from is always the first row ("here"),
     # known or not, and stays there whatever the filter says.
     $here = [pscustomobject]@{ Path = (Get-Location).ProviderPath; LastActivity = $null; Count = 0; Here = $true }
-    $groups = @($groups | Where-Object { $_.Path.TrimEnd('', '/') -ine $here.Path.TrimEnd('', '/') })
+    $groups = @($groups | Where-Object { $_.Path.TrimEnd([char]92, [char]47) -ine $here.Path.TrimEnd([char]92, [char]47) })
     $filter = ''
     $cursor = 0
     $top = 0
