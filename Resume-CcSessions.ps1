@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.23'
+$script:CcrVersion = '0.26'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -1296,6 +1296,72 @@ function Select-CcrSession {
 }
 
 # =============================================================================
+#  release channels: ccr (stable) and ccrtest (test), side by side
+# =============================================================================
+
+# Channels are branches of the public repo, served raw by GitHub. Two copies
+# live next to each other: Resume-CcSessions.ps1 (stable = main, loaded by
+# the profile) and Resume-CcSessions.test.ps1 (test branch), and the channel
+# of a copy is its file name. `ccr -Update` refreshes the stable copy from
+# main, `ccrtest -Update` the test copy from the test branch, and
+# `ccr -Channel test` installs/refreshes the test copy in the first place.
+$script:CcrChannels = [ordered]@{ stable = 'main'; test = 'test' }
+
+function Get-CcrChannelOf([string]$Path) {
+    if ($Path -match '\.test\.ps1$') { 'test' } else { 'stable' }
+}
+function Get-CcrChannelPath([string]$Channel, [string]$AnyCopyPath) {
+    $dir = Split-Path -Parent $AnyCopyPath
+    if ($Channel -eq 'test') { Join-Path $dir 'Resume-CcSessions.test.ps1' } else { Join-Path $dir 'Resume-CcSessions.ps1' }
+}
+
+function Update-CcrSelf {
+    param(
+        [Parameter(Mandatory)][string]$Channel,
+        [Parameter(Mandatory)][string]$TargetPath,
+        [switch]$WhatIf
+    )
+    $branch = $script:CcrChannels[$Channel]
+    if (-not $branch) { throw "ccr: unknown channel '$Channel' (known: $($script:CcrChannels.Keys -join ', '))" }
+    # Cache-buster: GitHub's raw CDN can serve a minutes-old file after a push.
+    $url = "https://raw.githubusercontent.com/Cepstral/claude-codex-resume/$branch/Resume-CcSessions.ps1?t=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())"
+    if ($WhatIf) { "would download branch '$branch' -> $TargetPath"; return }
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) "ccr-update-$PID.ps1"
+    try {
+        Invoke-WebRequest -Uri $url -OutFile $tmp -UseBasicParsing
+        $errs = $null
+        [void][System.Management.Automation.Language.Parser]::ParseFile($tmp, [ref]$null, [ref]$errs)
+        if ($errs) { throw "the downloaded file does not parse ($($errs[0].Message)) - nothing replaced" }
+        $m = [regex]::Match(((Get-Content -LiteralPath $tmp -TotalCount 30) -join "`n"), "CcrVersion = '([^']+)'")
+        $newVer = if ($m.Success) { $m.Groups[1].Value } else { '?' }
+        $had = if (Test-Path -LiteralPath $TargetPath) {
+            $mm = [regex]::Match(((Get-Content -LiteralPath $TargetPath -TotalCount 30) -join "`n"), "CcrVersion = '([^']+)'")
+            if ($mm.Success) { $mm.Groups[1].Value } else { '?' }
+        } else { 'none' }
+        Copy-Item -LiteralPath $tmp -Destination $TargetPath -Force
+        if ($IsWindows) { Unblock-File -LiteralPath $TargetPath -ErrorAction SilentlyContinue }
+        $cmd = if ($Channel -eq 'test') { 'ccrtest' } else { 'ccr' }
+        Write-Host "ccr: channel '$Channel' (branch $branch) v$had -> v$newVer at $TargetPath. Run: $cmd" -ForegroundColor Green
+        if ($newVer -eq $had) { Write-Host "ccr: same version as before - nothing newer on that branch yet." }
+    }
+    finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+}
+
+# The test channel, side by side with the stable one: its functions are
+# loaded in a child scope for this one call and never replace the stable
+# ones. Every ccr parameter passes through (ccrtest -Update, -WhatIf, -n ...).
+function ccrtest {
+    $stable = $MyInvocation.MyCommand.ScriptBlock.File
+    if (-not $stable) { $stable = Join-Path (Split-Path -Parent $PROFILE) 'Resume-CcSessions.ps1' }
+    $test = Get-CcrChannelPath 'test' $stable
+    if (-not (Test-Path -LiteralPath $test)) {
+        Write-Host "ccr: no test copy yet - install it with: ccr -Channel test" -ForegroundColor Yellow
+        return
+    }
+    & { param($testFile, $passArgs) . $testFile; Resume-CcSessions @passArgs } $test $args
+}
+
+# =============================================================================
 #  public entry point
 # =============================================================================
 
@@ -1382,6 +1448,16 @@ function Resume-CcSessions {
         column; a session always resumes under the account it belongs to
         (CLAUDE_CONFIG_DIR / CODEX_HOME set per launched process), and
         Ctrl+N asks which account a new conversation goes to.
+    .EXAMPLE
+        ccr -Update
+        Refresh this (stable) copy from the main branch on GitHub. Open tabs
+        pick the new version up by themselves on their next ccr.
+    .EXAMPLE
+        ccr -Channel test   then   ccrtest
+        Install the test channel (the repo's test branch) as a side-by-side
+        copy, Resume-CcSessions.test.ps1 next to this file, and run it as
+        ccrtest - same parameters, same keys, never replacing the stable ccr.
+        ccrtest -Update refreshes it from its branch.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     [Alias('ccr')]
@@ -1397,6 +1473,12 @@ function Resume-CcSessions {
         # prefix ambiguity: `ccr -n` works.
         [Alias('n')][switch]$New,
         [switch]$NewWindow,
+        # Release channels: -Update refreshes THIS copy from its own channel
+        # (stable = main for ccr, test branch for ccrtest); -Channel test
+        # installs/refreshes the side-by-side test copy (run it as ccrtest),
+        # -Channel stable the stable one.
+        [ValidateSet('stable', 'test')][string]$Channel = '',
+        [switch]$Update,
         # Multi-account: restrict the list to one configured account (label
         # from ccr.json). Also the account Ctrl+N/-n defaults to.
         [string]$Root = '',
@@ -1410,6 +1492,15 @@ function Resume-CcSessions {
         [string]$RemoveAccount = ''
     )
     $filterText = if ($Filter) { ($Filter -join ' ').Trim() } else { '' }
+
+    # --- release channels (before the self-heal, on purpose) -----------------
+    if ($Update -or $Channel) {
+        $selfPath = $MyInvocation.MyCommand.ScriptBlock.File
+        if (-not $selfPath) { $selfPath = Join-Path (Split-Path -Parent $PROFILE) 'Resume-CcSessions.ps1' }
+        $ch = if ($Channel) { $Channel } else { Get-CcrChannelOf $selfPath }
+        Update-CcrSelf -Channel $ch -TargetPath (Get-CcrChannelPath $ch $selfPath) -WhatIf:$WhatIfPreference
+        return
+    }
 
     # --- stale-shell self-heal ---------------------------------------------
     # A shell loads this file once, at startup; after an update every already
