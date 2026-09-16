@@ -201,6 +201,19 @@ Control links do not move: they are cloud objects owned by the account that crea
 Codex keeps a catalog beside its rollout files, so moving a Codex rollout by hand is not
 supported — start the thread again under the other account instead.
 
+## macOS / Linux (`ccr.py`)
+
+Everything above exists in the Python version with the same `ccr.json` keys (file: `$CCR_CONFIG` or
+`~/.config/ccr/ccr.json`) and the same flags spelled the fzf way:
+
+| PowerShell                              | Python                                          |
+|-----------------------------------------|-------------------------------------------------|
+| `-Root work` · `-Accounts` · `-AddAccount work -CopySettings` · `-RemoveAccount work` · `-DisableAccounts` | `--root work` · `--accounts` · `--add-account work --copy-settings` · `--remove-account work` · `--disable-accounts` |
+| `Ctrl+M` (or `Ctrl+A`) account page: `+` add, `Del` remove, `S` copy settings, `X` off | `Ctrl-A` account page: `+` and `X` are rows you pick with Enter, `Del` removes, `Ctrl-S` copies settings (fzf delivers Ctrl-M as Enter) |
+| `Space` cycles the account a row opens under (per row) | `Tab` marks rows as usual, `Ctrl-O` opens the marked rows under an account chosen from a menu (one target for the whole selection) |
+| account column and legend in the picker | the same; the label is part of the fuzzy-searchable text |
+| `-WhatIf` lists the moves and the `$env:` prefixes | `--dry-run` lists the moves and the `CLAUDE_CONFIG_DIR='…'` / `CODEX_HOME='…'` prefixes |
+
 ## What is shared and what is per account
 
 | Per dir (= per account)                                        | Shared                                              |

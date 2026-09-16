@@ -22,6 +22,26 @@ record it in the parity table in `docs/multi-account.md`. Known cases so far:
 - Codex titles set with `/rename` live in the account's own catalog and do not
   travel with a moved rollout; Claude titles are inside the transcript and do.
 
+## PowerShell ↔ Python parity (hard rule)
+
+`Resume-CcSessions.ps1` (Windows, pwsh) and `ccr.py` (macOS/Linux, Python +
+fzf) are the same tool. **Every behavior change, fix and version bump made to
+one must be made to the other in the same change**, with the same flags,
+keys, config file (`ccr.json`), wording and docs. When the picker UI cannot
+express something the same way (fzf vs. the hand-drawn console picker), pick
+the nearest fzf equivalent and note it in the reply and in the README's
+macOS section; never leave a feature out silently.
+
+Key mapping between the two pickers (fzf cannot tell Ctrl-M from Enter, and
+Space types into its filter): Ctrl+M/Ctrl+A account page ↔ `Ctrl-A`; Space
+cycling the account per row ↔ `Tab` mark + `Ctrl-O` (one target account for
+the marked rows); `+`/`X` on the account page ↔ rows picked with Enter;
+`S` ↔ `Ctrl-S`. The mapping table lives in `docs/multi-account.md`.
+
+Known asymmetries (2026-09-16): `ccr.py` has Codex desktop-app support
+(`codex app` rows, deeplinks, `--terminal`) and a `+ new folder` entry on
+Ctrl-N that the PowerShell script does not have yet.
+
 ## Working rules
 
 - Edit `Resume-CcSessions.ps1` in this repo, parse-check, commit, push; the

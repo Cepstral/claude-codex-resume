@@ -116,7 +116,7 @@ Current Codex versions do **not** auto-generate conversation titles — what its
 
 ## macOS / Linux — native version
 
-`ccr.py` is a port of the same tool with no PowerShell involved: Python 3 (stdlib only) for the data, [fzf](https://github.com/junegunn/fzf) for the picker, and **real terminal tabs** — iTerm2 and Terminal.app via AppleScript, tmux windows when you're inside tmux. Same files, same rules, same features as the PowerShell version (titles, `(cleared)` tags, `run` flags, Codex catalog titles, delete via `codex delete`, new-conversation flow), **plus Codex desktop-app support** (below).
+`ccr.py` is a port of the same tool with no PowerShell involved: Python 3 (stdlib only) for the data, [fzf](https://github.com/junegunn/fzf) for the picker, and **real terminal tabs** — iTerm2 and Terminal.app via AppleScript, tmux windows when you're inside tmux. Same files, same rules, same features as the PowerShell version (titles, `(cleared)` tags, `run` flags, Codex catalog titles, delete via `codex delete`, new-conversation flow, [multi-account mode](docs/multi-account.md), self-update), **plus Codex desktop-app support** (below). The two scripts carry the same version number and move in lockstep.
 
 ```sh
 brew install fzf          # picker UI (python3 comes with the Xcode command line tools)
@@ -124,17 +124,21 @@ curl -fsSL https://raw.githubusercontent.com/Cepstral/claude-codex-resume/main/i
 ccr
 ```
 
-The installer puts `ccr` in `~/.local/bin` (tells you if that isn't on your PATH); re-run it to update.
+The installer puts `ccr` in `~/.local/bin` (tells you if that isn't on your PATH); afterwards `ccr --update` refreshes it from the main branch, and `ccr --channel test` installs the test branch side by side as `ccrtest` (`ccrtest --update` refreshes that one).
 
 | | |
 |---|---|
 | `ccr` · `ccr kit` · `ccr -n [name]` · `ccr --tool codex` · `ccr --top 0` · `ccr --new-window` · `ccr --dry-run` | same meanings as the PowerShell flags |
+| `ccr --root work` · `ccr --accounts` · `ccr --add-account work [--copy-settings]` · `ccr --remove-account work` · `ccr --disable-accounts` | multi-account mode, same meanings as the PowerShell flags; the config is `$CCR_CONFIG` or `~/.config/ccr/ccr.json` (same keys) |
+| `ccr --update` · `ccr --channel test` | self-update from the release channels (see above) |
 | `ccr --terminal` | resume Codex **app** conversations with `codex resume` in a terminal instead of handing them back to the app |
 | `ccr --tabs` | Terminal.app: extra sessions as tabs instead of windows (see below); iTerm2 and tmux use tabs either way |
-| type | fuzzy filter (fzf); `cleared`, `run` and `app` are searchable words |
+| type | fuzzy filter (fzf); `cleared`, `run`, `app` and the account label are searchable words |
 | `Tab` | mark / unmark (fzf convention — Space types into the filter). Marked rows take a green **●** in the gutter and the counter beside the prompt reads `49/128 · 2 marked`. |
 | `Enter` | open the marked sessions (or the highlighted one); the first takes over the current terminal, the rest become tabs in iTerm2 and tmux, separate windows in Terminal.app |
-| `Ctrl-N` | new conversation: folder → tool → name. The folder list starts with **`+ new folder`** (`Ctrl-O` jumps straight there) — type a path, `~` and relative paths welcome, and ccr offers to create it, so a brand-new project needs nothing prepared. The tool step offers **`codex app`** wherever the desktop app is installed. |
+| `Ctrl-O` | multi-account: open the marked sessions **under another account** — a menu asks which; each conversation moves into that account's dir first (the PowerShell picker does the same with Space cycling per row) |
+| `Ctrl-A` | the account page: turn multi-account mode on, add an account (`+`), remove one (`Del`), copy the default account's settings to one (`Ctrl-S`), turn the mode off (`X`). Same page as `Ctrl+M` in the PowerShell picker (fzf cannot tell Ctrl-M from Enter) |
+| `Ctrl-N` | new conversation: folder → tool → name → account (when the tool has several). The folder list starts with **`here`** (the folder ccr runs in) and **`+ new folder`** (`Ctrl-O` jumps straight there) — type a path, `~` and relative paths welcome, and ccr offers to create it, so a brand-new project needs nothing prepared. The tool step offers **`codex app`** wherever the desktop app is installed. |
 | `Del` | delete the highlighted conversation after a confirmation |
 | `Esc` | cancel |
 
