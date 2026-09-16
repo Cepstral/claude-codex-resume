@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.26'
+$script:CcrVersion = '0.27'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -261,7 +261,13 @@ function Save-CcrConfig([object]$Config) {
 # also records the CURRENT default dirs under a label so existing sessions
 # keep an account name.
 function Add-CcrAccount {
-    param([Parameter(Mandatory)][string]$Label, [string]$Tool = 'all')
+    param(
+        [Parameter(Mandatory)][string]$Label,
+        [string]$Tool = 'all',
+        # Label for the CURRENT default dirs on the first call; asked
+        # interactively when not given (the picker passes it in).
+        [string]$ExistingLabel = ''
+    )
     if ($Label -notmatch '^[A-Za-z0-9_-]{1,20}$') { Write-Error "ccr: account label must be 1-20 letters/digits/_/- (got '$Label')"; return }
     $cfg = Get-CcrConfig
     if (-not $cfg) { $cfg = [pscustomobject]@{} }
@@ -272,7 +278,7 @@ function Add-CcrAccount {
     $firstTime = -not ($cfg.claudeRoots.PSObject.Properties.Count -or $cfg.codexRoots.PSObject.Properties.Count)
     if ($firstTime) {
         # Give the existing default dirs a name so their sessions stay listed.
-        $existing = Read-Host 'label for the CURRENT login/dirs (e.g. personal)'
+        $existing = if ($ExistingLabel) { $ExistingLabel } else { Read-Host 'label for the CURRENT login/dirs (e.g. personal)' }
         if ($existing -notmatch '^[A-Za-z0-9_-]{1,20}$' -or $existing -eq $Label) { Write-Error 'ccr: invalid or duplicate label'; return }
         $cfg.claudeRoots | Add-Member -NotePropertyName $existing -NotePropertyValue (Get-CcrClaudeRoot)
         $cfg.codexRoots | Add-Member -NotePropertyName $existing -NotePropertyValue (Get-CcrCodexRoot)
@@ -1124,12 +1130,13 @@ function Select-CcrSession {
                     $who = if ($acctIdent[$accounts[$ai]]) { " ($($acctIdent[$accounts[$ai]]))" } else { '' }
                     "$($ai + 1) $($accounts[$ai])$who"
                 }
-                $hint = "ACCOUNT MODE: $($legend -join " $([char]0x00B7) ") $([char]0x00B7) Space cycles the number $([char]0x00B7) Enter open $([char]0x00B7) Ctrl+M back"
+                $legendTxt = if ($accounts.Count) { "$($legend -join " $([char]0x00B7) ") $([char]0x00B7) Space cycles the number $([char]0x00B7) Enter open" } else { 'no accounts yet' }
+                $hint = "ACCOUNT MODE: $legendTxt $([char]0x00B7) + add account $([char]0x00B7) Ctrl+M back"
                 if ($hint.Length -gt $w - 1) { $hint = $hint.Substring(0, $w - 1) }
                 [void]$sb.Append("`e[35m").Append($hint).Append("`e[39m`e[K")
             }
             else {
-                $hint = "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space mark $([char]0x00B7) Enter open $([char]0x00B7) Ctrl+N new $([char]0x00B7) Del delete$(if ($accounts.Count -gt 1) { " $([char]0x00B7) Ctrl+M accounts" }) $([char]0x00B7) Esc cancel $([char]0x00B7) type to filter $([char]0x00B7) v$script:CcrVersion"
+                $hint = "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space mark $([char]0x00B7) Enter open $([char]0x00B7) Ctrl+N new $([char]0x00B7) Del delete $([char]0x00B7) Ctrl+M accounts $([char]0x00B7) Esc cancel $([char]0x00B7) type to filter $([char]0x00B7) v$script:CcrVersion"
                 if ($hint.Length -gt $w - 1) { $hint = $hint.Substring(0, $w - 1) }
                 [void]$sb.Append("`e[2m").Append($hint).Append("`e[22m`e[K")
             }
@@ -1185,10 +1192,6 @@ function Select-CcrSession {
             # with Control set (it is the CR byte); Ctrl+A is an alias that
             # survives every terminal.
             if ($ctrl -and ($k.Key -in [ConsoleKey]::M, [ConsoleKey]::A, [ConsoleKey]::Enter)) {
-                if ($accounts.Count -lt 2) {
-                    Show-CcrNotice "ccr: no accounts configured - set one up with: ccr -AddAccount <label>" '33'
-                    continue
-                }
                 $acctMode = -not $acctMode
                 if ($acctMode -and $acctIdent.Count -eq 0) {
                     foreach ($lbl in $accounts) {
@@ -1206,6 +1209,36 @@ function Select-CcrSession {
                 if ($newPick) { return [pscustomobject]@{ NewSessionPath = $newPick.Path; NewSessionTool = $newPick.Tool; NewSessionName = $newPick.Name; NewSessionRoot = $newPick.Root } }
                 continue
             }
+            if ($acctMode -and ($k.KeyChar -eq '+' -or $k.Key -eq [ConsoleKey]::Insert)) {
+                # Ask the label(s) inside the alt buffer, then hand the terminal
+                # to the tool's own login flow and restart the picker so the
+                # new account (and, the first time, the label given to the
+                # current dirs) shows up everywhere.
+                $labelHint = "1-20 letters/digits/_/-  $([char]0x00B7) Enter $([char]0x00B7) Esc back"
+                $newLabel = Read-CcrInput -Prompt 'new account label> ' -Hint $labelHint
+                if ($null -eq $newLabel) { continue }
+                if ($newLabel -notmatch '^[A-Za-z0-9_-]{1,20}$') { Show-CcrNotice "ccr: invalid label '$newLabel' ($labelHint)" '33'; continue }
+                if ($newLabel -in $accounts) { Show-CcrNotice "ccr: account '$newLabel' already exists" '33'; continue }
+                $existingLabel = ''
+                if ($accounts.Count -eq 0) {
+                    $existingLabel = Read-CcrInput -Prompt 'label for the CURRENT login/dirs (e.g. personal)> ' -Hint $labelHint
+                    if ($null -eq $existingLabel) { continue }
+                    if ($existingLabel -notmatch '^[A-Za-z0-9_-]{1,20}$' -or $existingLabel -eq $newLabel) { Show-CcrNotice "ccr: invalid or duplicate label '$existingLabel'" '33'; continue }
+                }
+                # Leave the alt buffer: the login flows draw on the main screen.
+                [Console]::Write("`e[?25h`e[?1049l")
+                [Console]::TreatControlCAsInput = $prevCtrlC
+                try {
+                    if ($WhatIfPreference) { Write-Host "WhatIf: would add account '$newLabel'$(if ($existingLabel) { " (current dirs labeled '$existingLabel')" })." -ForegroundColor Yellow }
+                    else { Add-CcrAccount -Label $newLabel -ExistingLabel $existingLabel }
+                }
+                catch { Write-Warning "ccr: adding the account failed: $_" }
+                Write-Host ''
+                Write-Host 'ccr: press any key to go back to the picker' -ForegroundColor DarkGray
+                [void][Console]::ReadKey($true)
+                # The caller re-enumerates with the new config and reopens the picker.
+                return [pscustomobject]@{ Restart = $true; Filter = $filter }
+            }
             switch ($k.Key) {
                 'UpArrow' { if ($cursor -gt 0) { $cursor-- } }
                 'DownArrow' { if ($cursor -lt $view.Count - 1) { $cursor++ } }
@@ -1221,7 +1254,8 @@ function Select-CcrSession {
                             # none -> 1 -> 2 -> ... -> none, over the accounts that
                             # have a dir for this row's tool.
                             $avail = Get-CcrAcctAvail $row
-                            if ($avail.Count -eq 0) { Show-CcrNotice "ccr: no account has a $($row.Tool) dir configured" '33' }
+                            if ($accounts.Count -eq 0) { Show-CcrNotice "ccr: no accounts yet - press + to add one" '33' }
+                            elseif ($avail.Count -eq 0) { Show-CcrNotice "ccr: no account has a $($row.Tool) dir configured" '33' }
                             else {
                                 $cur = if ($acct.ContainsKey($key)) { [array]::IndexOf($avail, $acct[$key]) } else { -1 }
                                 if ($cur + 1 -ge $avail.Count) { $acct.Remove($key) } else { $acct[$key] = $avail[$cur + 1] }
@@ -1434,13 +1468,16 @@ function Resume-CcSessions {
         ccr -RemoveAccount work forgets the entry (nothing is deleted).
     .EXAMPLE
         ccr   then Ctrl+M
-        Account mode (several accounts configured): the hint line lists the
-        accounts as 1, 2, ...; Space cycles a number on the highlighted row
-        (none -> 1 -> 2 -> none) instead of the dot. Enter opens each row
-        under the chosen account, moving the conversation into that account's
-        dir first when it differs (both claude and codex; running sessions
-        are refused). Ctrl+M again returns to normal marks. Ctrl+A is an
-        alias for terminals that deliver Ctrl+M as Enter.
+        Account mode: the hint line lists the accounts as 1, 2, ...; Space
+        cycles a number on the highlighted row (none -> 1 -> 2 -> none)
+        instead of the dot. Enter opens each row under the chosen account,
+        moving the conversation into that account's dir first when it
+        differs (both claude and codex; running sessions are refused).
+        "+" adds an account from here: it asks the label (the first time
+        also a label for the current dirs), runs the login flows like
+        ccr -AddAccount, and reopens the picker. Ctrl+M again returns to
+        normal marks. Ctrl+A is an alias for terminals that deliver Ctrl+M
+        as Enter.
     .EXAMPLE
         ccr -Root work
         With several accounts configured, list only the "work" account's
@@ -1587,6 +1624,15 @@ function Resume-CcSessions {
         $picked = Select-CcrSession -Sessions $sorted -InitialFilter $filterText -NoMultiOpen:(-not $canMultiOpen) -ClaudeRoots $claudeRoots -CodexRoots $codexRoots
     }
     if ($null -eq $picked) { Write-Host 'ccr: cancelled.'; return }
+    if ($picked -isnot [System.Array] -and $picked.PSObject.Properties['Restart']) {
+        # An account was added from inside the picker: run again from the top
+        # with the same arguments, so the listing and the account column
+        # reflect the new ccr.json.
+        $again = @{} + $PSBoundParameters
+        if ($picked.Filter) { $again['Filter'] = @($picked.Filter) } else { $again.Remove('Filter') }
+        Resume-CcSessions @again
+        return
+    }
 
     # With several accounts, a tool process must see the config dir of the
     # account its conversation belongs to (CLAUDE_CONFIG_DIR / CODEX_HOME). In

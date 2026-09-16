@@ -130,10 +130,13 @@ The hint line turns into the account list, and `Space` now cycles a **number** o
 highlighted row instead of the dot:
 
 ```
-ACCOUNT MODE: 1 personal (me@gmail.com) · 2 work (me@company.com) · Space cycles the number · Enter open · Ctrl+M back
-1 claude work      1h  Billing API pagination          D:epospi-server
-2 claude personal  3h  Home automation bridge          D:epos\home
-  codex  work      5h  migrate build to vite           D:epos\web-app
+ACCOUNT MODE: 1 personal (me@gmail.com) · 2 work (me@company.com) · Space cycles the number · Enter open · + add account · Ctrl+M back
+1 claude work      1h  Billing API pagination          D:
+epospi-server
+2 claude personal  3h  Home automation bridge          D:
+epos\home
+  codex  work      5h  migrate build to vite           D:
+epos\web-app
 ```
 
 `Enter` opens every numbered row **under that account**. When the number differs from the
@@ -145,6 +148,13 @@ header shows how many rows will be re-homed, `-WhatIf` lists the moves, and a ru
 refused (close its tab first). Only accounts that have a dir for the row's tool are offered.
 
 `Ctrl+M` again returns to normal green marks; numbered rows keep their numbers.
+
+### Adding an account from the picker — `+`
+
+You do not need the command line for the first setup: press `Ctrl+M`, then `+` (or `Insert`).
+ccr asks the new label and, if no account exists yet, a label for the current login (the one
+whose sessions you already see). It then leaves the picker, runs the same login flows as
+`ccr -AddAccount`, waits for a key, and reopens the picker with the new account column.
 
 ## Moving a conversation to the other account
 
