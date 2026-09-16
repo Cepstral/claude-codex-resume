@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.27'
+$script:CcrVersion = '0.28'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -255,35 +255,49 @@ function Save-CcrConfig([object]$Config) {
     $Config | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $script:CcrConfigPath -Encoding utf8NoBOM
 }
 
-# Register a new account: one fresh config dir per tool next to the default
-# one (~/.claude-<label>, ~/.codex-<label>), the tool's own interactive
-# login run inside it, and the entry recorded in ccr.json. The first call
-# also records the CURRENT default dirs under a label so existing sessions
-# keep an account name.
-function Add-CcrAccount {
-    param(
-        [Parameter(Mandatory)][string]$Label,
-        [string]$Tool = 'all',
-        # Label for the CURRENT default dirs on the first call; asked
-        # interactively when not given (the picker passes it in).
-        [string]$ExistingLabel = ''
-    )
-    if ($Label -notmatch '^[A-Za-z0-9_-]{1,20}$') { Write-Error "ccr: account label must be 1-20 letters/digits/_/- (got '$Label')"; return }
+# Multi-account mode starts by giving the dirs the tools use today a label,
+# so the sessions already there keep an account name: that label is fixed,
+# "default", and nothing moves.
+$script:CcrDefaultLabel = 'default'
+
+function Get-CcrMapCount([object]$Map) { if ($Map) { @($Map.PSObject.Properties).Count } else { 0 } }
+
+# Is multi-account mode on (ccr.json lists at least one account)?
+function Test-CcrMultiAccount {
+    $cfg = Get-CcrConfig
+    [bool]($cfg -and ((Get-CcrMapCount $cfg.claudeRoots) -or (Get-CcrMapCount $cfg.codexRoots)))
+}
+
+# Turn multi-account mode on: record the current default dir of each tool
+# under the "default" label. Returns the config; no-op when already on.
+function Enable-CcrMultiAccount {
     $cfg = Get-CcrConfig
     if (-not $cfg) { $cfg = [pscustomobject]@{} }
     foreach ($key in 'claudeRoots', 'codexRoots') {
-        if (-not $cfg.PSObject.Properties[$key]) { $cfg | Add-Member -NotePropertyName $key -NotePropertyValue ([pscustomobject]@{}) }
+        if (-not $cfg.PSObject.Properties[$key] -or -not $cfg.$key) { $cfg | Add-Member -NotePropertyName $key -NotePropertyValue ([pscustomobject]@{}) -Force }
     }
+    if ((Get-CcrMapCount $cfg.claudeRoots) -or (Get-CcrMapCount $cfg.codexRoots)) { return $cfg }
+    $cfg.claudeRoots | Add-Member -NotePropertyName $script:CcrDefaultLabel -NotePropertyValue (Get-CcrClaudeRoot)
+    $cfg.codexRoots | Add-Member -NotePropertyName $script:CcrDefaultLabel -NotePropertyValue (Get-CcrCodexRoot)
+    $cfg | Add-Member -NotePropertyName defaultRoot -NotePropertyValue $script:CcrDefaultLabel -Force
+    Save-CcrConfig $cfg
+    Write-Host "ccr: multi-account mode is on - the dirs claude and codex use today are the '$($script:CcrDefaultLabel)' account (nothing moved)." -ForegroundColor Green
+    $cfg
+}
+
+# Register a new account for one tool (or both): a fresh config dir next to
+# the default one (~/.claude-<label>, ~/.codex-<label>), the tool's own
+# interactive login run inside it, and the entry recorded in ccr.json.
+# Turns multi-account mode on first when needed.
+function Add-CcrAccount {
+    param(
+        [Parameter(Mandatory)][string]$Label,
+        [ValidateSet('claude', 'codex', 'all')][string]$Tool = 'all'
+    )
+    if ($Label -notmatch '^[A-Za-z0-9_-]{1,20}$') { throw "ccr: account label must be 1-20 letters/digits/_/- (got '$Label')" }
+    if ($Label -eq $script:CcrDefaultLabel) { throw "ccr: '$Label' is the label of the dirs in use today - pick another one" }
+    $cfg = Enable-CcrMultiAccount
     $tools = if ($Tool -eq 'all') { @('claude', 'codex') } else { @($Tool) }
-    $firstTime = -not ($cfg.claudeRoots.PSObject.Properties.Count -or $cfg.codexRoots.PSObject.Properties.Count)
-    if ($firstTime) {
-        # Give the existing default dirs a name so their sessions stay listed.
-        $existing = if ($ExistingLabel) { $ExistingLabel } else { Read-Host 'label for the CURRENT login/dirs (e.g. personal)' }
-        if ($existing -notmatch '^[A-Za-z0-9_-]{1,20}$' -or $existing -eq $Label) { Write-Error 'ccr: invalid or duplicate label'; return }
-        $cfg.claudeRoots | Add-Member -NotePropertyName $existing -NotePropertyValue (Get-CcrClaudeRoot)
-        $cfg.codexRoots | Add-Member -NotePropertyName $existing -NotePropertyValue (Get-CcrCodexRoot)
-        $cfg | Add-Member -NotePropertyName defaultRoot -NotePropertyValue $existing -Force
-    }
     foreach ($t in $tools) {
         $map = if ($t -eq 'claude') { $cfg.claudeRoots } else { $cfg.codexRoots }
         if ($map.PSObject.Properties[$Label]) { Write-Warning "ccr: $t account '$Label' already configured - skipping"; continue }
@@ -302,22 +316,63 @@ function Add-CcrAccount {
     Show-CcrAccounts
 }
 
+# Forget an account: every session it holds moves into the tool's default
+# account first (claude: transcript + sidecar into the same project slug;
+# codex: rollout into the same sessions/YYYY/MM/DD path), then the entry
+# leaves ccr.json. The dir and its login stay on disk. Refused while one of
+# its sessions is running, and for the default account itself.
 function Remove-CcrAccount {
-    param([Parameter(Mandatory)][string]$Label)
+    param(
+        [Parameter(Mandatory)][string]$Label,
+        [ValidateSet('claude', 'codex', 'all')][string]$Tool = 'all'
+    )
     $cfg = Get-CcrConfig
-    if (-not $cfg) { Write-Error 'ccr: no accounts configured'; return }
-    $hit = $false
-    foreach ($key in 'claudeRoots', 'codexRoots') {
-        $map = $cfg.$key
-        if ($map -and $map.PSObject.Properties[$Label]) { $map.PSObject.Properties.Remove($Label); $hit = $true }
+    if (-not $cfg) { throw 'ccr: no accounts configured' }
+    $tools = if ($Tool -eq 'all') { @('claude', 'codex') } else { @($Tool) }
+    # Plan everything before moving anything.
+    $plan = foreach ($t in $tools) {
+        $roots = @(Get-CcrRoots -Tool $t)
+        $src = @($roots | Where-Object { $_.Label -eq $Label })
+        if ($src.Count -eq 0) { continue }
+        $dst = @($roots | Where-Object Default)[0]
+        if ($dst.Label -eq $Label) { throw "ccr: '$Label' is the default $t account - it cannot be removed; turn multi-account mode off instead" }
+        $sessions = @(if ($t -eq 'claude') { Get-CcrClaudeSession -Root $src[0] } else { Get-CcrCodexSession -Root $src[0] })
+        $running = @($sessions | Where-Object Running)
+        if ($running.Count) { throw "ccr: $($running.Count) $t session(s) of '$Label' are running - close them first" }
+        [pscustomobject]@{ Tool = $t; Src = $src[0]; Dst = $dst; Sessions = $sessions }
     }
-    if (-not $hit) { Write-Error "ccr: no account '$Label' configured"; return }
-    if ($cfg.defaultRoot -eq $Label) {
-        $left = @($cfg.claudeRoots.PSObject.Properties.Name) + @($cfg.codexRoots.PSObject.Properties.Name) | Select-Object -Unique -First 1
-        $cfg.defaultRoot = "$left"
+    if (-not $plan) { throw "ccr: no account '$Label' configured" }
+    foreach ($step in $plan) {
+        foreach ($sess in $step.Sessions) { [void](Move-CcrSessionToRoot -Session $sess -TargetRoot $step.Dst) }
+        $map = if ($step.Tool -eq 'claude') { $cfg.claudeRoots } else { $cfg.codexRoots }
+        $map.PSObject.Properties.Remove($Label)
+        Write-Host "ccr: $($step.Tool) account '$Label' removed - $($step.Sessions.Count) session(s) moved to '$($step.Dst.Label)' ($(Format-CcrCwd $step.Dst.Path 50)); the dir $(Format-CcrCwd $step.Src.Path 50) and its login stay on disk."
     }
     Save-CcrConfig $cfg
-    Write-Host "ccr: account '$Label' forgotten (its config dirs and sessions were NOT deleted)."
+}
+
+# Turn multi-account mode off: every other account's sessions move into the
+# default account of its tool (see Remove-CcrAccount), then the account keys
+# leave ccr.json (the file goes too when nothing else is in it), so both
+# tools are back to their single default dir. Other dirs and their logins
+# stay on disk.
+function Disable-CcrMultiAccount {
+    $cfg = Get-CcrConfig
+    if (-not (Test-CcrMultiAccount)) { Write-Host 'ccr: multi-account mode is not on.'; return }
+    foreach ($t in 'claude', 'codex') {
+        $roots = @(Get-CcrRoots -Tool $t)
+        $dst = @($roots | Where-Object Default)[0]
+        $plain = if ($t -eq 'claude') { Get-CcrClaudeRoot } else { Get-CcrCodexRoot }
+        if ($dst.Label -and (Expand-CcrPath $dst.Path) -ne (Expand-CcrPath $plain)) {
+            throw "ccr: the default $t account lives in $($dst.Path), but $t itself uses $plain - the sessions would disappear from ccr. Make them the same dir first."
+        }
+    }
+    $labels = @(@(Get-CcrClaudeRoots) + @(Get-CcrCodexRoots) | Where-Object { $_.Label -and -not $_.Default } | ForEach-Object Label | Select-Object -Unique)
+    foreach ($lbl in $labels) { Remove-CcrAccount -Label $lbl }
+    $cfg = Get-CcrConfig
+    foreach ($key in 'claudeRoots', 'codexRoots', 'defaultRoot') { if ($cfg.PSObject.Properties[$key]) { $cfg.PSObject.Properties.Remove($key) } }
+    if (@($cfg.PSObject.Properties).Count -eq 0) { Remove-Item -LiteralPath $script:CcrConfigPath -Force } else { Save-CcrConfig $cfg }
+    Write-Host 'ccr: multi-account mode is off - claude and codex are back to their single default dirs.' -ForegroundColor Green
 }
 
 # sessionId -> live claude process id (stale pid files filtered out).
@@ -823,6 +878,152 @@ function Show-CcrDeleteConfirm {
     return ($k.KeyChar -eq 'y' -or $k.KeyChar -eq 'Y')
 }
 
+# Draw a whole screen of lines inside the alt buffer (long plain lines are
+# cut with an ellipsis; lines carrying escape codes are left alone).
+function Write-CcrScreen([string[]]$Lines) {
+    $w = [Console]::WindowWidth
+    $sb = [System.Text.StringBuilder]::new()
+    [void]$sb.Append("`e[H")
+    foreach ($l in $Lines) {
+        $t = $l
+        if ($t -notmatch "`e" -and $t.Length -gt $w - 1) { $t = $t.Substring(0, $w - 2) + [char]0x2026 }
+        [void]$sb.Append($t).Append("`e[K`n")
+    }
+    [void]$sb.Append("`e[J")
+    [Console]::Write($sb.ToString())
+}
+
+# Account page (Ctrl+M in the picker). The first time it explains what
+# turning multi-account mode on does and goes straight to adding the first
+# extra account (tool, then label). Afterwards it lists the accounts per
+# tool - with who is logged in where - and offers: Enter = account mode in
+# the picker (number the rows), + = add an account, Del = remove the
+# highlighted one (its sessions go to the default account), X = turn
+# multi-account mode off (every session goes to the default account).
+# Runs inside the alt buffer; the work itself is done by the caller on the
+# main screen. Returns @{ Action = 'mode' | 'add' | 'remove' | 'disable';
+# Tool; Label } or $null on Esc.
+function Show-CcrAccountPage {
+    param([object[]]$ClaudeRoots = @(), [object[]]$CodexRoots = @(), [hashtable]$Identity = @{})
+    $dot = [char]0x00B7
+    $labelHint = "1-20 letters/digits/_/- $dot Enter $dot Esc back"
+    $def = $script:CcrDefaultLabel
+
+    function Read-CcrNewAccount {
+        # tool, then label -> @{ Action = 'add'; Tool; Label } or $null
+        $tool = Select-CcrTool -Title 'tool for the new account' -ClaudeNote 'fresh dir + claude auth login' -CodexNote 'fresh dir + codex login'
+        if (-not $tool) { return $null }
+        $taken = @(@(if ($tool -eq 'claude') { $ClaudeRoots } else { $CodexRoots }) | ForEach-Object Label | Where-Object { $_ })
+        while ($true) {
+            $label = Read-CcrInput -Prompt "label for the new $tool account (e.g. work)> " -Hint $labelHint
+            if ($null -eq $label) { return $null }
+            if ($label -notmatch '^[A-Za-z0-9_-]{1,20}$') { Show-CcrNotice "ccr: invalid label '$label' ($labelHint)" '33'; continue }
+            if ($label -eq $def -or $label -in $taken) { Show-CcrNotice "ccr: $tool account '$label' already exists" '33'; continue }
+            return [pscustomobject]@{ Action = 'add'; Tool = $tool; Label = $label }
+        }
+    }
+
+    $rows = @(foreach ($t in 'claude', 'codex') {
+            foreach ($r in @(if ($t -eq 'claude') { $ClaudeRoots } else { $CodexRoots })) {
+                if ($r.Label) { [pscustomobject]@{ Tool = $t; Label = $r.Label; Path = $r.Path; Default = $r.Default } }
+            }
+        })
+
+    if ($rows.Count -eq 0) {
+        # --- activation page ---
+        Write-CcrScreen @(
+            "`e[1mMulti-account mode`e[22m",
+            '',
+            '  You are about to turn multi-account mode on. Nothing is moved or logged out:',
+            "  the dirs claude and codex use today become the '$def' account, and every",
+            '  session you see now belongs to it.',
+            "    claude   $(Format-CcrCwd (Get-CcrClaudeRoot) 60)",
+            "    codex    $(Format-CcrCwd (Get-CcrCodexRoot) 60)",
+            '',
+            '  Next you choose a tool and a label for the additional account. ccr creates a',
+            "  fresh dir for it (~\.claude-<label> or ~\.codex-<label>) and runs that tool's",
+            '  own login there, so each account keeps its own credentials and settings.',
+            '  Afterwards Ctrl+M lists the accounts, adds more, or turns the mode off again.',
+            '',
+            "  `e[32m[Enter]`e[39m continue    `e[2mEsc: back, nothing changes`e[22m")
+        while ($true) {
+            $k = [Console]::ReadKey($true)
+            if ($k.Key -eq [ConsoleKey]::Enter) { return (Read-CcrNewAccount) }
+            if ($k.Key -eq [ConsoleKey]::Escape -or ($k.Key -eq [ConsoleKey]::C -and ($k.Modifiers -band [ConsoleModifiers]::Control))) { return $null }
+        }
+    }
+
+    # --- list page ---
+    $missing = @($rows | Where-Object { -not $Identity.ContainsKey("$($_.Tool)|$($_.Label)") })
+    if ($missing.Count) {
+        Write-CcrScreen @("`e[1mAccounts`e[22m", '', "  `e[2mchecking who is logged in where ($($missing.Count) dir(s))...`e[22m")
+        foreach ($r in $missing) { $Identity["$($r.Tool)|$($r.Label)"] = Get-CcrLoginIdentity -Tool $r.Tool -RootPath $r.Path }
+    }
+    $cursor = 0
+    $labelW = [Math]::Max(7, ($rows | ForEach-Object { $_.Label.Length } | Measure-Object -Maximum).Maximum)
+    $multi = ($ClaudeRoots.Count -gt 1) -or ($CodexRoots.Count -gt 1)
+    while ($true) {
+        $lines = [System.Collections.Generic.List[string]]::new()
+        $lines.Add("`e[1mAccounts`e[22m  `e[2m$($script:CcrConfigPath)`e[22m")
+        $lines.Add("`e[2m$([char]0x2191)$([char]0x2193) move $dot Enter account mode (number the rows) $dot + add $dot Del remove $dot X turn off $dot Esc back`e[22m")
+        for ($i = 0; $i -lt $rows.Count; $i++) {
+            $r = $rows[$i]
+            $toolColor = if ($r.Tool -eq 'claude') { "`e[38;5;208m" } else { "`e[36m" }
+            $who = $Identity["$($r.Tool)|$($r.Label)"]
+            $row = "  $toolColor$($r.Tool.PadRight(7))`e[39m`e[35m$($r.Label.PadRight($labelW))`e[39m  $((Format-CcrCwd $r.Path 40).PadRight(40))  $who$(if ($r.Default) { "  `e[2m(default)`e[22m" })"
+            if ($i -eq $cursor) { $row = "`e[7m$row`e[27m" }
+            $lines.Add($row)
+        }
+        $lines.Add('')
+        $lines.Add("  `e[2mA session always resumes under the account whose dir it lives in. Account mode moves one to another account.`e[22m")
+        Write-CcrScreen $lines
+        $k = [Console]::ReadKey($true)
+        if ($k.Key -eq [ConsoleKey]::C -and ($k.Modifiers -band [ConsoleModifiers]::Control)) { return $null }
+        switch ($k.Key) {
+            'UpArrow' { if ($cursor -gt 0) { $cursor-- } }
+            'DownArrow' { if ($cursor -lt $rows.Count - 1) { $cursor++ } }
+            'Enter' {
+                if ($multi) { return [pscustomobject]@{ Action = 'mode' } }
+                Show-CcrNotice "ccr: add a second account first (+) - account mode needs something to move to" '33'
+            }
+            'Escape' { return $null }
+            'Insert' { $r = Read-CcrNewAccount; if ($r) { return $r } }
+            'Delete' {
+                $r = $rows[$cursor]
+                if ($r.Default) { Show-CcrNotice "ccr: '$($r.Label)' is the default $($r.Tool) account - turn multi-account mode off (X) instead" '33'; continue }
+                Write-CcrScreen @(
+                    "`e[1mRemove account`e[22m",
+                    '',
+                    "    $($r.Tool) $dot `e[1m$($r.Label)`e[22m  $(Format-CcrCwd $r.Path 60)",
+                    '',
+                    "  Every $($r.Tool) session of this account moves to the '$def' account and",
+                    "  keeps working there. The dir and its login stay on disk; ccr just forgets it.",
+                    '  Refused while one of its sessions is running.',
+                    '',
+                    "  `e[31m[y]`e[39m remove    `e[2many other key: cancel`e[22m")
+                $c = [Console]::ReadKey($true)
+                if ($c.KeyChar -in 'y', 'Y') { return [pscustomobject]@{ Action = 'remove'; Tool = $r.Tool; Label = $r.Label } }
+            }
+            default {
+                if ($k.KeyChar -eq '+') { $r = Read-CcrNewAccount; if ($r) { return $r } }
+                elseif ($k.KeyChar -in 'x', 'X') {
+                    Write-CcrScreen @(
+                        "`e[1mTurn multi-account mode off`e[22m",
+                        '',
+                        "  Every session of every other account moves to the '$def' account (the dirs",
+                        '  claude and codex use today) and keeps working there. The other dirs and their',
+                        "  logins stay on disk; ccr forgets them and goes back to a single account.",
+                        '  Refused while a session of another account is running.',
+                        '',
+                        "  `e[31m[y]`e[39m turn off    `e[2many other key: cancel`e[22m")
+                    $c = [Console]::ReadKey($true)
+                    if ($c.KeyChar -in 'y', 'Y') { return [pscustomobject]@{ Action = 'disable' } }
+                }
+            }
+        }
+    }
+}
+
 # One-line notice inside the picker; waits for a key.
 function Show-CcrNotice {
     param([string]$Text, [string]$Color = '31')
@@ -889,14 +1090,19 @@ function Select-CcrRoot {
 # Tool chooser for a NEW conversation: claude or codex. Returns the tool
 # name, or $null on Esc. Runs inside the caller's alt buffer.
 function Select-CcrTool {
+    param(
+        [string]$Title = 'tool for the new conversation',
+        [string]$ClaudeNote = 'asks for a session name',
+        [string]$CodexNote = 'no start name - /rename inside'
+    )
     $tools = @(
-        [pscustomobject]@{ Name = 'claude'; Color = "`e[38;5;208m"; Note = 'asks for a session name' },
-        [pscustomobject]@{ Name = 'codex'; Color = "`e[36m"; Note = 'no start name - /rename inside' }
+        [pscustomobject]@{ Name = 'claude'; Color = "`e[38;5;208m"; Note = $ClaudeNote },
+        [pscustomobject]@{ Name = 'codex'; Color = "`e[36m"; Note = $CodexNote }
     )
     $cursor = 0
     while ($true) {
         $sb = [System.Text.StringBuilder]::new()
-        [void]$sb.Append("`e[H").Append('tool for the new conversation').Append("`e[K`n")
+        [void]$sb.Append("`e[H").Append($Title).Append("`e[K`n")
         [void]$sb.Append("`e[2m$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Enter choose $([char]0x00B7) c / x jump $([char]0x00B7) Esc back`e[22m`e[K")
         for ($i = 0; $i -lt $tools.Count; $i++) {
             $t = $tools[$i]
@@ -1073,7 +1279,7 @@ function Select-CcrSession {
     $acct = @{}
     $acctMode = $false
     $accounts = @(@(@($ClaudeRoots) + @($CodexRoots) | ForEach-Object { "$($_.Label)" } | Where-Object { $_ }) | Select-Object -Unique)
-    $acctIdent = @{}   # label -> who is logged in there; filled on first Ctrl+M
+    $acctIdent = @{}   # "tool|label" -> who is logged in there; filled by the account page
     function Get-CcrAcctAvail([object]$row) {
         $roots = if ($row.Tool -eq 'codex') { $CodexRoots } else { $ClaudeRoots }
         @($accounts | Where-Object { $lbl = $_; @($roots | Where-Object { $_.Label -eq $lbl }).Count -gt 0 })
@@ -1127,11 +1333,11 @@ function Select-CcrSession {
             [void]$sb.Append($line1).Append("`e[K`n")
             if ($acctMode) {
                 $legend = for ($ai = 0; $ai -lt $accounts.Count; $ai++) {
-                    $who = if ($acctIdent[$accounts[$ai]]) { " ($($acctIdent[$accounts[$ai]]))" } else { '' }
+                    $id = $acctIdent["claude|$($accounts[$ai])"]; if (-not $id) { $id = $acctIdent["codex|$($accounts[$ai])"] }
+                    $who = if ($id) { " ($($id -replace ' \(.*\)$', ''))" } else { '' }
                     "$($ai + 1) $($accounts[$ai])$who"
                 }
-                $legendTxt = if ($accounts.Count) { "$($legend -join " $([char]0x00B7) ") $([char]0x00B7) Space cycles the number $([char]0x00B7) Enter open" } else { 'no accounts yet' }
-                $hint = "ACCOUNT MODE: $legendTxt $([char]0x00B7) + add account $([char]0x00B7) Ctrl+M back"
+                $hint = "ACCOUNT MODE: $($legend -join " $([char]0x00B7) ") $([char]0x00B7) Space cycles the number $([char]0x00B7) Enter open $([char]0x00B7) Ctrl+M back"
                 if ($hint.Length -gt $w - 1) { $hint = $hint.Substring(0, $w - 1) }
                 [void]$sb.Append("`e[35m").Append($hint).Append("`e[39m`e[K")
             }
@@ -1188,56 +1394,43 @@ function Select-CcrSession {
             $k = [Console]::ReadKey($true)
             if ($k.Key -eq [ConsoleKey]::C -and ($k.Modifiers -band [ConsoleModifiers]::Control)) { return $null }
             $ctrl = [bool]($k.Modifiers -band [ConsoleModifiers]::Control)
-            # Ctrl+M toggles account mode. Some terminals deliver Ctrl+M as Enter
-            # with Control set (it is the CR byte); Ctrl+A is an alias that
-            # survives every terminal.
+            # Ctrl+M: the account page (or, from account mode, back to normal
+            # marks). Some terminals deliver Ctrl+M as Enter with Control set
+            # (it is the CR byte); Ctrl+A is an alias that survives every
+            # terminal.
             if ($ctrl -and ($k.Key -in [ConsoleKey]::M, [ConsoleKey]::A, [ConsoleKey]::Enter)) {
-                $acctMode = -not $acctMode
-                if ($acctMode -and $acctIdent.Count -eq 0) {
-                    foreach ($lbl in $accounts) {
-                        $r = @($ClaudeRoots | Where-Object { $_.Label -eq $lbl })
-                        $t = 'claude'
-                        if ($r.Count -eq 0) { $r = @($CodexRoots | Where-Object { $_.Label -eq $lbl }); $t = 'codex' }
-                        if ($r.Count) { $acctIdent[$lbl] = (Get-CcrLoginIdentity -Tool $t -RootPath $r[0].Path) -replace ' \(.*\)$', '' }
+                if ($acctMode) { $acctMode = $false; continue }
+                $act = Show-CcrAccountPage -ClaudeRoots $ClaudeRoots -CodexRoots $CodexRoots -Identity $acctIdent
+                if ($null -eq $act) { continue }
+                if ($act.Action -eq 'mode') { $acctMode = $true; continue }
+                # add / remove / disable: leave the alt buffer (login flows and
+                # progress draw on the main screen), do it, then restart the
+                # picker so the listing reflects the new ccr.json.
+                [Console]::Write("`e[?25h`e[?1049l")
+                [Console]::TreatControlCAsInput = $prevCtrlC
+                try {
+                    if ($WhatIfPreference) {
+                        Write-Host "WhatIf: would $($act.Action) $(if ($act.Label) { "$($act.Tool) account '$($act.Label)'" } else { 'multi-account mode' })." -ForegroundColor Yellow
+                    }
+                    else {
+                        switch ($act.Action) {
+                            'add' { Add-CcrAccount -Label $act.Label -Tool $act.Tool }
+                            'remove' { Remove-CcrAccount -Label $act.Label -Tool $act.Tool }
+                            'disable' { Disable-CcrMultiAccount }
+                        }
                     }
                 }
-                continue
+                catch { Write-Warning "ccr: $($act.Action) failed: $_" }
+                Write-Host ''
+                Write-Host 'ccr: press any key to go back to the picker' -ForegroundColor DarkGray
+                [void][Console]::ReadKey($true)
+                return [pscustomobject]@{ Restart = $true; Filter = $filter }
             }
             if ($k.Key -eq [ConsoleKey]::N -and $ctrl) {
                 # Ctrl+N: pick a folder (and tool, and account) for a brand-new conversation.
                 $newPick = Select-CcrPath -Sessions $Sessions -ClaudeRoots $ClaudeRoots -CodexRoots $CodexRoots
                 if ($newPick) { return [pscustomobject]@{ NewSessionPath = $newPick.Path; NewSessionTool = $newPick.Tool; NewSessionName = $newPick.Name; NewSessionRoot = $newPick.Root } }
                 continue
-            }
-            if ($acctMode -and ($k.KeyChar -eq '+' -or $k.Key -eq [ConsoleKey]::Insert)) {
-                # Ask the label(s) inside the alt buffer, then hand the terminal
-                # to the tool's own login flow and restart the picker so the
-                # new account (and, the first time, the label given to the
-                # current dirs) shows up everywhere.
-                $labelHint = "1-20 letters/digits/_/-  $([char]0x00B7) Enter $([char]0x00B7) Esc back"
-                $newLabel = Read-CcrInput -Prompt 'new account label> ' -Hint $labelHint
-                if ($null -eq $newLabel) { continue }
-                if ($newLabel -notmatch '^[A-Za-z0-9_-]{1,20}$') { Show-CcrNotice "ccr: invalid label '$newLabel' ($labelHint)" '33'; continue }
-                if ($newLabel -in $accounts) { Show-CcrNotice "ccr: account '$newLabel' already exists" '33'; continue }
-                $existingLabel = ''
-                if ($accounts.Count -eq 0) {
-                    $existingLabel = Read-CcrInput -Prompt 'label for the CURRENT login/dirs (e.g. personal)> ' -Hint $labelHint
-                    if ($null -eq $existingLabel) { continue }
-                    if ($existingLabel -notmatch '^[A-Za-z0-9_-]{1,20}$' -or $existingLabel -eq $newLabel) { Show-CcrNotice "ccr: invalid or duplicate label '$existingLabel'" '33'; continue }
-                }
-                # Leave the alt buffer: the login flows draw on the main screen.
-                [Console]::Write("`e[?25h`e[?1049l")
-                [Console]::TreatControlCAsInput = $prevCtrlC
-                try {
-                    if ($WhatIfPreference) { Write-Host "WhatIf: would add account '$newLabel'$(if ($existingLabel) { " (current dirs labeled '$existingLabel')" })." -ForegroundColor Yellow }
-                    else { Add-CcrAccount -Label $newLabel -ExistingLabel $existingLabel }
-                }
-                catch { Write-Warning "ccr: adding the account failed: $_" }
-                Write-Host ''
-                Write-Host 'ccr: press any key to go back to the picker' -ForegroundColor DarkGray
-                [void][Console]::ReadKey($true)
-                # The caller re-enumerates with the new config and reopens the picker.
-                return [pscustomobject]@{ Restart = $true; Filter = $filter }
             }
             switch ($k.Key) {
                 'UpArrow' { if ($cursor -gt 0) { $cursor-- } }
@@ -1254,8 +1447,7 @@ function Select-CcrSession {
                             # none -> 1 -> 2 -> ... -> none, over the accounts that
                             # have a dir for this row's tool.
                             $avail = Get-CcrAcctAvail $row
-                            if ($accounts.Count -eq 0) { Show-CcrNotice "ccr: no accounts yet - press + to add one" '33' }
-                            elseif ($avail.Count -eq 0) { Show-CcrNotice "ccr: no account has a $($row.Tool) dir configured" '33' }
+                            if ($avail.Count -eq 0) { Show-CcrNotice "ccr: no account has a $($row.Tool) dir configured" '33' }
                             else {
                                 $cur = if ($acct.ContainsKey($key)) { [array]::IndexOf($avail, $acct[$key]) } else { -1 }
                                 if ($cur + 1 -ge $avail.Count) { $acct.Remove($key) } else { $acct[$key] = $avail[$cur + 1] }
@@ -1460,24 +1652,31 @@ function Resume-CcSessions {
         Run the picker, then print the wt.exe command line instead of launching.
     .EXAMPLE
         ccr -AddAccount work
-        Set up a second account for claude and codex: ccr creates one data dir
+        Second account (multi-account mode): creates a fresh config dir
         per tool (~/.claude-work, ~/.codex-work), runs each tool's own login
-        flow inside it, and records both in ccr.json next to this script. The
-        first time it also asks for a label for the current login (e.g.
-        "personal"). ccr -Accounts shows who is logged in where;
-        ccr -RemoveAccount work forgets the entry (nothing is deleted).
+        flow inside it, and records both in ccr.json next to this script.
+        The first time the dirs in use today become the "default" account
+        (nothing moves). -Tool claude / -Tool codex limits it to one tool.
+        ccr -Accounts shows who is logged in where; ccr -RemoveAccount work
+        moves its sessions to the default account and forgets the entry;
+        ccr -DisableAccounts does that for every account and turns
+        multi-account mode off. Dirs and logins are never deleted.
     .EXAMPLE
         ccr   then Ctrl+M
-        Account mode: the hint line lists the accounts as 1, 2, ...; Space
-        cycles a number on the highlighted row (none -> 1 -> 2 -> none)
-        instead of the dot. Enter opens each row under the chosen account,
-        moving the conversation into that account's dir first when it
-        differs (both claude and codex; running sessions are refused).
-        "+" adds an account from here: it asks the label (the first time
-        also a label for the current dirs), runs the login flows like
-        ccr -AddAccount, and reopens the picker. Ctrl+M again returns to
-        normal marks. Ctrl+A is an alias for terminals that deliver Ctrl+M
-        as Enter.
+        The account page. The first time it explains that the dirs in use
+        today become the "default" account and asks tool + label for the
+        additional one, then runs that tool's login (like ccr -AddAccount).
+        Afterwards it lists the accounts with who is logged in where:
+        + adds one, Del removes the highlighted one (its sessions go to
+        the default account), X turns multi-account mode off (every
+        session goes to the default account), Enter switches the picker to
+        ACCOUNT MODE: the hint line numbers the accounts and Space cycles a
+        number on the highlighted row (none -> 1 -> 2 -> none) instead of
+        the dot; Enter then opens each row under the chosen account, moving
+        the conversation into that account's dir first when it differs
+        (both claude and codex; running sessions are refused). Ctrl+M again
+        returns to normal marks. Ctrl+A is an alias for terminals that
+        deliver Ctrl+M as Enter.
     .EXAMPLE
         ccr -Root work
         With several accounts configured, list only the "work" account's
@@ -1526,7 +1725,8 @@ function Resume-CcSessions {
         # forgets the entry (no data is deleted).
         [switch]$Accounts,
         [string]$AddAccount = '',
-        [string]$RemoveAccount = ''
+        [string]$RemoveAccount = '',
+        [switch]$DisableAccounts
     )
     $filterText = if ($Filter) { ($Filter -join ' ').Trim() } else { '' }
 
@@ -1556,6 +1756,10 @@ function Resume-CcSessions {
             if ($filterText) { $inv += " -Filter '$($filterText -replace "'", "''")'" }
             if ($New) { $inv += ' -New' }
             if ($NewWindow) { $inv += ' -NewWindow' }
+            if ($Accounts) { $inv += ' -Accounts' }
+            if ($AddAccount) { $inv += " -AddAccount '$AddAccount'" }
+            if ($RemoveAccount) { $inv += " -RemoveAccount '$RemoveAccount'" }
+            if ($DisableAccounts) { $inv += ' -DisableAccounts' }
             if ($Root) { $inv += " -Root '$($Root -replace "'", "''")'" }
             if ($WhatIfPreference) { $inv += ' -WhatIf' }
             & ([scriptblock]::Create($inv))
@@ -1566,8 +1770,15 @@ function Resume-CcSessions {
 
     # --- account management (multi-account) --------------------------------
     if ($Accounts) { Show-CcrAccounts; return }
-    if ($AddAccount) { Add-CcrAccount -Label $AddAccount -Tool $Tool; return }
-    if ($RemoveAccount) { Remove-CcrAccount -Label $RemoveAccount; return }
+    if ($AddAccount -or $RemoveAccount -or $DisableAccounts) {
+        try {
+            if ($AddAccount) { Add-CcrAccount -Label $AddAccount -Tool $Tool }
+            elseif ($RemoveAccount) { Remove-CcrAccount -Label $RemoveAccount -Tool $Tool }
+            else { Disable-CcrMultiAccount }
+        }
+        catch { Write-Error "$_" }
+        return
+    }
 
     # Config dirs (accounts) per tool. One unlabeled root each unless ccr.json
     # says otherwise; -Root narrows the LISTING to a single configured account.

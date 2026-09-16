@@ -7,31 +7,67 @@ exactly that: **one dir per account and tool**, each with the tool's own normal 
 A conversation belongs to the account whose dir it lives in, so ccr always resumes it under the
 right account with no bookkeeping — and ccr never touches a credential.
 
-## Setup (once) — from inside ccr
+## Setup (once) — from inside the picker, or from the command line
 
-```powershell
-ccr -AddAccount work
+Press `Ctrl+M` in the picker. The first time you get the activation page:
+
+```
+Multi-account mode
+
+  You are about to turn multi-account mode on. Nothing is moved or logged out:
+  the dirs claude and codex use today become the 'default' account, and every
+  session you see now belongs to it.
+    claude   ~\.claude
+    codex    ~\.codex
+
+  Next you choose a tool and a label for the additional account. ccr creates a
+  fresh dir for it (~\.claude-<label> or ~\.codex-<label>) and runs that tool's
+  own login there, so each account keeps its own credentials and settings.
+  Afterwards Ctrl+M lists the accounts, adds more, or turns the mode off again.
+
+  [Enter] continue    Esc: back, nothing changes
 ```
 
-The first time, ccr asks for a label for your **current** login/dirs (say `personal`) so the
-sessions you already have keep an account name. Then, for each tool, it creates a fresh dir
-(`~/.claude-work`, `~/.codex-work`), runs the tool's own interactive login **in that dir**
-(`claude auth login` / `codex login` — a browser opens, you sign in with the work account),
-and records the entry in `ccr.json` next to `Resume-CcSessions.ps1`. `-Tool claude` or
-`-Tool codex` limits it to one tool.
+`Enter` asks which tool (claude or codex — accounts are per tool, so a second Claude account
+does not force a second Codex one) and a label (say `work`), then leaves the picker and runs
+that tool's own interactive login **in the fresh dir** (`claude auth login` / `codex login` — a
+browser opens, you sign in with the work account). The entry lands in `ccr.json` next to
+`Resume-CcSessions.ps1`, and the picker reopens with an account column.
+
+From then on `Ctrl+M` shows the account page:
+
+```
+Accounts  C:\Users\me\OneDrive\.claude\pwsh\ccr.json
+↑↓ move · Enter account mode (number the rows) · + add · Del remove · X turn off · Esc back
+  claude  default  ~\OneDrive\.claude     me@gmail.com (max)    (default)
+  claude  work     ~\.claude-work         me@company.com (max)
+  codex   default  ~\.codex               Logged in using ChatGPT  (default)
+```
+
+- `+` adds another account (tool, then label, then that tool's login).
+- `Del` removes the highlighted account: every session it holds **moves to the `default`
+  account** of that tool and keeps working there; the dir and its login stay on disk, ccr just
+  forgets them. Refused while one of its sessions is running.
+- `X` turns multi-account mode off: the same for every account at once, and `ccr.json` goes back
+  to no accounts, so both tools are on their single default dir again.
+- `Enter` switches the picker to account mode (below).
+
+The same from the command line:
 
 ```powershell
-ccr -Accounts              # what is configured, and who is logged in where
-ccr -RemoveAccount work    # forget the entry; dirs and sessions are NOT deleted
+ccr -AddAccount work              # both tools;  -Tool claude / -Tool codex for one
+ccr -Accounts                     # what is configured, and who is logged in where
+ccr -RemoveAccount work           # sessions move to 'default', entry forgotten
+ccr -DisableAccounts              # everything back to the single default dirs
 ```
 
 `ccr -Accounts` on a two-account setup:
 
 ```
-accounts in C:\Users\me\OneDrive\.claude\pwsh\ccr.json  (default: personal)
-  claude personal     ~\OneDrive\.claude          me@gmail.com (max)
+accounts in C:\Users\me\OneDrive\.claude\pwsh\ccr.json  (default: default)
+  claude default      ~\OneDrive\.claude          me@gmail.com (max)
   claude work         ~\.claude-work              me@company.com (max)
-  codex  personal     ~\.codex                    Logged in using ChatGPT
+  codex  default      ~\.codex                    Logged in using ChatGPT
   codex  work         ~\.codex-work               Logged in using ChatGPT
 ```
 
@@ -44,9 +80,9 @@ The same result is a `ccr.json` (`$env:CCR_CONFIG` can point elsewhere) plus one
 
 ```json
 {
-  "claudeRoots": { "personal": "~/.claude", "work": "~/.claude-work" },
-  "codexRoots":  { "personal": "~/.codex",  "work": "~/.codex-work"  },
-  "defaultRoot": "personal"
+  "claudeRoots": { "default": "~/.claude", "work": "~/.claude-work" },
+  "codexRoots":  { "default": "~/.codex",  "work": "~/.codex-work"  },
+  "defaultRoot": "default"
 }
 ```
 
@@ -70,10 +106,10 @@ An **account column** appears between the tool and the age (magenta), for both t
 filter>                                                 88/121 · 2 marked
 ↑↓ move · Space mark · Enter open · Ctrl+N new · Del delete · Esc cancel · type to filter · v0.20
 ● claude work      1h  Billing API pagination          D:\repos\api-server
-  claude personal  3h  Home automation bridge          D:\repos\home
+  claude default   3h  Home automation bridge          D:\repos\home
   codex  work      5h  migrate build to vite           D:\repos\web-app
-● claude personal  1d  Physics simulation viral videos D:\repos\sim-shorts
-  codex  personal  2d  sono affidabili i nebulizzatori ~
+● claude default   1d  Physics simulation viral videos D:\repos\sim-shorts
+  codex  default   2d  sono affidabili i nebulizzatori ~
 ```
 
 The label is part of the filter text, so typing `work` narrows to that account, exactly like
@@ -116,27 +152,24 @@ Claude, type the name → **choose the account**:
 ```
 account for the new conversation
 ↑↓ move · Enter choose · Esc back
-  personal     ~\.claude  (default)
+  default      ~\.claude  (default)
   work         ~\.claude-work
 ```
 
 Enter starts `claude --name "<name>"` (or `codex`) in the chosen dir; Esc steps back one level.
 The account question only appears for a tool that has several accounts configured.
 
-## Opening a conversation under another account — Ctrl+M
+## Opening a conversation under another account — account mode
 
-Press `Ctrl+M` in the picker (Ctrl+A works too, for terminals that deliver Ctrl+M as Enter).
-The hint line turns into the account list, and `Space` now cycles a **number** on the
-highlighted row instead of the dot:
+On the account page press `Enter` (Ctrl+A works as Ctrl+M too, for terminals that deliver
+Ctrl+M as Enter). The picker's hint line turns into the account list, and `Space` now cycles a
+**number** on the highlighted row instead of the dot:
 
 ```
-ACCOUNT MODE: 1 personal (me@gmail.com) · 2 work (me@company.com) · Space cycles the number · Enter open · + add account · Ctrl+M back
-1 claude work      1h  Billing API pagination          D:
-epospi-server
-2 claude personal  3h  Home automation bridge          D:
-epos\home
-  codex  work      5h  migrate build to vite           D:
-epos\web-app
+ACCOUNT MODE: 1 default (me@gmail.com) · 2 work (me@company.com) · Space cycles the number · Enter open · Ctrl+M back
+1 claude work      1h  Billing API pagination          D:\repos\api-server
+2 claude default   3h  Home automation bridge          D:\repos\home
+  codex  work      5h  migrate build to vite           D:\repos\web-app
 ```
 
 `Enter` opens every numbered row **under that account**. When the number differs from the
@@ -148,13 +181,6 @@ header shows how many rows will be re-homed, `-WhatIf` lists the moves, and a ru
 refused (close its tab first). Only accounts that have a dir for the row's tool are offered.
 
 `Ctrl+M` again returns to normal green marks; numbered rows keep their numbers.
-
-### Adding an account from the picker — `+`
-
-You do not need the command line for the first setup: press `Ctrl+M`, then `+` (or `Insert`).
-ccr asks the new label and, if no account exists yet, a label for the current login (the one
-whose sessions you already see). It then leaves the picker, runs the same login flows as
-`ccr -AddAccount`, waits for a key, and reopens the picker with the new account column.
 
 ## Moving a conversation to the other account
 
