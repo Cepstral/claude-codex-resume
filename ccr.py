@@ -22,7 +22,7 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "0.21"
+VERSION = "0.22"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -172,12 +172,14 @@ def user_text(obj):
 
 class Session:
     __slots__ = ("tool", "id", "title", "cwd", "last", "running", "pid", "source",
-                 "started_at", "started_by_clear", "head_bridge", "tail_bridge", "cleared")
+                 "started_at", "started_by_clear", "head_bridge", "tail_bridge", "cleared",
+                 "origin")
 
     def __init__(self, **kw):
         for k in self.__slots__:
             setattr(self, k, kw.get(k))
         self.cleared = bool(self.cleared)
+        self.origin = self.origin or "cli"
 
     @property
     def key(self):
@@ -405,6 +407,19 @@ def codex_title_map() -> dict:
     return m
 
 
+APP_ORIGINATORS = ("codex desktop", "codex_app", "codex-app")
+
+
+def codex_origin(originator) -> str:
+    """'app' for threads started in the Codex desktop app, else 'cli'.
+
+    session_meta records who opened the thread (`originator`): the desktop app
+    writes 'Codex Desktop', the CLI a 'codex_cli_*' token. Unknown/missing
+    (older rollouts) is treated as 'cli' - that is how ccr always resumed."""
+    o = (originator or "").strip().lower()
+    return "app" if any(k in o for k in APP_ORIGINATORS) else "cli"
+
+
 def codex_sessions() -> list:
     root = codex_root() / "sessions"
     if not root.is_dir():
@@ -423,7 +438,7 @@ def codex_sessions() -> list:
         mm = re.search(r"-(" + UUID_IN + r")\.jsonl$", f.name)
         if not mm:
             continue
-        sid, cwd, title, skip = mm.group(1), None, None, False
+        sid, cwd, title, skip, origin = mm.group(1), None, None, False, "cli"
         try:
             # Bounded streaming head read: rollouts reach hundreds of MB.
             with open(f, encoding="utf-8", errors="replace") as fh:
@@ -441,6 +456,7 @@ def codex_sessions() -> list:
                                 break
                             cwd = meta.get("cwd") or cwd
                             sid = meta.get("session_id") or meta.get("id") or sid
+                            origin = codex_origin(meta.get("originator"))
                         except Exception:
                             pass
                     elif '"response_item"' in line and '"role":"user"' in line:
@@ -472,7 +488,8 @@ def codex_sessions() -> list:
         if not title:
             title = "(session)"
         out.append(Session(tool="codex", id=sid, title=title, cwd=cwd, last=mtime_utc(f),
-                           running=sid in running, pid=running.get(sid), source=str(f)))
+                           running=sid in running, pid=running.get(sid), source=str(f),
+                           origin=origin))
     return out
 
 
@@ -513,9 +530,16 @@ def session_rows(sessions, index):
         age = f"{RED}{'run':>6}{RESET}" if s.running else f"{fmt_age(s.last):>6}"
         title = s.title if len(s.title) <= 50 else s.title[:49] + "…"
         tag = f" {YELLOW}(cleared){RESET}" if s.cleared else ""
-        disp = f"{color}{s.tool:<6}{RESET}{age}  {title}{tag}  {DIM}{fmt_cwd(s.cwd, 40)}{RESET}"
-        extra = (" cleared" if s.cleared else "") + (" run" if s.running else "")  # filter words
-        prev = (f"{s.tool} · {s.title}\\nfolder: {s.cwd}\\nlast: "
+        # Tool column, padded on the plain text (the colors are zero-width).
+        app = s.origin == "app"
+        tool = f"{color}{s.tool}{RESET}" + (f"{DIM} app{RESET}" if app else "")
+        tool += " " * max(1, 10 - len(s.tool) - (4 if app else 0))
+        disp = f"{tool}{age}  {title}{tag}  {DIM}{fmt_cwd(s.cwd, 40)}{RESET}"
+        extra = ((" cleared" if s.cleared else "") + (" run" if s.running else "")
+                 + (" app" if app else ""))  # filter words
+        how = (f"opens in: Codex app (codex://threads/{s.id})" if app
+               else f"opens in: terminal ({resume_argv(s)[0]} …)")
+        prev = (f"{s.tool} · {s.title}\\nfolder: {s.cwd}\\n{how}\\nlast: "
                 f"{s.last.astimezone():%Y-%m-%d %H:%M}   id: {s.id}").replace("\t", " ")
         rows.append(f"{i}\t{disp}{DIM}{extra}{RESET}\t{prev}")
     return rows
@@ -571,6 +595,9 @@ def confirm_delete(s: Session) -> bool:
     if preview:
         print(f"    {'last prompt' if s.tool == 'claude' else 'last reply '}: {DIM}{preview}{RESET}")
     print(f"\n  {DIM}removed from disk, no undo (codex: via 'codex delete'){RESET}")
+    if s.tool == "codex" and s.origin == "app" and not shutil.which("codex"):
+        print(f"  {YELLOW}the Codex app keeps its own copy: without the 'codex' CLI this only drops "
+              f"the transcript, the thread stays in the app{RESET}")
     try:
         ans = input(f"  {RED}[y]{RESET} delete    {DIM}anything else: cancel{RESET} > ")
     except (EOFError, KeyboardInterrupt):
@@ -635,12 +662,52 @@ def exec_inline(cwd: str, argv: list, title: str, dry: bool):
         sys.exit(f"ccr: cannot start {argv[0]}: {e}")
 
 
-def launch(picked: list, new_window: bool, dry: bool):
-    launch_list = []
+def resume_argv(s: Session) -> list:
+    return ["claude", "--resume", s.id] if s.tool == "claude" else ["codex", "resume", s.id]
+
+
+def url_opener() -> list:
+    """Command prefix that hands a URL to the desktop handler, or []."""
+    if sys.platform == "darwin":
+        return ["open"]
+    if os.name == "nt":
+        return ["cmd", "/c", "start", ""]
+    x = shutil.which("xdg-open")
+    return [x] if x else []
+
+
+def open_in_codex_app(s: Session, opener: list, dry: bool) -> bool:
+    """Focus the thread in the Codex desktop app through its codex:// deeplink."""
+    argv = opener + [f"codex://threads/{s.id}"]
+    if dry:
+        print("  " + " ".join(shlex.quote(a) for a in argv))
+        return True
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True)
+    except OSError as e:
+        print(f"ccr: cannot reach the Codex app: {e}", file=sys.stderr)
+        return False
+    if r.returncode != 0:
+        print(f"ccr: 'codex app · {s.title}' - deeplink refused: "
+              f"{(r.stderr or '').strip() or 'exit ' + str(r.returncode)}", file=sys.stderr)
+        return False
+    return True
+
+
+def launch(picked: list, new_window: bool, dry: bool, terminal: bool = False):
+    opener = [] if terminal else url_opener()
+    app_list, launch_list = [], []
     for s in picked:
         if not UUID_RE.match(s.id):
             print(f"ccr: skipping '{s.title}' - unexpected session id", file=sys.stderr)
             continue
+        # Desktop-app threads go back to the app, not to a terminal tab.
+        if s.tool == "codex" and s.origin == "app" and not terminal:
+            if opener:
+                app_list.append(s)
+                continue
+            print(f"ccr: no URL handler here - resuming 'codex app · {s.title}' in a terminal instead",
+                  file=sys.stderr)
         cwd = s.cwd
         if not cwd or not Path(cwd).is_dir():
             if s.tool == "claude":
@@ -650,12 +717,19 @@ def launch(picked: list, new_window: bool, dry: bool):
             print(f"ccr: 'codex · {s.title}' - recorded folder missing ({cwd}), starting in {HOME}",
                   file=sys.stderr)
             cwd = str(HOME)
-        argv = ["claude", "--resume", s.id] if s.tool == "claude" else ["codex", "resume", s.id]
-        launch_list.append((s, cwd, argv))
-    if not launch_list:
+        launch_list.append((s, cwd, resume_argv(s)))
+    if not app_list and not launch_list:
         print("ccr: nothing to open.")
         return
-    # First selection takes over this terminal; the rest open as tabs.
+    # Deeplinks first: exec_inline below never returns.
+    for s in app_list:
+        open_in_codex_app(s, opener, dry)
+    if app_list and not dry:
+        n = len(app_list)
+        print(f"ccr: {n} conversation{'' if n == 1 else 's'} handed to the Codex app.")
+    if not launch_list:
+        return
+    # First terminal selection takes over this terminal; the rest open as tabs.
     inline, tabs = (None, launch_list) if new_window else (launch_list[0], launch_list[1:])
     for s, cwd, argv in tabs:
         if not open_tab(cwd, " ".join(shlex.quote(a) for a in argv), new_window, dry):
@@ -722,6 +796,9 @@ def main():
     ap.add_argument("-n", "--new", action="store_true",
                     help="start a new conversation (folder menu); trailing text prefills the name box")
     ap.add_argument("--new-window", action="store_true", help="open selections in new windows, keep this tab")
+    ap.add_argument("--terminal", action="store_true",
+                    help="resume Codex desktop-app conversations with 'codex resume' in a terminal "
+                         "instead of handing them back to the app")
     ap.add_argument("--dry-run", action="store_true", help="print what would be launched, launch nothing")
     ap.add_argument("--version", action="version", version="ccr " + VERSION + " (python)")
     a = ap.parse_args()
@@ -783,7 +860,7 @@ def main():
         if not picked:
             print("ccr: cancelled.")
             return
-        launch(picked, a.new_window, a.dry_run)
+        launch(picked, a.new_window, a.dry_run, a.terminal)
         return
 
 
