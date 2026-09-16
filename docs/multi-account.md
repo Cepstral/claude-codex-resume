@@ -110,16 +110,21 @@ Without a `ccr.json`, nothing changes: ccr uses the default dirs as before.
 
 ## What the picker shows
 
-An **account column** appears between the tool and the age (magenta), for both tools:
+An **account column** appears between the tool and the age (magenta), for both tools, the
+default account in parentheses; above the rows, a legend lists the accounts (see
+[Space](#opening-a-conversation-under-another-account--space) below):
 
 ```
 filter>                                                 88/121 · 2 marked
-↑↓ move · Space mark · Enter open · Ctrl+N new · Del delete · Esc cancel · type to filter · v0.20
-● claude work      1h  Billing API pagination          D:\repos\api-server
-  claude default   3h  Home automation bridge          D:\repos\home
-  codex  work      5h  migrate build to vite           D:\repos\web-app
-● claude default   1d  Physics simulation viral videos D:\repos\sim-shorts
-  codex  default   2d  sono affidabili i nebulizzatori ~
+Multi-account mode active.
+  1 (default)  claude ~\.claude       me@gmail.com    codex ~\.codex       me@gmail.com
+  2 work       claude ~\.claude-work  me@company.com  codex ~\.codex-work  me@company.com
+↑↓ move · Space cycles the account (dot = as is) · Enter open · Ctrl+N new · Ctrl+A accounts · Del delete · Esc cancel
+● claude work       1h  Billing API pagination          D:\repos\api-server
+  claude (default)  3h  Home automation bridge          D:\repos\home
+  codex  work       5h  migrate build to vite           D:\repos\web-app
+● claude (default)  1d  Physics simulation viral videos D:\repos\sim-shorts
+  codex  (default)  2d  sono affidabili i nebulizzatori ~
 ```
 
 The label is part of the filter text, so typing `work` narrows to that account, exactly like
@@ -176,14 +181,21 @@ account per line, and `Space` cycles the account the highlighted row will open u
 account first (a green dot — a plain open), then the others (a magenta digit), then none.
 
 ```
-filter>                                                              198/198 · 1 marked · 1 re-homed
-  1 default    claude ~\OneDrive\.claude  codex ~\.codex        me@company.com
-  2 personal   claude ~\OneDrive\.claude-personal  codex ~\.codex-personal  me@gmail.com
+filter>                                                                       198/198 · 1 marked · 1 re-homed
+Multi-account mode active.
+  1 (default)  claude ~\OneDrive\.claude           me@company.com  codex ~\.codex           me@company.com
+  2 personal   claude ~\OneDrive\.claude-personal  me@gmail.com    codex ~\.codex-personal  me@gmail.com
 ↑↓ move · Space cycles the account (dot = as is) · Enter open · Ctrl+N new · Ctrl+A accounts · Del delete · Esc cancel
-2 claude default    1h  Billing API pagination          D:\repos\api-server
+2 claude (default)  1h  Billing API pagination          D:\repos\api-server
 ● claude personal   3h  Home automation bridge          D:\repos\home
-  codex  default    5h  migrate build to vite           D:\repos\web-app
+  codex  (default)  5h  migrate build to vite           D:\repos\web-app
 ```
+
+One line per **account**, because an account label spans both tools: the digit is what `Space`
+(or `Ctrl-O` on macOS) targets, and the line says under which dir and login each tool runs for
+that account — the email is read per tool from that dir's own files, so the two can differ. The
+`Ctrl+A` page lists one row per tool instead, because its actions (remove, copy settings) are
+per tool.
 
 `Enter` opens every marked row under the chosen account. When the digit differs from the account
 the conversation currently belongs to, ccr first **moves** the conversation into that account's
