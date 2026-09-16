@@ -132,7 +132,7 @@ The installer puts `ccr` in `~/.local/bin` (tells you if that isn't on your PATH
 | type | fuzzy filter (fzf); `cleared`, `run` and `app` are searchable words |
 | `Tab` | mark / unmark (fzf convention — Space types into the filter) |
 | `Enter` | open the marked sessions (or the highlighted one); the first takes over the current terminal, the rest become tabs |
-| `Ctrl-N` | new conversation: folder → tool → name |
+| `Ctrl-N` | new conversation: folder → tool → name. The folder list starts with **`+ new folder`** (`Ctrl-O` jumps straight there) — type a path, `~` and relative paths welcome, and ccr offers to create it, so a brand-new project needs nothing prepared. The tool step offers **`codex app`** wherever the desktop app is installed. |
 | `Del` | delete the highlighted conversation after a confirmation |
 | `Esc` | cancel |
 
@@ -159,6 +159,12 @@ at all, app conversations fall back to `codex resume` with a notice.
 
 Type `app` in the filter to list just those. Note that the `run` flag still only sees CLI sessions (it scans for
 `codex resume <uuid>` processes); reopening a thread already open in the app just refocuses it, so nothing breaks.
+
+**Starting one.** `Ctrl-N` → folder → `codex app` opens `codex://threads/new?path=<folder>`, and the app treats that
+folder as the thread's workspace root — registering it as a project when it is not one yet. That is what makes the
+`+ new folder` entry useful: type a path for a project that does not exist, let ccr create the directory, and the new
+Codex conversation starts there with the project already set up. A first message typed at the prompt (or the trailing
+text of `ccr -n TEXT`) is prefilled in the composer; nothing is sent for you.
 
 A preview pane shows the full title, folder, how the row will open, last-used time and session id of the highlighted row. Outside iTerm2/Terminal.app/tmux (e.g. a bare SSH shell) only the first selection can start, in the current terminal; ccr says so.
 

@@ -19,10 +19,11 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "0.22"
+VERSION = "0.23"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -744,7 +745,106 @@ def launch(picked: list, new_window: bool, dry: bool, terminal: bool = False):
 # ----------------------------------------------------------------------------
 # new conversation (Ctrl-N / -n)
 # ----------------------------------------------------------------------------
-def new_conversation(sessions: list, initial_name: str, dry: bool) -> bool:
+CODEX_APP_BUNDLE = b"com.openai.codex"
+
+
+def codex_app_installed(sessions: list) -> bool:
+    """True when the Codex desktop app can take a codex:// link here.
+
+    Having opened app threads before is proof enough and costs nothing. A fresh
+    install has none, so fall back to looking for the bundle (Spotlight is not
+    always available, so read the Info.plist bytes) or the registered handler."""
+    if any(s.tool == "codex" and s.origin == "app" for s in sessions):
+        return True
+    try:
+        if sys.platform == "darwin":
+            for d in ("/Applications", "/System/Applications", str(HOME / "Applications")):
+                for plist in Path(d).glob("*.app/Contents/Info.plist"):
+                    try:
+                        if CODEX_APP_BUNDLE in plist.read_bytes():
+                            return True
+                    except OSError:
+                        continue
+            return False
+        if shutil.which("xdg-mime"):
+            out = subprocess.run(["xdg-mime", "query", "default", "x-scheme-handler/codex"],
+                                 capture_output=True, text=True, timeout=5).stdout
+            return bool(out.strip())
+    except Exception:
+        pass
+    return False
+
+
+def ask_new_folder(seed: str, dry: bool):
+    """Read a folder path for a brand-new project, creating it on request.
+
+    Relative paths resolve against the directory ccr runs in; ~ expands.
+    Returns an existing directory, or None when the user backs out."""
+    while True:
+        try:
+            raw = input(f"new project folder{' [' + seed + ']' if seed else ''}> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        raw = raw or seed
+        if not raw:
+            return None
+        p = Path(os.path.expandvars(os.path.expanduser(raw)))
+        if not p.is_absolute():
+            p = Path.cwd() / p
+        p = Path(os.path.normpath(str(p)))
+        if p.is_dir():
+            return str(p)
+        if p.exists():
+            print(f"ccr: {p} exists but is not a folder.", file=sys.stderr)
+            continue
+        if dry:
+            print(f"dry-run: would create {p}")
+            return str(p)
+        try:
+            ans = input(f"  {p} does not exist.  {CYAN}[y]{RESET} create it"
+                        f"    {DIM}anything else: type another path{RESET} > ")
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if ans.strip().lower() != "y":
+            continue
+        try:
+            p.mkdir(parents=True)
+        except OSError as e:
+            print(f"ccr: cannot create {p}: {e}", file=sys.stderr)
+            continue
+        print(f"  {DIM}created {p}{RESET}")
+        return str(p)
+
+
+def open_new_app_thread(folder: str, prompt_text: str, opener: list, dry: bool) -> bool:
+    """New thread in the Codex desktop app, rooted at folder.
+
+    The app resolves ?path= to a workspace root and registers it as a project
+    when it is not one yet - which is what makes 'new project folder' land
+    somewhere useful. ?prompt= only prefills the composer, it sends nothing."""
+    q = {"path": folder}
+    if prompt_text:
+        q["prompt"] = prompt_text
+    # safe="/" keeps the folder readable in --dry-run; the app decodes either way.
+    query = urllib.parse.urlencode(q, quote_via=urllib.parse.quote, safe="/")
+    argv = opener + ["codex://threads/new?" + query]
+    if dry:
+        print("  " + " ".join(shlex.quote(x) for x in argv))
+        return True
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True)
+    except OSError as e:
+        print(f"ccr: cannot reach the Codex app: {e}", file=sys.stderr)
+        return False
+    if r.returncode != 0:
+        print(f"ccr: the Codex app refused the new-thread link: "
+              f"{(r.stderr or '').strip() or 'exit ' + str(r.returncode)}", file=sys.stderr)
+        return False
+    print(f"ccr: new Codex app conversation in {folder}")
+    return True
+
+
+def new_conversation(sessions: list, initial_name: str, dry: bool, terminal: bool = False) -> bool:
     groups = {}
     for s in sessions:
         g = groups.setdefault(s.cwd.lower(), {"path": s.cwd, "last": s.last, "count": 0})
@@ -753,22 +853,44 @@ def new_conversation(sessions: list, initial_name: str, dry: bool) -> bool:
             g["last"] = s.last
     folders = sorted(groups.values(), key=lambda g: g["last"], reverse=True)
     index, rows = {}, []
+    rows.append(f"new\t{ORANGE}+ new folder{RESET}  {DIM}type a path, ccr creates it{RESET}"
+                f"\tstart a project in a folder no session has used yet")
     for i, g in enumerate(folders):
         index[str(i)] = g
         rows.append(f"{i}\t{fmt_age(g['last']):>6}  {DIM}{g['count']:>3}×{RESET}  "
                     f"{fmt_cwd(g['path'], 70)}\t{g['path']}")
-    res = run_fzf(rows, "new conversation: pick a folder · Enter next · Esc back",
-                  multi=False, prompt="new session in> ")
-    if not res or not res[1]:
+    res = run_fzf(rows, "new conversation: pick a folder · Enter next · Ctrl-O new folder · Esc back",
+                  multi=False, prompt="new session in> ", expect=["ctrl-o"])
+    if not res or not (res[0] or res[1]):
         return False
-    folder = index[res[1][0]]["path"]
+    if res[0] == "ctrl-o" or (res[1] and res[1][0] == "new"):
+        folder = ask_new_folder(initial_name if os.sep in initial_name else "", dry)
+        if not folder:
+            return False
+    else:
+        folder = index[res[1][0]]["path"]
+    opener = [] if terminal else url_opener()
+    app_ok = bool(opener) and codex_app_installed(sessions)
     tools = [f"0\t{ORANGE}claude{RESET}   {DIM}asks for a session name{RESET}\tclaude",
-             f"1\t{CYAN}codex{RESET}    {DIM}no start name - /rename inside{RESET}\tcodex"]
+             f"1\t{CYAN}codex{RESET}    {DIM}terminal · no start name - /rename inside{RESET}\tcodex"]
+    if app_ok:
+        tools.append(f"2\t{CYAN}codex{RESET}{DIM} app{RESET}  {DIM}new thread in the Codex desktop app, "
+                     f"in this folder{RESET}\tcodex app")
     res = run_fzf(tools, "tool for the new conversation · Enter choose · Esc back",
                   multi=False, preview=False, prompt="tool> ")
     if not res or not res[1]:
         return False
-    tool = "codex" if res[1][0] == "1" else "claude"
+    tool = {"1": "codex", "2": "codex app"}.get(res[1][0], "claude")
+    if tool != "codex app" and not Path(folder).is_dir():
+        print(f"ccr: folder no longer exists: {folder}", file=sys.stderr)
+        return False
+    if tool == "codex app":
+        try:
+            hint = f" [{initial_name}]" if initial_name else ""
+            first = input(f"first message for codex (empty = just open the folder){hint}> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return False
+        return open_new_app_thread(folder, first or initial_name, opener, dry)
     name = ""
     if tool == "claude":
         try:
@@ -776,9 +898,6 @@ def new_conversation(sessions: list, initial_name: str, dry: bool) -> bool:
             name = input(f"session name for claude (empty = auto title){hint}> ").strip() or initial_name
         except (EOFError, KeyboardInterrupt):
             return False
-    if not Path(folder).is_dir():
-        print(f"ccr: folder no longer exists: {folder}", file=sys.stderr)
-        return False
     argv = ["claude", "--name", name] if (tool == "claude" and name) else [tool]
     exec_inline(folder, argv, f"{tool} · {name or 'new'}", dry)
     return True
@@ -816,7 +935,7 @@ def main():
         sessions = sessions[: a.top]
 
     if a.new:
-        if not new_conversation(sessions, query, a.dry_run):
+        if not new_conversation(sessions, query, a.dry_run, a.terminal):
             print("ccr: cancelled.")
         return
 
@@ -830,7 +949,7 @@ def main():
         key, ids = res
         picked = [index[i] for i in ids if i in index]
         if key == "ctrl-n":
-            if not new_conversation(sessions, "", a.dry_run):
+            if not new_conversation(sessions, "", a.dry_run, a.terminal):
                 print("ccr: cancelled.")
             return
         if key == "del":
