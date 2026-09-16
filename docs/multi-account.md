@@ -21,7 +21,7 @@ Multi-account mode
     codex    ~\.codex
 
   Next you choose a tool and a label for the additional account. ccr creates a
-  fresh dir for it (~\.claude-<label> or ~\.codex-<label>) and runs that tool's
+  dir for it next to the default one (.claude-<label> / .codex-<label>) and runs that tool's
   own login there, so each account keeps its own credentials and settings.
   Afterwards Ctrl+M lists the accounts, adds more, or turns the mode off again.
 

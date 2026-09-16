@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.39'
+$script:CcrVersion = '0.40'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -340,9 +340,11 @@ function Copy-CcrStatusline {
     Write-Host "ccr: status line copied to $(Format-CcrCwd $ToPath 50): statusLine in settings.json$(if ($files.Count) { " + $($files.Name -join ', ')" })"
 }
 
-# Register a new account for one tool (or both): a fresh config dir next to
-# the default one (~/.claude-<label>, ~/.codex-<label>), the tool's own
-# interactive login run inside it, and the entry recorded in ccr.json.
+# Register a new account for one tool (or both): a config dir NEXT TO the
+# tool's default dir (so a default in OneDrive\.claude gets
+# OneDrive\.claude-<label>, and ~\.codex gets ~\.codex-<label>), the
+# tool's own interactive login run inside it - skipped when the dir already
+# holds a login from an earlier life - and the entry recorded in ccr.json.
 # Turns multi-account mode on first when needed.
 function Add-CcrAccount {
     param(
@@ -358,7 +360,9 @@ function Add-CcrAccount {
     foreach ($t in $tools) {
         $map = if ($t -eq 'claude') { $cfg.claudeRoots } else { $cfg.codexRoots }
         if ($map.PSObject.Properties[$Label]) { Write-Warning "ccr: $t account '$Label' already configured - skipping"; continue }
-        $dir = Join-Path $HOME ".$t-$Label"
+        $defPath = @(Get-CcrRoots -Tool $t | Where-Object Default)[0].Path
+        $dir = Join-Path (Split-Path -Parent $defPath) "$(Split-Path -Leaf $defPath)-$Label"
+        $reused = Test-Path -LiteralPath $dir
         New-Item -ItemType Directory -Path $dir -Force | Out-Null
         $map | Add-Member -NotePropertyName $Label -NotePropertyValue $dir
         Save-CcrConfig $cfg   # record first, so an aborted login still leaves a usable entry
@@ -382,6 +386,12 @@ function Add-CcrAccount {
                 $seed | ConvertTo-Json | Set-Content -LiteralPath $cj -Encoding utf8NoBOM
             }
             if ($CopyStatusline) { try { Copy-CcrStatusline -FromPath $from -ToPath $dir } catch { Write-Warning "$_" } }
+        }
+        $hasLogin = Test-Path -LiteralPath (Join-Path $dir $(if ($t -eq 'claude') { '.credentials.json' } else { 'auth.json' }))
+        if ($reused -and $hasLogin) {
+            $already = Get-CcrQuickIdentity -Tool $t -RootPath $dir
+            Write-Host "ccr: $t account '$Label' -> $dir  - existing dir, already logged in$(if ($already) { " as $already" }); no login needed" -ForegroundColor Yellow
+            continue
         }
         Write-Host "ccr: $t account '$Label' -> $dir  - starting the $t login flow in that dir" -ForegroundColor Yellow
         $var = if ($t -eq 'claude') { 'CLAUDE_CONFIG_DIR' } else { 'CODEX_HOME' }
@@ -1848,8 +1858,10 @@ function Resume-CcSessions {
         Run the picker, then print the wt.exe command line instead of launching.
     .EXAMPLE
         ccr -AddAccount work
-        Second account (multi-account mode): creates a fresh config dir
-        per tool (~/.claude-work, ~/.codex-work), runs each tool's own login
+        Second account (multi-account mode): creates a config dir per tool
+        next to the tool's default dir (OneDrive/.claude-work next to
+        OneDrive/.claude, ~/.codex-work next to ~/.codex; an existing dir
+        with a login inside is reused as is), runs each tool's own login
         flow inside it, and records both in ccr.json next to this script.
         The first time the dirs in use today become the "default" account
         (nothing moves). -Tool claude / -Tool codex limits it to one tool;
