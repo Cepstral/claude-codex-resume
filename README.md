@@ -116,7 +116,7 @@ Current Codex versions do **not** auto-generate conversation titles — what its
 
 ## macOS / Linux — native version
 
-`ccr.py` is a port of the same tool with no PowerShell involved: Python 3 (stdlib only) for the data, [fzf](https://github.com/junegunn/fzf) for the picker, and **real terminal tabs** — iTerm2 and Terminal.app via AppleScript, tmux windows when you're inside tmux. Same files, same rules, same features as the PowerShell version (titles, `(cleared)` tags, `run` flags, Codex catalog titles, delete via `codex delete`, new-conversation flow).
+`ccr.py` is a port of the same tool with no PowerShell involved: Python 3 (stdlib only) for the data, [fzf](https://github.com/junegunn/fzf) for the picker, and **real terminal tabs** — iTerm2 and Terminal.app via AppleScript, tmux windows when you're inside tmux. Same files, same rules, same features as the PowerShell version (titles, `(cleared)` tags, `run` flags, Codex catalog titles, delete via `codex delete`, new-conversation flow), **plus Codex desktop-app support** (below).
 
 ```sh
 brew install fzf          # picker UI (python3 comes with the Xcode command line tools)
@@ -129,16 +129,62 @@ The installer puts `ccr` in `~/.local/bin` (tells you if that isn't on your PATH
 | | |
 |---|---|
 | `ccr` · `ccr kit` · `ccr -n [name]` · `ccr --tool codex` · `ccr --top 0` · `ccr --new-window` · `ccr --dry-run` | same meanings as the PowerShell flags |
-| type | fuzzy filter (fzf); `cleared` and `run` are searchable words |
-| `Tab` | mark / unmark (fzf convention — Space types into the filter) |
-| `Enter` | open the marked sessions (or the highlighted one); the first takes over the current terminal, the rest become tabs |
-| `Ctrl-N` | new conversation: folder → tool → name |
+| `ccr --terminal` | resume Codex **app** conversations with `codex resume` in a terminal instead of handing them back to the app |
+| `ccr --tabs` | Terminal.app: extra sessions as tabs instead of windows (see below); iTerm2 and tmux use tabs either way |
+| type | fuzzy filter (fzf); `cleared`, `run` and `app` are searchable words |
+| `Tab` | mark / unmark (fzf convention — Space types into the filter). Marked rows take a green **●** in the gutter and the counter beside the prompt reads `49/128 · 2 marked`. |
+| `Enter` | open the marked sessions (or the highlighted one); the first takes over the current terminal, the rest become tabs in iTerm2 and tmux, separate windows in Terminal.app |
+| `Ctrl-N` | new conversation: folder → tool → name. The folder list starts with **`+ new folder`** (`Ctrl-O` jumps straight there) — type a path, `~` and relative paths welcome, and ccr offers to create it, so a brand-new project needs nothing prepared. The tool step offers **`codex app`** wherever the desktop app is installed. |
 | `Del` | delete the highlighted conversation after a confirmation |
 | `Esc` | cancel |
 
-A preview pane shows the full title, folder, last-used time and session id of the highlighted row. Outside iTerm2/Terminal.app/tmux (e.g. a bare SSH shell) only the first selection can start, in the current terminal; ccr says so.
+### Codex app vs Codex CLI
 
-*The Python port is verified against the same session data as the PowerShell version, but the macOS tab scripting (osascript) was written from the iTerm2/Terminal.app dictionaries and not yet exercised on a Mac — report anything odd with `ccr --dry-run`, which prints the exact AppleScript it would run.*
+Codex conversations can start in two places, and they do not reopen the same way. Each rollout records who
+opened it (`session_meta.originator`: `Codex Desktop` for the app, a `codex_cli_*` token for the CLI), so ccr
+shows the difference in the tool column and routes each row to where it belongs:
+
+```
+  codex app   22h  Review flusso completo locale   ~/Documents/bnb-monitor
+  codex        3d  migrate build to vite           ~/repos/web-app
+```
+
+- `codex app` → opened with the app's own deeplink, `codex://threads/<id>`, which focuses that thread in the
+  Codex desktop app (the ChatGPT app, bundle id `com.openai.codex`). No terminal tab is spent, so a selection
+  of app conversations leaves your current tab alone.
+- `codex` → resumed as before, `codex resume <id>` in a tab, in the session's recorded folder.
+
+This matters when the `codex` CLI is not on your `PATH` — the usual case when Codex arrived as the desktop app —
+because `codex resume` would have nothing to run. `--terminal` forces the old behaviour for app conversations,
+and `--dry-run` prints the exact `open codex://…` line instead of launching. On a machine with no URL handler
+at all, app conversations fall back to `codex resume` with a notice.
+
+Type `app` in the filter to list just those. Note that the `run` flag still only sees CLI sessions (it scans for
+`codex resume <uuid>` processes); reopening a thread already open in the app just refocuses it, so nothing breaks.
+
+**Starting one.** `Ctrl-N` → folder → `codex app` opens `codex://threads/new?path=<folder>`, and the app treats that
+folder as the thread's workspace root — registering it as a project when it is not one yet. That is what makes the
+`+ new folder` entry useful: type a path for a project that does not exist, let ccr create the directory, and the new
+Codex conversation starts there with the project already set up. A first message typed at the prompt (or the trailing
+text of `ccr -n TEXT`) is prefilled in the composer; nothing is sent for you.
+
+The legend sits above the prompt rather than under it, one line of keys and one of filter hints, with the keys
+picked out in colour and the rest kept quiet — and the two-step new-conversation menu labels which step you are on
+and which folder you chose. A preview pane shows the full title, folder, how the row will open, last-used time and
+session id of the highlighted row. Everything beyond the plain picker is version-gated, so an older fzf loses the
+marked counter or the line highlight rather than refusing to start. Outside iTerm2/Terminal.app/tmux (e.g. a bare SSH shell) only the first selection can start, in the current terminal; ccr says so.
+
+**Terminal.app gets windows, and asks for nothing.** Terminal's AppleScript dictionary has `do script`, which opens a
+window — an app sending itself an Apple event needs no rights, so nothing is ever prompted. It has no verb for a new
+*tab* at all: that takes a `Cmd-T` keystroke through System Events, a different app, which macOS gates behind
+*Privacy & Security → Automation*. ccr does not go looking for that permission, so extra sessions open as separate
+windows. Pass `--tabs` if you would rather have tabs and don't mind granting it once — and if you decline, or the
+keystroke fails for any other reason, ccr says what happened and opens the window anyway. iTerm2 creates tabs
+natively and asks for nothing, and so do tmux, `--new-window`, and Codex conversations sent to the desktop app.
+
+*The Python port is verified against the same session data as the PowerShell version. The Terminal.app path has since
+been exercised on a Mac; the iTerm2 scripting is still written from the dictionary alone — report anything odd with
+`ccr --dry-run`, which prints the exact AppleScript it would run.*
 
 ## License
 

@@ -19,10 +19,11 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "0.21"
+VERSION = "0.26"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -30,6 +31,29 @@ HOME = Path.home()
 FZF = shlex.split(os.environ.get("CCR_FZF") or "fzf")
 
 ORANGE, CYAN, RED, YELLOW, DIM, RESET = "\033[38;5;208m", "\033[36m", "\033[31m", "\033[33m", "\033[2m", "\033[0m"
+GREEN, BOLD = "\033[32m", "\033[1m"
+ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+
+def visible_len(s: str) -> int:
+    return len(ANSI_RE.sub("", s))
+
+
+def right_align(line: str, tail: str) -> str:
+    """Push tail to the right edge, counting only the characters that show.
+
+    fzf indents header lines past the pointer/marker gutter, so the usable
+    width is a few columns short of the terminal's."""
+    width = shutil.get_terminal_size((100, 24)).columns - 4
+    gap = max(3, width - visible_len(line) - visible_len(tail))
+    return line + " " * gap + tail
+
+
+def hint(*pairs, tail: str = "") -> str:
+    """A 'key action' legend: keys carry the colour, actions stay quiet."""
+    sep = f"{DIM}  ·  {RESET}"
+    line = sep.join(f"{BOLD}{CYAN}{k}{RESET} {DIM}{v}{RESET}" for k, v in pairs)
+    return right_align(line, f"{DIM}{tail}{RESET}") if tail else line
 
 
 # ----------------------------------------------------------------------------
@@ -172,12 +196,14 @@ def user_text(obj):
 
 class Session:
     __slots__ = ("tool", "id", "title", "cwd", "last", "running", "pid", "source",
-                 "started_at", "started_by_clear", "head_bridge", "tail_bridge", "cleared")
+                 "started_at", "started_by_clear", "head_bridge", "tail_bridge", "cleared",
+                 "origin")
 
     def __init__(self, **kw):
         for k in self.__slots__:
             setattr(self, k, kw.get(k))
         self.cleared = bool(self.cleared)
+        self.origin = self.origin or "cli"
 
     @property
     def key(self):
@@ -405,6 +431,19 @@ def codex_title_map() -> dict:
     return m
 
 
+APP_ORIGINATORS = ("codex desktop", "codex_app", "codex-app")
+
+
+def codex_origin(originator) -> str:
+    """'app' for threads started in the Codex desktop app, else 'cli'.
+
+    session_meta records who opened the thread (`originator`): the desktop app
+    writes 'Codex Desktop', the CLI a 'codex_cli_*' token. Unknown/missing
+    (older rollouts) is treated as 'cli' - that is how ccr always resumed."""
+    o = (originator or "").strip().lower()
+    return "app" if any(k in o for k in APP_ORIGINATORS) else "cli"
+
+
 def codex_sessions() -> list:
     root = codex_root() / "sessions"
     if not root.is_dir():
@@ -423,7 +462,7 @@ def codex_sessions() -> list:
         mm = re.search(r"-(" + UUID_IN + r")\.jsonl$", f.name)
         if not mm:
             continue
-        sid, cwd, title, skip = mm.group(1), None, None, False
+        sid, cwd, title, skip, origin = mm.group(1), None, None, False, "cli"
         try:
             # Bounded streaming head read: rollouts reach hundreds of MB.
             with open(f, encoding="utf-8", errors="replace") as fh:
@@ -441,6 +480,7 @@ def codex_sessions() -> list:
                                 break
                             cwd = meta.get("cwd") or cwd
                             sid = meta.get("session_id") or meta.get("id") or sid
+                            origin = codex_origin(meta.get("originator"))
                         except Exception:
                             pass
                     elif '"response_item"' in line and '"role":"user"' in line:
@@ -472,28 +512,65 @@ def codex_sessions() -> list:
         if not title:
             title = "(session)"
         out.append(Session(tool="codex", id=sid, title=title, cwd=cwd, last=mtime_utc(f),
-                           running=sid in running, pid=running.get(sid), source=str(f)))
+                           running=sid in running, pid=running.get(sid), source=str(f),
+                           origin=origin))
     return out
 
 
 # ----------------------------------------------------------------------------
 # fzf picker
 # ----------------------------------------------------------------------------
+FZF_VER = None
+
+
+def fzf_version() -> tuple:
+    """(major, minor) of the picker, (0, 0) when it will not say."""
+    global FZF_VER
+    if FZF_VER is None:
+        FZF_VER = (0, 0)
+        try:
+            out = subprocess.run(FZF[:1] + ["--version"], capture_output=True, text=True,
+                                 timeout=5).stdout
+            m = re.match(r"(\d+)\.(\d+)", out.strip())
+            if m:
+                FZF_VER = (int(m.group(1)), int(m.group(2)))
+        except Exception:
+            pass
+    return FZF_VER
+
+
+# Counts in the picker's own words: "49/128 · 2 marked", marked in green.
+INFO_CMD = (r'printf "%s" "$FZF_MATCH_COUNT/$FZF_TOTAL_COUNT"; '
+            r'[ "${FZF_SELECT_COUNT:-0}" -gt 0 ] && '
+            r'printf " \033[32m·\033[0m \033[1;32m%s marked\033[0m" "$FZF_SELECT_COUNT"; :')
+
+
 def run_fzf(rows, header, query="", multi=True, expect=None, preview=True, prompt="filter> "):
     """Rows are '<id>\\t<display>\\t<preview>'. Returns (key, [ids]) or None on
     Esc/Ctrl-C; key is '' for Enter or one of `expect`."""
     if not shutil.which(FZF[0]):
         sys.exit("ccr: fzf not found - install it first (brew install fzf)")
+    ver = fzf_version()
+    colors = ["marker:green:bold", "pointer:cyan", "prompt:cyan", "info:dim"]
     args = FZF + ["--ansi", "--no-sort", "--layout=reverse", "--delimiter=\t", "--with-nth=2",
-            "--header=" + header, "--prompt=" + prompt, "--info=inline"]
+            "--header=" + header, "--prompt=" + prompt, "--info=inline",
+            "--marker=●", "--pointer=❯"]
+    if ver >= (0, 21):
+        args.append("--header-first")   # legend above the prompt, not buried under it
+    if ver >= (0, 42):
+        args.append("--highlight-line")
+        colors += ["selected-bg:-1", "selected-fg:green"]
+    args.append("--color=" + ",".join(colors))
     if multi:
         args.append("--multi")
+        if ver >= (0, 46):
+            args += ["--info-command=" + INFO_CMD]
     if query:
         args += ["--query", query]
     if expect:
         args += ["--expect", ",".join(expect)]
     if preview:
-        args += ["--preview", "printf '%b\\n' {3}", "--preview-window=down,4,wrap"]
+        args += ["--preview", "printf '%b\\n' {3}", "--preview-window=down,5,wrap"]
     p = subprocess.run(args, input="\n".join(rows) + "\n", text=True, stdout=subprocess.PIPE)
     if p.returncode not in (0, 1):
         return None
@@ -513,16 +590,27 @@ def session_rows(sessions, index):
         age = f"{RED}{'run':>6}{RESET}" if s.running else f"{fmt_age(s.last):>6}"
         title = s.title if len(s.title) <= 50 else s.title[:49] + "…"
         tag = f" {YELLOW}(cleared){RESET}" if s.cleared else ""
-        disp = f"{color}{s.tool:<6}{RESET}{age}  {title}{tag}  {DIM}{fmt_cwd(s.cwd, 40)}{RESET}"
-        extra = (" cleared" if s.cleared else "") + (" run" if s.running else "")  # filter words
-        prev = (f"{s.tool} · {s.title}\\nfolder: {s.cwd}\\nlast: "
+        # Tool column, padded on the plain text (the colors are zero-width).
+        app = s.origin == "app"
+        tool = f"{color}{s.tool}{RESET}" + (f"{DIM} app{RESET}" if app else "")
+        tool += " " * max(1, 10 - len(s.tool) - (4 if app else 0))
+        disp = f"{tool}{age}  {title}{tag}  {DIM}{fmt_cwd(s.cwd, 40)}{RESET}"
+        extra = ((" cleared" if s.cleared else "") + (" run" if s.running else "")
+                 + (" app" if app else ""))  # filter words
+        how = (f"opens in: Codex app (codex://threads/{s.id})" if app
+               else f"opens in: terminal ({resume_argv(s)[0]} …)")
+        prev = (f"{s.tool} · {s.title}\\nfolder: {s.cwd}\\n{how}\\nlast: "
                 f"{s.last.astimezone():%Y-%m-%d %H:%M}   id: {s.id}").replace("\t", " ")
         rows.append(f"{i}\t{disp}{DIM}{extra}{RESET}\t{prev}")
     return rows
 
 
-HINT = ("↑↓ move · Tab mark · Enter open · Ctrl-N new · Del delete · "
-        "Esc cancel · type to filter · ccr v" + VERSION)
+def picker_hint() -> str:
+    keys = hint(("↑↓", "move"), ("Tab", "mark"), ("Enter", "open"), ("Ctrl-N", "new"),
+                ("Del", "delete"), ("Esc", "cancel"))
+    words = f"{DIM},{RESET} ".join(f"{CYAN}{w}{RESET}" for w in ("run", "cleared", "app"))
+    filters = f"{DIM}type to filter — {RESET}{words}{DIM} match as words{RESET}"
+    return keys + "\n" + right_align(filters, f"{DIM}ccr v{VERSION}{RESET}")
 
 
 # ----------------------------------------------------------------------------
@@ -571,6 +659,9 @@ def confirm_delete(s: Session) -> bool:
     if preview:
         print(f"    {'last prompt' if s.tool == 'claude' else 'last reply '}: {DIM}{preview}{RESET}")
     print(f"\n  {DIM}removed from disk, no undo (codex: via 'codex delete'){RESET}")
+    if s.tool == "codex" and s.origin == "app" and not shutil.which("codex"):
+        print(f"  {YELLOW}the Codex app keeps its own copy: without the 'codex' CLI this only drops "
+              f"the transcript, the thread stays in the app{RESET}")
     try:
         ans = input(f"  {RED}[y]{RESET} delete    {DIM}anything else: cancel{RESET} > ")
     except (EOFError, KeyboardInterrupt):
@@ -585,9 +676,28 @@ def applescript_str(s: str) -> str:
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def open_tab(cwd: str, cmd: str, new_window: bool, dry: bool) -> bool:
+def run_osascript(script: str):
+    """(ok, message). osascript reports refusals on stderr with a non-zero exit."""
+    try:
+        r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    except OSError as e:
+        return False, str(e)
+    err = (r.stderr or "").strip().splitlines()
+    msg = err[-1] if err else ""
+    msg = msg.split("execution error:", 1)[-1].strip() or msg
+    if "-1743" in msg:
+        # The tab keystroke needs Automation rights the user just declined.
+        msg += "  (System Settings › Privacy & Security › Automation › Terminal › System Events)"
+    return r.returncode == 0, msg[:200]
+
+
+def open_tab(cwd: str, cmd: str, new_window: bool, dry: bool, tabs: bool = False) -> bool:
     """Run cmd in a new terminal surface: a tmux window when inside tmux,
-    else an iTerm2 / Terminal.app tab (or window). False = no backend."""
+    else an iTerm2 / Terminal.app tab (or window). False = no backend.
+
+    Terminal.app tabs cost an Automation prompt (see below), so there a window
+    is the default and `tabs` is the opt-in; iTerm2 and tmux pay nothing for a
+    tab and keep it."""
     shell_cmd = f"cd {shlex.quote(cwd)} && {cmd}"
     tp = os.environ.get("TERM_PROGRAM", "")
     if os.environ.get("TMUX"):
@@ -598,26 +708,37 @@ def open_tab(cwd: str, cmd: str, new_window: bool, dry: bool) -> bool:
             subprocess.run(argv)
         return True
     if tp == "iTerm.app":
-        if new_window:
-            script = ('tell application "iTerm2"\n  tell current session of (create window with default profile) '
-                      f'to write text {applescript_str(shell_cmd)}\nend tell')
-        else:
-            script = ('tell application "iTerm2"\n  tell current window\n    tell current session of '
-                      f'(create tab with default profile) to write text {applescript_str(shell_cmd)}\n'
-                      '  end tell\nend tell')
+        window = ('tell application "iTerm2"\n  tell current session of (create window with default profile) '
+                  f'to write text {applescript_str(shell_cmd)}\nend tell')
+        tab = ('tell application "iTerm2"\n  tell current window\n    tell current session of '
+               f'(create tab with default profile) to write text {applescript_str(shell_cmd)}\n'
+               '  end tell\nend tell')
     elif tp == "Apple_Terminal":
-        if new_window:
-            script = f'tell application "Terminal" to do script {applescript_str(shell_cmd)}'
-        else:
-            script = ('tell application "Terminal"\n  activate\n  tell application "System Events" to keystroke "t" '
-                      f'using command down\n  delay 0.3\n  do script {applescript_str(shell_cmd)} in selected tab of '
-                      'front window\nend tell')
+        # `do script` opens a window, and Terminal sending itself an Apple
+        # event needs no rights. A tab has no verb in the dictionary at all:
+        # it takes a Cmd-T keystroke through System Events, another app, which
+        # macOS gates behind Automation rights - so it stays opt-in.
+        window = f'tell application "Terminal" to do script {applescript_str(shell_cmd)}'
+        tab = ('tell application "Terminal"\n  activate\n  tell application "System Events" to keystroke "t" '
+               f'using command down\n  delay 0.3\n  do script {applescript_str(shell_cmd)} in selected tab of '
+               'front window\nend tell')
+        if not tabs:
+            tab = None
     else:
         return False
+    scripts = [window] if (new_window or tab is None) else [tab, window]
     if dry:
-        print("  osascript:\n    " + script.replace("\n", "\n    "))
-    else:
-        subprocess.run(["osascript", "-e", script], capture_output=True)
+        print("  osascript:\n    " + scripts[0].replace("\n", "\n    "))
+        if len(scripts) > 1:
+            print(f"    {DIM}(a new window instead, if the tab is refused){RESET}")
+        return True
+    ok, msg = run_osascript(scripts[0])
+    if not ok and len(scripts) > 1:
+        print(f"ccr: no new tab - {msg or 'the terminal refused it'}\n"
+              f"     opening a window instead", file=sys.stderr)
+        ok, msg = run_osascript(scripts[1])
+    if not ok:
+        print(f"ccr: could not start '{cmd}' - {msg or 'the terminal refused it'}", file=sys.stderr)
     return True
 
 
@@ -635,12 +756,52 @@ def exec_inline(cwd: str, argv: list, title: str, dry: bool):
         sys.exit(f"ccr: cannot start {argv[0]}: {e}")
 
 
-def launch(picked: list, new_window: bool, dry: bool):
-    launch_list = []
+def resume_argv(s: Session) -> list:
+    return ["claude", "--resume", s.id] if s.tool == "claude" else ["codex", "resume", s.id]
+
+
+def url_opener() -> list:
+    """Command prefix that hands a URL to the desktop handler, or []."""
+    if sys.platform == "darwin":
+        return ["open"]
+    if os.name == "nt":
+        return ["cmd", "/c", "start", ""]
+    x = shutil.which("xdg-open")
+    return [x] if x else []
+
+
+def open_in_codex_app(s: Session, opener: list, dry: bool) -> bool:
+    """Focus the thread in the Codex desktop app through its codex:// deeplink."""
+    argv = opener + [f"codex://threads/{s.id}"]
+    if dry:
+        print("  " + " ".join(shlex.quote(a) for a in argv))
+        return True
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True)
+    except OSError as e:
+        print(f"ccr: cannot reach the Codex app: {e}", file=sys.stderr)
+        return False
+    if r.returncode != 0:
+        print(f"ccr: 'codex app · {s.title}' - deeplink refused: "
+              f"{(r.stderr or '').strip() or 'exit ' + str(r.returncode)}", file=sys.stderr)
+        return False
+    return True
+
+
+def launch(picked: list, new_window: bool, dry: bool, terminal: bool = False, tabs: bool = False):
+    opener = [] if terminal else url_opener()
+    app_list, launch_list = [], []
     for s in picked:
         if not UUID_RE.match(s.id):
             print(f"ccr: skipping '{s.title}' - unexpected session id", file=sys.stderr)
             continue
+        # Desktop-app threads go back to the app, not to a terminal tab.
+        if s.tool == "codex" and s.origin == "app" and not terminal:
+            if opener:
+                app_list.append(s)
+                continue
+            print(f"ccr: no URL handler here - resuming 'codex app · {s.title}' in a terminal instead",
+                  file=sys.stderr)
         cwd = s.cwd
         if not cwd or not Path(cwd).is_dir():
             if s.tool == "claude":
@@ -650,15 +811,22 @@ def launch(picked: list, new_window: bool, dry: bool):
             print(f"ccr: 'codex · {s.title}' - recorded folder missing ({cwd}), starting in {HOME}",
                   file=sys.stderr)
             cwd = str(HOME)
-        argv = ["claude", "--resume", s.id] if s.tool == "claude" else ["codex", "resume", s.id]
-        launch_list.append((s, cwd, argv))
-    if not launch_list:
+        launch_list.append((s, cwd, resume_argv(s)))
+    if not app_list and not launch_list:
         print("ccr: nothing to open.")
         return
-    # First selection takes over this terminal; the rest open as tabs.
+    # Deeplinks first: exec_inline below never returns.
+    for s in app_list:
+        open_in_codex_app(s, opener, dry)
+    if app_list and not dry:
+        n = len(app_list)
+        print(f"ccr: {n} conversation{'' if n == 1 else 's'} handed to the Codex app.")
+    if not launch_list:
+        return
+    # First terminal selection takes over this terminal; the rest open as tabs.
     inline, tabs = (None, launch_list) if new_window else (launch_list[0], launch_list[1:])
     for s, cwd, argv in tabs:
-        if not open_tab(cwd, " ".join(shlex.quote(a) for a in argv), new_window, dry):
+        if not open_tab(cwd, " ".join(shlex.quote(a) for a in argv), new_window, dry, tabs):
             print("ccr: opening several sessions needs iTerm2, Terminal.app or tmux - only the first starts.",
                   file=sys.stderr)
             break
@@ -670,7 +838,106 @@ def launch(picked: list, new_window: bool, dry: bool):
 # ----------------------------------------------------------------------------
 # new conversation (Ctrl-N / -n)
 # ----------------------------------------------------------------------------
-def new_conversation(sessions: list, initial_name: str, dry: bool) -> bool:
+CODEX_APP_BUNDLE = b"com.openai.codex"
+
+
+def codex_app_installed(sessions: list) -> bool:
+    """True when the Codex desktop app can take a codex:// link here.
+
+    Having opened app threads before is proof enough and costs nothing. A fresh
+    install has none, so fall back to looking for the bundle (Spotlight is not
+    always available, so read the Info.plist bytes) or the registered handler."""
+    if any(s.tool == "codex" and s.origin == "app" for s in sessions):
+        return True
+    try:
+        if sys.platform == "darwin":
+            for d in ("/Applications", "/System/Applications", str(HOME / "Applications")):
+                for plist in Path(d).glob("*.app/Contents/Info.plist"):
+                    try:
+                        if CODEX_APP_BUNDLE in plist.read_bytes():
+                            return True
+                    except OSError:
+                        continue
+            return False
+        if shutil.which("xdg-mime"):
+            out = subprocess.run(["xdg-mime", "query", "default", "x-scheme-handler/codex"],
+                                 capture_output=True, text=True, timeout=5).stdout
+            return bool(out.strip())
+    except Exception:
+        pass
+    return False
+
+
+def ask_new_folder(seed: str, dry: bool):
+    """Read a folder path for a brand-new project, creating it on request.
+
+    Relative paths resolve against the directory ccr runs in; ~ expands.
+    Returns an existing directory, or None when the user backs out."""
+    while True:
+        try:
+            raw = input(f"new project folder{' [' + seed + ']' if seed else ''}> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        raw = raw or seed
+        if not raw:
+            return None
+        p = Path(os.path.expandvars(os.path.expanduser(raw)))
+        if not p.is_absolute():
+            p = Path.cwd() / p
+        p = Path(os.path.normpath(str(p)))
+        if p.is_dir():
+            return str(p)
+        if p.exists():
+            print(f"ccr: {p} exists but is not a folder.", file=sys.stderr)
+            continue
+        if dry:
+            print(f"dry-run: would create {p}")
+            return str(p)
+        try:
+            ans = input(f"  {p} does not exist.  {CYAN}[y]{RESET} create it"
+                        f"    {DIM}anything else: type another path{RESET} > ")
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if ans.strip().lower() != "y":
+            continue
+        try:
+            p.mkdir(parents=True)
+        except OSError as e:
+            print(f"ccr: cannot create {p}: {e}", file=sys.stderr)
+            continue
+        print(f"  {DIM}created {p}{RESET}")
+        return str(p)
+
+
+def open_new_app_thread(folder: str, prompt_text: str, opener: list, dry: bool) -> bool:
+    """New thread in the Codex desktop app, rooted at folder.
+
+    The app resolves ?path= to a workspace root and registers it as a project
+    when it is not one yet - which is what makes 'new project folder' land
+    somewhere useful. ?prompt= only prefills the composer, it sends nothing."""
+    q = {"path": folder}
+    if prompt_text:
+        q["prompt"] = prompt_text
+    # safe="/" keeps the folder readable in --dry-run; the app decodes either way.
+    query = urllib.parse.urlencode(q, quote_via=urllib.parse.quote, safe="/")
+    argv = opener + ["codex://threads/new?" + query]
+    if dry:
+        print("  " + " ".join(shlex.quote(x) for x in argv))
+        return True
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True)
+    except OSError as e:
+        print(f"ccr: cannot reach the Codex app: {e}", file=sys.stderr)
+        return False
+    if r.returncode != 0:
+        print(f"ccr: the Codex app refused the new-thread link: "
+              f"{(r.stderr or '').strip() or 'exit ' + str(r.returncode)}", file=sys.stderr)
+        return False
+    print(f"ccr: new Codex app conversation in {folder}")
+    return True
+
+
+def new_conversation(sessions: list, initial_name: str, dry: bool, terminal: bool = False) -> bool:
     groups = {}
     for s in sessions:
         g = groups.setdefault(s.cwd.lower(), {"path": s.cwd, "last": s.last, "count": 0})
@@ -679,32 +946,54 @@ def new_conversation(sessions: list, initial_name: str, dry: bool) -> bool:
             g["last"] = s.last
     folders = sorted(groups.values(), key=lambda g: g["last"], reverse=True)
     index, rows = {}, []
+    rows.append(f"new\t{ORANGE}+ new folder{RESET}  {DIM}type a path, ccr creates it{RESET}"
+                f"\tstart a project in a folder no session has used yet")
     for i, g in enumerate(folders):
         index[str(i)] = g
         rows.append(f"{i}\t{fmt_age(g['last']):>6}  {DIM}{g['count']:>3}×{RESET}  "
                     f"{fmt_cwd(g['path'], 70)}\t{g['path']}")
-    res = run_fzf(rows, "new conversation: pick a folder · Enter next · Esc back",
-                  multi=False, prompt="new session in> ")
+    res = run_fzf(rows, hint(("Enter", "next"), ("Ctrl-O", "new folder"), ("Esc", "back"),
+                             tail="new conversation · step 1 of 2: folder"),
+                  multi=False, prompt="new session in> ", expect=["ctrl-o"])
+    if not res or not (res[0] or res[1]):
+        return False
+    if res[0] == "ctrl-o" or (res[1] and res[1][0] == "new"):
+        folder = ask_new_folder(initial_name if os.sep in initial_name else "", dry)
+        if not folder:
+            return False
+    else:
+        folder = index[res[1][0]]["path"]
+    opener = [] if terminal else url_opener()
+    app_ok = bool(opener) and codex_app_installed(sessions)
+    tools = [f"0\t{ORANGE}claude{RESET}{' ' * 5}{DIM}asks for a session name{RESET}\tclaude",
+             f"1\t{CYAN}codex{RESET}{' ' * 6}{DIM}a terminal tab · no start name - /rename inside"
+             f"{RESET}\tcodex terminal"]
+    if app_ok:
+        tools.append(f"2\t{CYAN}codex{RESET}{DIM} app{RESET}{' ' * 2}{DIM}a new thread in the Codex "
+                     f"desktop app, rooted at this folder{RESET}\tcodex app desktop")
+    res = run_fzf(tools, hint(("Enter", "choose"), ("Esc", "back"),
+                              tail=f"step 2 of 2: tool · {fmt_cwd(folder, 46)}"),
+                   multi=False, preview=False, prompt="tool> ")
     if not res or not res[1]:
         return False
-    folder = index[res[1][0]]["path"]
-    tools = [f"0\t{ORANGE}claude{RESET}   {DIM}asks for a session name{RESET}\tclaude",
-             f"1\t{CYAN}codex{RESET}    {DIM}no start name - /rename inside{RESET}\tcodex"]
-    res = run_fzf(tools, "tool for the new conversation · Enter choose · Esc back",
-                  multi=False, preview=False, prompt="tool> ")
-    if not res or not res[1]:
+    tool = {"1": "codex", "2": "codex app"}.get(res[1][0], "claude")
+    if tool != "codex app" and not dry and not Path(folder).is_dir():
+        print(f"ccr: folder no longer exists: {folder}", file=sys.stderr)
         return False
-    tool = "codex" if res[1][0] == "1" else "claude"
+    if tool == "codex app":
+        try:
+            seed = f" [{initial_name}]" if initial_name else ""
+            first = input(f"first message for codex (empty = just open the folder){seed}> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return False
+        return open_new_app_thread(folder, first or initial_name, opener, dry)
     name = ""
     if tool == "claude":
         try:
-            hint = f" [{initial_name}]" if initial_name else ""
-            name = input(f"session name for claude (empty = auto title){hint}> ").strip() or initial_name
+            seed = f" [{initial_name}]" if initial_name else ""
+            name = input(f"session name for claude (empty = auto title){seed}> ").strip() or initial_name
         except (EOFError, KeyboardInterrupt):
             return False
-    if not Path(folder).is_dir():
-        print(f"ccr: folder no longer exists: {folder}", file=sys.stderr)
-        return False
     argv = ["claude", "--name", name] if (tool == "claude" and name) else [tool]
     exec_inline(folder, argv, f"{tool} · {name or 'new'}", dry)
     return True
@@ -722,6 +1011,13 @@ def main():
     ap.add_argument("-n", "--new", action="store_true",
                     help="start a new conversation (folder menu); trailing text prefills the name box")
     ap.add_argument("--new-window", action="store_true", help="open selections in new windows, keep this tab")
+    ap.add_argument("--tabs", action="store_true",
+                    help="Terminal.app: open the extra sessions as tabs instead of windows. Terminal has no "
+                         "AppleScript for a new tab, so this presses Cmd-T through System Events and macOS asks "
+                         "for Automation rights once; iTerm2 and tmux use tabs either way")
+    ap.add_argument("--terminal", action="store_true",
+                    help="resume Codex desktop-app conversations with 'codex resume' in a terminal "
+                         "instead of handing them back to the app")
     ap.add_argument("--dry-run", action="store_true", help="print what would be launched, launch nothing")
     ap.add_argument("--version", action="version", version="ccr " + VERSION + " (python)")
     a = ap.parse_args()
@@ -739,21 +1035,21 @@ def main():
         sessions = sessions[: a.top]
 
     if a.new:
-        if not new_conversation(sessions, query, a.dry_run):
+        if not new_conversation(sessions, query, a.dry_run, a.terminal):
             print("ccr: cancelled.")
         return
 
     while True:
         index = {}
         rows = session_rows(sessions, index)
-        res = run_fzf(rows, HINT, query=query, expect=["del", "ctrl-n"])
+        res = run_fzf(rows, picker_hint(), query=query, expect=["del", "ctrl-n"])
         if res is None:
             print("ccr: cancelled.")
             return
         key, ids = res
         picked = [index[i] for i in ids if i in index]
         if key == "ctrl-n":
-            if not new_conversation(sessions, "", a.dry_run):
+            if not new_conversation(sessions, "", a.dry_run, a.terminal):
                 print("ccr: cancelled.")
             return
         if key == "del":
@@ -783,7 +1079,7 @@ def main():
         if not picked:
             print("ccr: cancelled.")
             return
-        launch(picked, a.new_window, a.dry_run)
+        launch(picked, a.new_window, a.dry_run, a.terminal, a.tabs)
         return
 
 
