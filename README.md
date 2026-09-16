@@ -129,9 +129,10 @@ The installer puts `ccr` in `~/.local/bin` (tells you if that isn't on your PATH
 |---|---|
 | `ccr` · `ccr kit` · `ccr -n [name]` · `ccr --tool codex` · `ccr --top 0` · `ccr --new-window` · `ccr --dry-run` | same meanings as the PowerShell flags |
 | `ccr --terminal` | resume Codex **app** conversations with `codex resume` in a terminal instead of handing them back to the app |
+| `ccr --tabs` | Terminal.app: extra sessions as tabs instead of windows (see below); iTerm2 and tmux use tabs either way |
 | type | fuzzy filter (fzf); `cleared`, `run` and `app` are searchable words |
 | `Tab` | mark / unmark (fzf convention — Space types into the filter). Marked rows take a green **●** in the gutter and the counter beside the prompt reads `49/128 · 2 marked`. |
-| `Enter` | open the marked sessions (or the highlighted one); the first takes over the current terminal, the rest become tabs |
+| `Enter` | open the marked sessions (or the highlighted one); the first takes over the current terminal, the rest become tabs in iTerm2 and tmux, separate windows in Terminal.app |
 | `Ctrl-N` | new conversation: folder → tool → name. The folder list starts with **`+ new folder`** (`Ctrl-O` jumps straight there) — type a path, `~` and relative paths welcome, and ccr offers to create it, so a brand-new project needs nothing prepared. The tool step offers **`codex app`** wherever the desktop app is installed. |
 | `Del` | delete the highlighted conversation after a confirmation |
 | `Esc` | cancel |
@@ -172,11 +173,13 @@ and which folder you chose. A preview pane shows the full title, folder, how the
 session id of the highlighted row. Everything beyond the plain picker is version-gated, so an older fzf loses the
 marked counter or the line highlight rather than refusing to start. Outside iTerm2/Terminal.app/tmux (e.g. a bare SSH shell) only the first selection can start, in the current terminal; ccr says so.
 
-**Terminal.app tabs ask for permission once.** Terminal has no AppleScript verb for "new tab", so ccr presses `Cmd-T`
-through System Events, and macOS gates that behind *Privacy & Security → Automation → Terminal → System Events* — the
-prompt appears the first time you open two sessions at once. Decline it and ccr opens a **new window** for those
-sessions instead, saying why; nothing is lost silently. iTerm2 creates tabs natively and asks for nothing, and so does
-`--new-window`, tmux, or sending Codex conversations to the desktop app.
+**Terminal.app gets windows, and asks for nothing.** Terminal's AppleScript dictionary has `do script`, which opens a
+window — an app sending itself an Apple event needs no rights, so nothing is ever prompted. It has no verb for a new
+*tab* at all: that takes a `Cmd-T` keystroke through System Events, a different app, which macOS gates behind
+*Privacy & Security → Automation*. ccr does not go looking for that permission, so extra sessions open as separate
+windows. Pass `--tabs` if you would rather have tabs and don't mind granting it once — and if you decline, or the
+keystroke fails for any other reason, ccr says what happened and opens the window anyway. iTerm2 creates tabs
+natively and asks for nothing, and so do tmux, `--new-window`, and Codex conversations sent to the desktop app.
 
 *The Python port is verified against the same session data as the PowerShell version. The Terminal.app path has since
 been exercised on a Mac; the iTerm2 scripting is still written from the dictionary alone — report anything odd with

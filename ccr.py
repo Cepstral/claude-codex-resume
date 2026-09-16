@@ -23,7 +23,7 @@ import urllib.parse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "0.25"
+VERSION = "0.26"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -691,9 +691,13 @@ def run_osascript(script: str):
     return r.returncode == 0, msg[:200]
 
 
-def open_tab(cwd: str, cmd: str, new_window: bool, dry: bool) -> bool:
+def open_tab(cwd: str, cmd: str, new_window: bool, dry: bool, tabs: bool = False) -> bool:
     """Run cmd in a new terminal surface: a tmux window when inside tmux,
-    else an iTerm2 / Terminal.app tab (or window). False = no backend."""
+    else an iTerm2 / Terminal.app tab (or window). False = no backend.
+
+    Terminal.app tabs cost an Automation prompt (see below), so there a window
+    is the default and `tabs` is the opt-in; iTerm2 and tmux pay nothing for a
+    tab and keep it."""
     shell_cmd = f"cd {shlex.quote(cwd)} && {cmd}"
     tp = os.environ.get("TERM_PROGRAM", "")
     if os.environ.get("TMUX"):
@@ -710,15 +714,19 @@ def open_tab(cwd: str, cmd: str, new_window: bool, dry: bool) -> bool:
                f'(create tab with default profile) to write text {applescript_str(shell_cmd)}\n'
                '  end tell\nend tell')
     elif tp == "Apple_Terminal":
+        # `do script` opens a window, and Terminal sending itself an Apple
+        # event needs no rights. A tab has no verb in the dictionary at all:
+        # it takes a Cmd-T keystroke through System Events, another app, which
+        # macOS gates behind Automation rights - so it stays opt-in.
         window = f'tell application "Terminal" to do script {applescript_str(shell_cmd)}'
-        # Terminal.app has no "new tab" verb, so the tab is a Cmd-T keystroke
-        # through System Events - which macOS gates behind Automation rights.
         tab = ('tell application "Terminal"\n  activate\n  tell application "System Events" to keystroke "t" '
                f'using command down\n  delay 0.3\n  do script {applescript_str(shell_cmd)} in selected tab of '
                'front window\nend tell')
+        if not tabs:
+            tab = None
     else:
         return False
-    scripts = [window] if new_window else [tab, window]
+    scripts = [window] if (new_window or tab is None) else [tab, window]
     if dry:
         print("  osascript:\n    " + scripts[0].replace("\n", "\n    "))
         if len(scripts) > 1:
@@ -780,7 +788,7 @@ def open_in_codex_app(s: Session, opener: list, dry: bool) -> bool:
     return True
 
 
-def launch(picked: list, new_window: bool, dry: bool, terminal: bool = False):
+def launch(picked: list, new_window: bool, dry: bool, terminal: bool = False, tabs: bool = False):
     opener = [] if terminal else url_opener()
     app_list, launch_list = [], []
     for s in picked:
@@ -818,7 +826,7 @@ def launch(picked: list, new_window: bool, dry: bool, terminal: bool = False):
     # First terminal selection takes over this terminal; the rest open as tabs.
     inline, tabs = (None, launch_list) if new_window else (launch_list[0], launch_list[1:])
     for s, cwd, argv in tabs:
-        if not open_tab(cwd, " ".join(shlex.quote(a) for a in argv), new_window, dry):
+        if not open_tab(cwd, " ".join(shlex.quote(a) for a in argv), new_window, dry, tabs):
             print("ccr: opening several sessions needs iTerm2, Terminal.app or tmux - only the first starts.",
                   file=sys.stderr)
             break
@@ -1003,6 +1011,10 @@ def main():
     ap.add_argument("-n", "--new", action="store_true",
                     help="start a new conversation (folder menu); trailing text prefills the name box")
     ap.add_argument("--new-window", action="store_true", help="open selections in new windows, keep this tab")
+    ap.add_argument("--tabs", action="store_true",
+                    help="Terminal.app: open the extra sessions as tabs instead of windows. Terminal has no "
+                         "AppleScript for a new tab, so this presses Cmd-T through System Events and macOS asks "
+                         "for Automation rights once; iTerm2 and tmux use tabs either way")
     ap.add_argument("--terminal", action="store_true",
                     help="resume Codex desktop-app conversations with 'codex resume' in a terminal "
                          "instead of handing them back to the app")
@@ -1067,7 +1079,7 @@ def main():
         if not picked:
             print("ccr: cancelled.")
             return
-        launch(picked, a.new_window, a.dry_run, a.terminal)
+        launch(picked, a.new_window, a.dry_run, a.terminal, a.tabs)
         return
 
 
