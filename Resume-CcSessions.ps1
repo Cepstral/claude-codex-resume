@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.32'
+$script:CcrVersion = '0.33'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -1406,7 +1406,7 @@ function Select-CcrSession {
             # --- layout ---
             $w = [Console]::WindowWidth
             $h = [Console]::WindowHeight
-            $viewH = [Math]::Max(1, $h - 2 - $(if ($acctMode) { $accounts.Count } else { 0 }))
+            $viewH = [Math]::Max(1, $h - 2 - $(if ($acctMode) { $accounts.Count + 1 } else { 0 }))
             if ($cursor -gt $view.Count - 1) { $cursor = [Math]::Max(0, $view.Count - 1) }
             if ($cursor -lt $top) { $top = $cursor }
             elseif ($cursor -ge $top + $viewH) { $top = $cursor - $viewH + 1 }
@@ -1436,6 +1436,7 @@ function Select-CcrSession {
                 # Legend, one line per account: number, label, the dirs per
                 # tool, and who is logged in there once the account page has
                 # looked it up.
+                [void]$sb.Append("`e[1;35mMulti-account mode active.`e[22;39m`e[K`n")
                 $lblW = ($accounts | ForEach-Object Length | Measure-Object -Maximum).Maximum
                 for ($ai = 0; $ai -lt $accounts.Count; $ai++) {
                     $lbl = $accounts[$ai]
