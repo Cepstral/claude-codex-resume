@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.31'
+$script:CcrVersion = '0.32'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -285,6 +285,34 @@ function Enable-CcrMultiAccount {
     $cfg
 }
 
+# Does this claude config dir carry a status line (statusLine in its
+# settings.json)?
+function Test-CcrStatusline([string]$RootPath) {
+    $sj = Join-Path $RootPath 'settings.json'
+    if (-not (Test-Path -LiteralPath $sj)) { return $false }
+    try { [bool]((Get-Content -LiteralPath $sj -Raw | ConvertFrom-Json).PSObject.Properties['statusLine']) } catch { $false }
+}
+
+# Give a claude account the status line of another one: the statusLine
+# entry is merged into the target's settings.json (other keys untouched)
+# and the statusline* script files next to it are copied over (logs
+# excluded). Claude resolves the script through CLAUDE_CONFIG_DIR at run
+# time, so the copy works unchanged in the new dir.
+function Copy-CcrStatusline {
+    param([Parameter(Mandatory)][string]$FromPath, [Parameter(Mandatory)][string]$ToPath)
+    $src = Join-Path $FromPath 'settings.json'
+    if (-not (Test-CcrStatusline $FromPath)) { throw "ccr: no statusLine in $src - nothing to copy" }
+    $entry = (Get-Content -LiteralPath $src -Raw | ConvertFrom-Json).statusLine
+    New-Item -ItemType Directory -Path $ToPath -Force | Out-Null
+    $dst = Join-Path $ToPath 'settings.json'
+    $cfg = if (Test-Path -LiteralPath $dst) { Get-Content -LiteralPath $dst -Raw | ConvertFrom-Json } else { [pscustomobject]@{} }
+    $cfg | Add-Member -NotePropertyName statusLine -NotePropertyValue $entry -Force
+    $cfg | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $dst -Encoding utf8NoBOM
+    $files = @(Get-ChildItem -LiteralPath $FromPath -File -Filter 'statusline*' -ErrorAction SilentlyContinue | Where-Object { $_.Extension -notin '.log', '.txt' })
+    foreach ($f in $files) { Copy-Item -LiteralPath $f.FullName -Destination (Join-Path $ToPath $f.Name) -Force }
+    Write-Host "ccr: status line copied to $(Format-CcrCwd $ToPath 50): statusLine in settings.json$(if ($files.Count) { " + $($files.Name -join ', ')" })"
+}
+
 # Register a new account for one tool (or both): a fresh config dir next to
 # the default one (~/.claude-<label>, ~/.codex-<label>), the tool's own
 # interactive login run inside it, and the entry recorded in ccr.json.
@@ -292,7 +320,9 @@ function Enable-CcrMultiAccount {
 function Add-CcrAccount {
     param(
         [Parameter(Mandatory)][string]$Label,
-        [ValidateSet('claude', 'codex', 'all')][string]$Tool = 'all'
+        [ValidateSet('claude', 'codex', 'all')][string]$Tool = 'all',
+        # Claude only: give the new dir the default account's status line.
+        [switch]$CopyStatusline
     )
     if ($Label -notmatch '^[A-Za-z0-9_-]{1,12}$') { throw "ccr: account label must be 1-12 letters/digits/_/- (got '$Label')" }
     if ($Label -eq $script:CcrDefaultLabel) { throw "ccr: '$Label' is the label of the dirs in use today - pick another one" }
@@ -305,6 +335,10 @@ function Add-CcrAccount {
         New-Item -ItemType Directory -Path $dir -Force | Out-Null
         $map | Add-Member -NotePropertyName $Label -NotePropertyValue $dir
         Save-CcrConfig $cfg   # record first, so an aborted login still leaves a usable entry
+        if ($t -eq 'claude' -and $CopyStatusline) {
+            $from = @(Get-CcrRoots -Tool claude | Where-Object Default)[0].Path
+            try { Copy-CcrStatusline -FromPath $from -ToPath $dir } catch { Write-Warning "$_" }
+        }
         Write-Host "ccr: $t account '$Label' -> $dir  - starting the $t login flow in that dir" -ForegroundColor Yellow
         $var = if ($t -eq 'claude') { 'CLAUDE_CONFIG_DIR' } else { 'CODEX_HOME' }
         $prev = [System.Environment]::GetEnvironmentVariable($var)
@@ -893,6 +927,38 @@ function Write-CcrScreen([string[]]$Lines) {
     [Console]::Write($sb.ToString())
 }
 
+# A small checklist inside the alt buffer: Space toggles, Enter confirms,
+# Esc backs out. Items are @{ Key; Text; Note; Checked }; returns a
+# hashtable Key -> [bool], or $null on Esc.
+function Select-CcrChecklist {
+    param([Parameter(Mandatory)][string]$Title, [Parameter(Mandatory)][object[]]$Items)
+    $state = @{}
+    foreach ($it in $Items) { $state[$it.Key] = [bool]$it.Checked }
+    $cursor = 0
+    while ($true) {
+        $lines = [System.Collections.Generic.List[string]]::new()
+        $lines.Add($Title)
+        $lines.Add("`e[2m$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space toggle $([char]0x00B7) Enter continue $([char]0x00B7) Esc back`e[22m")
+        for ($i = 0; $i -lt $Items.Count; $i++) {
+            $it = $Items[$i]
+            $box = if ($state[$it.Key]) { "`e[32m[x]`e[39m" } else { '[ ]' }
+            $row = "  $box $($it.Text)$(if ($it.Note) { "  `e[2m$($it.Note)`e[22m" })"
+            if ($i -eq $cursor) { $row = "`e[7m$row`e[27m" }
+            $lines.Add($row)
+        }
+        Write-CcrScreen $lines
+        $k = [Console]::ReadKey($true)
+        if ($k.Key -eq [ConsoleKey]::C -and ($k.Modifiers -band [ConsoleModifiers]::Control)) { return $null }
+        switch ($k.Key) {
+            'UpArrow' { if ($cursor -gt 0) { $cursor-- } }
+            'DownArrow' { if ($cursor -lt $Items.Count - 1) { $cursor++ } }
+            'Spacebar' { $state[$Items[$cursor].Key] = -not $state[$Items[$cursor].Key] }
+            'Enter' { return $state }
+            'Escape' { return $null }
+        }
+    }
+}
+
 # Account page (Ctrl+M in the picker). The first time it explains what
 # turning multi-account mode on does and goes straight to adding the first
 # extra account (tool, then label). Afterwards it lists the accounts per
@@ -918,7 +984,20 @@ function Show-CcrAccountPage {
             if ($null -eq $label) { return $null }
             if ($label -notmatch '^[A-Za-z0-9_-]{1,12}$') { Show-CcrNotice "ccr: invalid label '$label' ($labelHint)" '33'; continue }
             if ($label -eq $def -or $label -in $taken) { Show-CcrNotice "ccr: $tool account '$label' already exists" '33'; continue }
-            return [pscustomobject]@{ Action = 'add'; Tool = $tool; Label = $label }
+            $copySl = $false
+            if ($tool -eq 'claude') {
+                # Options for the new claude dir; only offered when the
+                # default account has something to copy.
+                $defRoot = @($ClaudeRoots | Where-Object Default)[0]
+                $defPath = if ($defRoot) { $defRoot.Path } else { Get-CcrClaudeRoot }
+                if (Test-CcrStatusline $defPath) {
+                    $opts = Select-CcrChecklist -Title "options for the new claude account '$label'" -Items @(
+                        [pscustomobject]@{ Key = 'statusline'; Text = 'Copy statusline from default account'; Note = 'statusLine in settings.json + statusline*.ps1'; Checked = $true })
+                    if ($null -eq $opts) { return $null }
+                    $copySl = [bool]$opts['statusline']
+                }
+            }
+            return [pscustomobject]@{ Action = 'add'; Tool = $tool; Label = $label; CopyStatusline = $copySl }
         }
     }
 
@@ -967,7 +1046,7 @@ function Show-CcrAccountPage {
     while ($true) {
         $lines = [System.Collections.Generic.List[string]]::new()
         $lines.Add("`e[1mAccounts`e[22m  `e[2m$($script:CcrConfigPath)`e[22m")
-        $lines.Add("`e[2m$([char]0x2191)$([char]0x2193) move $dot + add $dot Del remove $dot X turn off $dot Esc back`e[22m")
+        $lines.Add("`e[2m$([char]0x2191)$([char]0x2193) move $dot + add $dot Del remove $dot S copy statusline from default $dot X turn off $dot Esc back`e[22m")
         for ($i = 0; $i -lt $rows.Count; $i++) {
             $r = $rows[$i]
             $toolColor = if ($r.Tool -eq 'claude') { "`e[38;5;208m" } else { "`e[36m" }
@@ -1005,6 +1084,25 @@ function Show-CcrAccountPage {
             }
             default {
                 if ($k.KeyChar -eq '+') { $r = Read-CcrNewAccount; if ($r) { return $r } }
+                elseif ($k.KeyChar -in 's', 'S') {
+                    $r = $rows[$cursor]
+                    if ($r.Tool -ne 'claude') { Show-CcrNotice "ccr: the status line is a claude setting - pick a claude row" '33'; continue }
+                    if ($r.Default) { Show-CcrNotice "ccr: '$($r.Label)' is the default account - it is the source, not a target" '33'; continue }
+                    $from = @($rows | Where-Object { $_.Tool -eq 'claude' -and $_.Default })[0]
+                    if (-not $from -or -not (Test-CcrStatusline $from.Path)) { Show-CcrNotice "ccr: the default claude account has no statusLine in its settings.json" '33'; continue }
+                    Write-CcrScreen @(
+                        "`e[1mCopy status line`e[22m",
+                        '',
+                        "    from  $($from.Label)  $(Format-CcrCwd $from.Path 60)",
+                        "    to    $($r.Label)  $(Format-CcrCwd $r.Path 60)",
+                        '',
+                        "  The statusLine entry is merged into the target's settings.json (other keys stay)",
+                        '  and the statusline* script files next to it are copied over.',
+                        '',
+                        "  `e[32m[y]`e[39m copy    `e[2many other key: cancel`e[22m")
+                    $c = [Console]::ReadKey($true)
+                    if ($c.KeyChar -in 'y', 'Y') { return [pscustomobject]@{ Action = 'statusline'; Tool = 'claude'; Label = $r.Label; From = $from.Path; To = $r.Path } }
+                }
                 elseif ($k.KeyChar -in 'x', 'X') {
                     Write-CcrScreen @(
                         "`e[1mTurn multi-account mode off`e[22m",
@@ -1420,11 +1518,12 @@ function Select-CcrSession {
                 [Console]::TreatControlCAsInput = $prevCtrlC
                 try {
                     if ($WhatIfPreference) {
-                        Write-Host "WhatIf: would $($act.Action) $(if ($act.Label) { "$($act.Tool) account '$($act.Label)'" } else { 'multi-account mode' })." -ForegroundColor Yellow
+                        Write-Host "WhatIf: would $($act.Action) $(if ($act.Label) { "$($act.Tool) account '$($act.Label)'" } else { 'multi-account mode' })$(if ($act.CopyStatusline) { ' (copying the status line)' })." -ForegroundColor Yellow
                     }
                     else {
                         switch ($act.Action) {
-                            'add' { Add-CcrAccount -Label $act.Label -Tool $act.Tool }
+                            'add' { Add-CcrAccount -Label $act.Label -Tool $act.Tool -CopyStatusline:([bool]$act.CopyStatusline) }
+                            'statusline' { Copy-CcrStatusline -FromPath $act.From -ToPath $act.To }
                             'remove' { Remove-CcrAccount -Label $act.Label -Tool $act.Tool }
                             'disable' { Disable-CcrMultiAccount }
                         }
@@ -1677,7 +1776,9 @@ function Resume-CcSessions {
         per tool (~/.claude-work, ~/.codex-work), runs each tool's own login
         flow inside it, and records both in ccr.json next to this script.
         The first time the dirs in use today become the "default" account
-        (nothing moves). -Tool claude / -Tool codex limits it to one tool.
+        (nothing moves). -Tool claude / -Tool codex limits it to one tool;
+        -CopyStatusline gives the new claude dir the default account's
+        status line (statusLine in settings.json + the statusline* files).
         ccr -Accounts shows who is logged in where; ccr -RemoveAccount work
         moves its sessions to the default account and forgets the entry;
         ccr -DisableAccounts does that for every account and turns
@@ -1688,9 +1789,12 @@ function Resume-CcSessions {
         today become the "default" account and asks tool + label for the
         additional one, then runs that tool's login (like ccr -AddAccount).
         Afterwards it lists the accounts (grouped by account) with who is
-        logged in where: + adds one, Del removes the highlighted one (its
-        sessions go to the default account), X turns multi-account mode
-        off (every session goes to the default account).
+        logged in where: + adds one (for claude, with a checkbox to copy
+        the default account's status line), Del removes the highlighted
+        one (its sessions go to the default account), S copies the status
+        line from the default account to the highlighted claude account,
+        X turns multi-account mode off (every session goes to the default
+        account).
         While multi-account mode is on, the picker's Space cycles the
         account a row opens under: its own (green dot = plain open), then
         the others (magenta digit, see the hint line), then none. Enter
@@ -1747,7 +1851,9 @@ function Resume-CcSessions {
         [switch]$Accounts,
         [string]$AddAccount = '',
         [string]$RemoveAccount = '',
-        [switch]$DisableAccounts
+        [switch]$DisableAccounts,
+        # With -AddAccount: give the new claude dir the default account's status line.
+        [switch]$CopyStatusline
     )
     $filterText = if ($Filter) { ($Filter -join ' ').Trim() } else { '' }
 
@@ -1779,6 +1885,7 @@ function Resume-CcSessions {
             if ($NewWindow) { $inv += ' -NewWindow' }
             if ($Accounts) { $inv += ' -Accounts' }
             if ($AddAccount) { $inv += " -AddAccount '$AddAccount'" }
+            if ($CopyStatusline) { $inv += ' -CopyStatusline' }
             if ($RemoveAccount) { $inv += " -RemoveAccount '$RemoveAccount'" }
             if ($DisableAccounts) { $inv += ' -DisableAccounts' }
             if ($Root) { $inv += " -Root '$($Root -replace "'", "''")'" }
@@ -1793,7 +1900,7 @@ function Resume-CcSessions {
     if ($Accounts) { Show-CcrAccounts; return }
     if ($AddAccount -or $RemoveAccount -or $DisableAccounts) {
         try {
-            if ($AddAccount) { Add-CcrAccount -Label $AddAccount -Tool $Tool }
+            if ($AddAccount) { Add-CcrAccount -Label $AddAccount -Tool $Tool -CopyStatusline:$CopyStatusline }
             elseif ($RemoveAccount) { Remove-CcrAccount -Label $RemoveAccount -Tool $Tool }
             else { Disable-CcrMultiAccount }
         }

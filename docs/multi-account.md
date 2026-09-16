@@ -44,7 +44,11 @@ Accounts  C:\Users\me\OneDrive\.claude\pwsh\ccr.json
   codex   default  ~\.codex               Logged in using ChatGPT  (default)
 ```
 
-- `+` adds another account (tool, then label, then that tool's login).
+- `+` adds another account (tool, then label, then that tool's login). For a Claude account a
+  checklist offers **Copy statusline from default account**: the `statusLine` entry is merged
+  into the new dir's `settings.json` and the `statusline*` script files are copied next to it
+  (Claude resolves the script through `CLAUDE_CONFIG_DIR`, so it works unchanged there).
+- `S` does the same copy for an existing Claude account (the highlighted row).
 - `Del` removes the highlighted account: every session it holds **moves to the `default`
   account** of that tool and keeps working there; the dir and its login stay on disk, ccr just
   forgets them. Refused while one of its sessions is running.
@@ -169,9 +173,12 @@ filter>                                                              198/198 · 
   1 default    claude ~\OneDrive\.claude  codex ~\.codex        me@company.com
   2 lpaliotto  claude ~\OneDrive\.claude-lpaliotto  codex ~\.codex-lpaliotto  me@gmail.com
 ↑↓ move · Space cycles the account (dot = as is) · Enter open · Ctrl+N new · Ctrl+M accounts · Del delete · Esc cancel
-2 claude default    1h  Billing API pagination          D:epospi-server
-● claude lpaliotto  3h  Home automation bridge          D:epos\home
-  codex  default    5h  migrate build to vite           D:epos\web-app
+2 claude default    1h  Billing API pagination          D:
+epospi-server
+● claude lpaliotto  3h  Home automation bridge          D:
+epos\home
+  codex  default    5h  migrate build to vite           D:
+epos\web-app
 ```
 
 `Enter` opens every marked row under the chosen account. When the digit differs from the account
