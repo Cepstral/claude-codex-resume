@@ -44,11 +44,12 @@ Accounts  C:\Users\me\OneDrive\.claude\pwsh\ccr.json
   codex   default  ~\.codex               Logged in using ChatGPT  (default)
 ```
 
-- `+` adds another account (tool, then label, then that tool's login). For a Claude account a
-  checklist offers **Copy statusline from default account**: the `statusLine` entry is merged
-  into the new dir's `settings.json` and the `statusline*` script files are copied next to it
-  (Claude resolves the script through `CLAUDE_CONFIG_DIR`, so it works unchanged there).
-- `S` does the same copy for an existing Claude account (the highlighted row).
+- `+` adds another account (tool, then label, then that tool's login). A checklist offers to
+  **copy the default account's settings**: for Claude the status line (the `statusLine` entry is
+  merged into the new dir's `settings.json` and the `statusline*` script files are copied next
+  to it; Claude resolves the script through `CLAUDE_CONFIG_DIR`, so it works unchanged there),
+  for Codex `config.toml` (model, effort, features, per-project trust).
+- `S` does the same copy for an existing account (the highlighted row, its own tool).
 - `Del` removes the highlighted account: every session it holds **moves to the `default`
   account** of that tool and keeps working there; the dir and its login stay on disk, ccr just
   forgets them. Refused while one of its sessions is running.
@@ -58,7 +59,7 @@ Accounts  C:\Users\me\OneDrive\.claude\pwsh\ccr.json
 The same from the command line:
 
 ```powershell
-ccr -AddAccount work              # both tools;  -Tool claude / -Tool codex for one
+ccr -AddAccount work              # both tools;  -Tool claude / -Tool codex for one; -CopySettings copies the default's settings
 ccr -Accounts                     # what is configured, and who is logged in where
 ccr -RemoveAccount work           # sessions move to 'default', entry forgotten
 ccr -DisableAccounts              # everything back to the single default dirs
@@ -219,3 +220,20 @@ Claude Code honors `CLAUDE_CODE_OAUTH_TOKEN` per process, which would allow one 
 with per-session accounts. It also makes ccr a credential handler (secure storage on three
 OSes, token expiry, keeping secrets off command lines), and Remote Control under a token session
 is unverified. The per-dir design keeps ccr out of the auth business entirely.
+
+## Claude ↔ Codex parity
+
+Every account feature exists for both tools. Where a concept has no counterpart, this table says so.
+
+| Concept                                   | Claude Code                                              | Codex CLI                                                        |
+|-------------------------------------------|----------------------------------------------------------|------------------------------------------------------------------|
+| Data dir per account                      | `CLAUDE_CONFIG_DIR`, created next to the default dir     | `CODEX_HOME`, created next to the default dir                    |
+| Login inside the dir                      | `claude auth login`                                      | `codex login`                                                    |
+| Reuse of an existing dir with a login     | `.credentials.json` present → no new login               | `auth.json` present → no new login                               |
+| Identity shown in the picker              | `.claude.json` → `oauthAccount.emailAddress`             | `auth.json` → email claim of the OpenID token                    |
+| Settings copied from the default account  | status line (`statusLine` + `statusline*` files)         | `config.toml`                                                    |
+| First-start wizard skipped in a new dir   | `.claude.json` seeded with `hasCompletedOnboarding`      | **not applicable** — Codex has no wizard to skip                 |
+| Moving a conversation between accounts    | transcript + sidecar folder, same project slug           | rollout file, same `sessions/YYYY/MM/DD` path                    |
+| Title after a move                        | travels with the transcript                              | **not applicable** — `/rename` titles stay in the old catalog    |
+| Per-launch account selection              | `CLAUDE_CONFIG_DIR` set on the process                   | `CODEX_HOME` set on the process; the desktop app cannot be given one, it always runs as the default account |
+| Delete a conversation                     | transcript + sidecar removed                             | `codex delete <id>`                                              |
