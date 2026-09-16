@@ -23,7 +23,7 @@ import urllib.parse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "0.23"
+VERSION = "0.24"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -31,6 +31,29 @@ HOME = Path.home()
 FZF = shlex.split(os.environ.get("CCR_FZF") or "fzf")
 
 ORANGE, CYAN, RED, YELLOW, DIM, RESET = "\033[38;5;208m", "\033[36m", "\033[31m", "\033[33m", "\033[2m", "\033[0m"
+GREEN, BOLD = "\033[32m", "\033[1m"
+ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+
+def visible_len(s: str) -> int:
+    return len(ANSI_RE.sub("", s))
+
+
+def right_align(line: str, tail: str) -> str:
+    """Push tail to the right edge, counting only the characters that show.
+
+    fzf indents header lines past the pointer/marker gutter, so the usable
+    width is a few columns short of the terminal's."""
+    width = shutil.get_terminal_size((100, 24)).columns - 4
+    gap = max(3, width - visible_len(line) - visible_len(tail))
+    return line + " " * gap + tail
+
+
+def hint(*pairs, tail: str = "") -> str:
+    """A 'key action' legend: keys carry the colour, actions stay quiet."""
+    sep = f"{DIM}  ·  {RESET}"
+    line = sep.join(f"{BOLD}{CYAN}{k}{RESET} {DIM}{v}{RESET}" for k, v in pairs)
+    return right_align(line, f"{DIM}{tail}{RESET}") if tail else line
 
 
 # ----------------------------------------------------------------------------
@@ -497,21 +520,57 @@ def codex_sessions() -> list:
 # ----------------------------------------------------------------------------
 # fzf picker
 # ----------------------------------------------------------------------------
+FZF_VER = None
+
+
+def fzf_version() -> tuple:
+    """(major, minor) of the picker, (0, 0) when it will not say."""
+    global FZF_VER
+    if FZF_VER is None:
+        FZF_VER = (0, 0)
+        try:
+            out = subprocess.run(FZF[:1] + ["--version"], capture_output=True, text=True,
+                                 timeout=5).stdout
+            m = re.match(r"(\d+)\.(\d+)", out.strip())
+            if m:
+                FZF_VER = (int(m.group(1)), int(m.group(2)))
+        except Exception:
+            pass
+    return FZF_VER
+
+
+# Counts in the picker's own words: "49/128 · 2 marked", marked in green.
+INFO_CMD = (r'printf "%s" "$FZF_MATCH_COUNT/$FZF_TOTAL_COUNT"; '
+            r'[ "${FZF_SELECT_COUNT:-0}" -gt 0 ] && '
+            r'printf " \033[32m·\033[0m \033[1;32m%s marked\033[0m" "$FZF_SELECT_COUNT"; :')
+
+
 def run_fzf(rows, header, query="", multi=True, expect=None, preview=True, prompt="filter> "):
     """Rows are '<id>\\t<display>\\t<preview>'. Returns (key, [ids]) or None on
     Esc/Ctrl-C; key is '' for Enter or one of `expect`."""
     if not shutil.which(FZF[0]):
         sys.exit("ccr: fzf not found - install it first (brew install fzf)")
+    ver = fzf_version()
+    colors = ["marker:green:bold", "pointer:cyan", "prompt:cyan", "info:dim"]
     args = FZF + ["--ansi", "--no-sort", "--layout=reverse", "--delimiter=\t", "--with-nth=2",
-            "--header=" + header, "--prompt=" + prompt, "--info=inline"]
+            "--header=" + header, "--prompt=" + prompt, "--info=inline",
+            "--marker=●", "--pointer=❯"]
+    if ver >= (0, 21):
+        args.append("--header-first")   # legend above the prompt, not buried under it
+    if ver >= (0, 42):
+        args.append("--highlight-line")
+        colors += ["selected-bg:-1", "selected-fg:green"]
+    args.append("--color=" + ",".join(colors))
     if multi:
         args.append("--multi")
+        if ver >= (0, 46):
+            args += ["--info-command=" + INFO_CMD]
     if query:
         args += ["--query", query]
     if expect:
         args += ["--expect", ",".join(expect)]
     if preview:
-        args += ["--preview", "printf '%b\\n' {3}", "--preview-window=down,4,wrap"]
+        args += ["--preview", "printf '%b\\n' {3}", "--preview-window=down,5,wrap"]
     p = subprocess.run(args, input="\n".join(rows) + "\n", text=True, stdout=subprocess.PIPE)
     if p.returncode not in (0, 1):
         return None
@@ -546,8 +605,12 @@ def session_rows(sessions, index):
     return rows
 
 
-HINT = ("↑↓ move · Tab mark · Enter open · Ctrl-N new · Del delete · "
-        "Esc cancel · type to filter · ccr v" + VERSION)
+def picker_hint() -> str:
+    keys = hint(("↑↓", "move"), ("Tab", "mark"), ("Enter", "open"), ("Ctrl-N", "new"),
+                ("Del", "delete"), ("Esc", "cancel"))
+    words = f"{DIM},{RESET} ".join(f"{CYAN}{w}{RESET}" for w in ("run", "cleared", "app"))
+    filters = f"{DIM}type to filter — {RESET}{words}{DIM} match as words{RESET}"
+    return keys + "\n" + right_align(filters, f"{DIM}ccr v{VERSION}{RESET}")
 
 
 # ----------------------------------------------------------------------------
@@ -859,7 +922,8 @@ def new_conversation(sessions: list, initial_name: str, dry: bool, terminal: boo
         index[str(i)] = g
         rows.append(f"{i}\t{fmt_age(g['last']):>6}  {DIM}{g['count']:>3}×{RESET}  "
                     f"{fmt_cwd(g['path'], 70)}\t{g['path']}")
-    res = run_fzf(rows, "new conversation: pick a folder · Enter next · Ctrl-O new folder · Esc back",
+    res = run_fzf(rows, hint(("Enter", "next"), ("Ctrl-O", "new folder"), ("Esc", "back"),
+                             tail="new conversation · step 1 of 2: folder"),
                   multi=False, prompt="new session in> ", expect=["ctrl-o"])
     if not res or not (res[0] or res[1]):
         return False
@@ -871,31 +935,33 @@ def new_conversation(sessions: list, initial_name: str, dry: bool, terminal: boo
         folder = index[res[1][0]]["path"]
     opener = [] if terminal else url_opener()
     app_ok = bool(opener) and codex_app_installed(sessions)
-    tools = [f"0\t{ORANGE}claude{RESET}   {DIM}asks for a session name{RESET}\tclaude",
-             f"1\t{CYAN}codex{RESET}    {DIM}terminal · no start name - /rename inside{RESET}\tcodex"]
+    tools = [f"0\t{ORANGE}claude{RESET}{' ' * 5}{DIM}asks for a session name{RESET}\tclaude",
+             f"1\t{CYAN}codex{RESET}{' ' * 6}{DIM}a terminal tab · no start name - /rename inside"
+             f"{RESET}\tcodex terminal"]
     if app_ok:
-        tools.append(f"2\t{CYAN}codex{RESET}{DIM} app{RESET}  {DIM}new thread in the Codex desktop app, "
-                     f"in this folder{RESET}\tcodex app")
-    res = run_fzf(tools, "tool for the new conversation · Enter choose · Esc back",
-                  multi=False, preview=False, prompt="tool> ")
+        tools.append(f"2\t{CYAN}codex{RESET}{DIM} app{RESET}{' ' * 2}{DIM}a new thread in the Codex "
+                     f"desktop app, rooted at this folder{RESET}\tcodex app desktop")
+    res = run_fzf(tools, hint(("Enter", "choose"), ("Esc", "back"),
+                              tail=f"step 2 of 2: tool · {fmt_cwd(folder, 46)}"),
+                   multi=False, preview=False, prompt="tool> ")
     if not res or not res[1]:
         return False
     tool = {"1": "codex", "2": "codex app"}.get(res[1][0], "claude")
-    if tool != "codex app" and not Path(folder).is_dir():
+    if tool != "codex app" and not dry and not Path(folder).is_dir():
         print(f"ccr: folder no longer exists: {folder}", file=sys.stderr)
         return False
     if tool == "codex app":
         try:
-            hint = f" [{initial_name}]" if initial_name else ""
-            first = input(f"first message for codex (empty = just open the folder){hint}> ").strip()
+            seed = f" [{initial_name}]" if initial_name else ""
+            first = input(f"first message for codex (empty = just open the folder){seed}> ").strip()
         except (EOFError, KeyboardInterrupt):
             return False
         return open_new_app_thread(folder, first or initial_name, opener, dry)
     name = ""
     if tool == "claude":
         try:
-            hint = f" [{initial_name}]" if initial_name else ""
-            name = input(f"session name for claude (empty = auto title){hint}> ").strip() or initial_name
+            seed = f" [{initial_name}]" if initial_name else ""
+            name = input(f"session name for claude (empty = auto title){seed}> ").strip() or initial_name
         except (EOFError, KeyboardInterrupt):
             return False
     argv = ["claude", "--name", name] if (tool == "claude" and name) else [tool]
@@ -942,7 +1008,7 @@ def main():
     while True:
         index = {}
         rows = session_rows(sessions, index)
-        res = run_fzf(rows, HINT, query=query, expect=["del", "ctrl-n"])
+        res = run_fzf(rows, picker_hint(), query=query, expect=["del", "ctrl-n"])
         if res is None:
             print("ccr: cancelled.")
             return

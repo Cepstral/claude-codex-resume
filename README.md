@@ -130,7 +130,7 @@ The installer puts `ccr` in `~/.local/bin` (tells you if that isn't on your PATH
 | `ccr` · `ccr kit` · `ccr -n [name]` · `ccr --tool codex` · `ccr --top 0` · `ccr --new-window` · `ccr --dry-run` | same meanings as the PowerShell flags |
 | `ccr --terminal` | resume Codex **app** conversations with `codex resume` in a terminal instead of handing them back to the app |
 | type | fuzzy filter (fzf); `cleared`, `run` and `app` are searchable words |
-| `Tab` | mark / unmark (fzf convention — Space types into the filter) |
+| `Tab` | mark / unmark (fzf convention — Space types into the filter). Marked rows take a green **●** in the gutter and the counter beside the prompt reads `49/128 · 2 marked`. |
 | `Enter` | open the marked sessions (or the highlighted one); the first takes over the current terminal, the rest become tabs |
 | `Ctrl-N` | new conversation: folder → tool → name. The folder list starts with **`+ new folder`** (`Ctrl-O` jumps straight there) — type a path, `~` and relative paths welcome, and ccr offers to create it, so a brand-new project needs nothing prepared. The tool step offers **`codex app`** wherever the desktop app is installed. |
 | `Del` | delete the highlighted conversation after a confirmation |
@@ -166,7 +166,11 @@ folder as the thread's workspace root — registering it as a project when it is
 Codex conversation starts there with the project already set up. A first message typed at the prompt (or the trailing
 text of `ccr -n TEXT`) is prefilled in the composer; nothing is sent for you.
 
-A preview pane shows the full title, folder, how the row will open, last-used time and session id of the highlighted row. Outside iTerm2/Terminal.app/tmux (e.g. a bare SSH shell) only the first selection can start, in the current terminal; ccr says so.
+The legend sits above the prompt rather than under it, one line of keys and one of filter hints, with the keys
+picked out in colour and the rest kept quiet — and the two-step new-conversation menu labels which step you are on
+and which folder you chose. A preview pane shows the full title, folder, how the row will open, last-used time and
+session id of the highlighted row. Everything beyond the plain picker is version-gated, so an older fzf loses the
+marked counter or the line highlight rather than refusing to start. Outside iTerm2/Terminal.app/tmux (e.g. a bare SSH shell) only the first selection can start, in the current terminal; ccr says so.
 
 *The Python port is verified against the same session data as the PowerShell version, but the macOS tab scripting (osascript) was written from the iTerm2/Terminal.app dictionaries and not yet exercised on a Mac — report anything odd with `ccr --dry-run`, which prints the exact AppleScript it would run.*
 
