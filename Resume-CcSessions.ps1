@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.43'
+$script:CcrVersion = '0.44'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -303,12 +303,18 @@ function Enable-CcrMultiAccount {
     foreach ($key in 'claudeRoots', 'codexRoots') {
         if (-not $cfg.PSObject.Properties[$key] -or -not $cfg.$key) { $cfg | Add-Member -NotePropertyName $key -NotePropertyValue ([pscustomobject]@{}) -Force }
     }
-    if ((Get-CcrMapCount $cfg.claudeRoots) -or (Get-CcrMapCount $cfg.codexRoots)) { return $cfg }
-    $cfg.claudeRoots | Add-Member -NotePropertyName $script:CcrDefaultLabel -NotePropertyValue (Get-CcrClaudeRoot)
-    $cfg.codexRoots | Add-Member -NotePropertyName $script:CcrDefaultLabel -NotePropertyValue (Get-CcrCodexRoot)
-    $cfg | Add-Member -NotePropertyName defaultRoot -NotePropertyValue $script:CcrDefaultLabel -Force
+    # Seed per tool: a by-hand ccr.json may list only one tool's roots, and the
+    # other tool must still keep its current dir as an account once it gets
+    # a second one (otherwise its real default would vanish from the listing).
+    $wasOn = [bool]((Get-CcrMapCount $cfg.claudeRoots) -or (Get-CcrMapCount $cfg.codexRoots))
+    $seeded = @()
+    if (-not (Get-CcrMapCount $cfg.claudeRoots)) { $cfg.claudeRoots | Add-Member -NotePropertyName $script:CcrDefaultLabel -NotePropertyValue (Get-CcrClaudeRoot); $seeded += 'claude' }
+    if (-not (Get-CcrMapCount $cfg.codexRoots)) { $cfg.codexRoots | Add-Member -NotePropertyName $script:CcrDefaultLabel -NotePropertyValue (Get-CcrCodexRoot); $seeded += 'codex' }
+    if (-not $cfg.PSObject.Properties['defaultRoot'] -or -not $cfg.defaultRoot) { $cfg | Add-Member -NotePropertyName defaultRoot -NotePropertyValue $script:CcrDefaultLabel -Force }
+    if ($seeded.Count -eq 0) { return $cfg }
     Save-CcrConfig $cfg
-    Write-Host "ccr: multi-account mode is on - the dirs claude and codex use today are the '$($script:CcrDefaultLabel)' account (nothing moved)." -ForegroundColor Green
+    if ($wasOn) { Write-Host "ccr: the dir $($seeded -join ' and ') uses today is recorded as the '$($script:CcrDefaultLabel)' account (nothing moved)." -ForegroundColor Green }
+    else { Write-Host "ccr: multi-account mode is on - the dirs claude and codex use today are the '$($script:CcrDefaultLabel)' account (nothing moved)." -ForegroundColor Green }
     $cfg
 }
 
@@ -334,7 +340,9 @@ function Copy-CcrStatusline {
     $dst = Join-Path $ToPath 'settings.json'
     $cfg = if (Test-Path -LiteralPath $dst) { Get-Content -LiteralPath $dst -Raw | ConvertFrom-Json } else { [pscustomobject]@{} }
     $cfg | Add-Member -NotePropertyName statusLine -NotePropertyValue $entry -Force
-    $cfg | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $dst -Encoding utf8NoBOM
+    # Depth 100 (the maximum): a settings.json can nest deeper than 10 (MCP
+    # server configs, permission trees) and a shallow depth would truncate it.
+    $cfg | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath $dst -Encoding utf8NoBOM
     $files = @(Get-ChildItem -LiteralPath $FromPath -File -Filter 'statusline*' -ErrorAction SilentlyContinue | Where-Object { $_.Extension -notin '.log', '.txt' })
     foreach ($f in $files) { Copy-Item -LiteralPath $f.FullName -Destination (Join-Path $ToPath $f.Name) -Force }
     Write-Host "ccr: status line copied to $(Format-CcrCwd $ToPath 50): statusLine in settings.json$(if ($files.Count) { " + $($files.Name -join ', ')" })"
@@ -893,12 +901,18 @@ function Remove-CcrSessionData {
     if ($Session.Tool -eq 'codex') {
         # Codex keeps a catalog besides the rollout file, so let its own CLI do
         # the delete; fall back to removing the rollout directly.
+        # The session's own account dir must be CODEX_HOME for the call, or
+        # codex looks in the default dir and misses it (leaving the account's
+        # catalog stale).
         $ok = $false
+        $prevHome = $env:CODEX_HOME
+        if ($Session.PSObject.Properties['RootPath'] -and $Session.RootPath) { $env:CODEX_HOME = $Session.RootPath }
         try {
             $null = & codex delete $Session.SessionId 2>&1
             $ok = ($LASTEXITCODE -eq 0)
         }
         catch { $ok = $false }
+        finally { $env:CODEX_HOME = $prevHome }
         if (-not $ok -and $Session.Source -and (Test-Path -LiteralPath $Session.Source)) {
             Remove-Item -LiteralPath $Session.Source -Force
             $ok = $true
@@ -1102,8 +1116,9 @@ function Show-CcrAccountPage {
             "    codex    $(Format-CcrCwd (Get-CcrCodexRoot) 60)",
             '',
             '  Next you choose a tool and a label for the additional account. ccr creates a',
-            "  fresh dir for it (~\.claude-<label> or ~\.codex-<label>) and runs that tool's",
-            '  own login there, so each account keeps its own credentials and settings.',
+            '  fresh dir for it next to the one the tool uses today (.claude-<label> or',
+            "  .codex-<label>) and runs that tool's own login there, so each account keeps",
+            '  its own credentials and settings.',
             '  Afterwards Ctrl+M lists the accounts, adds more, or turns the mode off again.',
             '',
             "  `e[32m[Enter]`e[39m continue    `e[2mEsc: back, nothing changes`e[22m")
@@ -1450,8 +1465,15 @@ function Select-CcrSession {
         # Config dirs (accounts) in play per tool; more than one for either
         # tool adds an account column and an account step to Ctrl+N.
         [object[]]$ClaudeRoots = @(),
-        [object[]]$CodexRoots = @()
+        [object[]]$CodexRoots = @(),
+        # Every configured account, for the Ctrl+M page: -Root narrows the
+        # listing (the lists above) but account management must still see
+        # all of them, or the page shows one row and refuses Del/S/X on it.
+        [object[]]$AllClaudeRoots = $null,
+        [object[]]$AllCodexRoots = $null
     )
+    if ($null -eq $AllClaudeRoots) { $AllClaudeRoots = $ClaudeRoots }
+    if ($null -eq $AllCodexRoots) { $AllCodexRoots = $CodexRoots }
     $multiRoot = ($ClaudeRoots.Count -gt 1) -or ($CodexRoots.Count -gt 1)
     $defLabel = @{ claude = "$(@($ClaudeRoots | Where-Object Default)[0].Label)"; codex = "$(@($CodexRoots | Where-Object Default)[0].Label)" }
     $rootW = if ($multiRoot) {
@@ -1629,7 +1651,7 @@ function Select-CcrSession {
             # with Control set (it is the CR byte); Ctrl+A is an alias that
             # survives every terminal.
             if ($ctrl -and ($k.Key -in [ConsoleKey]::M, [ConsoleKey]::A, [ConsoleKey]::Enter)) {
-                $act = Show-CcrAccountPage -ClaudeRoots $ClaudeRoots -CodexRoots $CodexRoots -Identity $acctIdent
+                $act = Show-CcrAccountPage -ClaudeRoots $AllClaudeRoots -CodexRoots $AllCodexRoots -Identity $acctIdent
                 if ($null -eq $act) { continue }
                 # add / remove / disable: leave the alt buffer (login flows and
                 # progress draw on the main screen), do it, then restart the
@@ -2049,9 +2071,10 @@ function Resume-CcSessions {
             Write-Error "ccr: no account '$Root' in $($script:CcrConfigPath) (known: $($known -join ', '))"
             return
         }
-        $claudeRoots = @($allClaudeRoots | Where-Object { $_.Label -eq $Root })
-        $codexRoots = @($allCodexRoots | Where-Object { $_.Label -eq $Root })
-        foreach ($r in @($claudeRoots) + @($codexRoots)) { $r.Default = $true }
+        # Copies, not the same objects: the narrowed entry is shown as the
+        # default of the listing, while the full lists keep the real default.
+        $claudeRoots = @($allClaudeRoots | Where-Object { $_.Label -eq $Root } | ForEach-Object { [pscustomobject]@{ Label = $_.Label; Path = $_.Path; Default = $true } })
+        $codexRoots = @($allCodexRoots | Where-Object { $_.Label -eq $Root } | ForEach-Object { [pscustomobject]@{ Label = $_.Label; Path = $_.Path; Default = $true } })
     }
 
     $sessions = [System.Collections.Generic.List[object]]::new()
@@ -2084,7 +2107,7 @@ function Resume-CcSessions {
     }
     else {
         $canMultiOpen = $IsWindows -or [bool]$env:TMUX
-        $picked = Select-CcrSession -Sessions $sorted -InitialFilter $filterText -NoMultiOpen:(-not $canMultiOpen) -ClaudeRoots $claudeRoots -CodexRoots $codexRoots
+        $picked = Select-CcrSession -Sessions $sorted -InitialFilter $filterText -NoMultiOpen:(-not $canMultiOpen) -ClaudeRoots $claudeRoots -CodexRoots $codexRoots -AllClaudeRoots $allClaudeRoots -AllCodexRoots $allCodexRoots
     }
     if ($null -eq $picked) { Write-Host 'ccr: cancelled.'; return }
     if ($picked -isnot [System.Array] -and $picked.PSObject.Properties['Restart']) {
@@ -2206,7 +2229,29 @@ function Resume-CcSessions {
         $tabs = @()
     }
 
+    $moves = @($launch | Where-Object MoveTo)
+    $what = ($launch | ForEach-Object { "$($_.Tool):$($_.Title)$(if ($_.MoveTo) { " -> account $($_.MoveTo.Label)" })" }) -join ', '
+    $go = $PSCmdlet.ShouldProcess($what, "open as terminal tabs$(if ($moves.Count) { ", re-homing $($moves.Count)" })")
+    if ($go) {
+        # Re-home first, so the resume finds the transcript in its new dir. A
+        # failed move leaves the transcript where it was, so the launch falls
+        # back to the source account instead of resuming in a dir without it.
+        foreach ($m in $moves) {
+            try {
+                $null = Move-CcrSessionToRoot -Session $m.Session -TargetRoot $m.MoveTo
+                Write-Host "ccr: moved '$($m.Title)' to account '$($m.MoveTo.Label)'"
+            }
+            catch {
+                Write-Warning "ccr: could not move '$($m.Title)' to '$($m.MoveTo.Label)': $_ - it opens under '$($m.Session.Root)' instead"
+                $m.RootPath = $m.Session.RootPath
+                $m.MoveTo = $null
+            }
+        }
+    }
+
     # wt.exe args as a flat array; ';' as its own element needs no escaping.
+    # Built after the re-home step, so each command carries the dir the
+    # transcript actually ended up in.
     $wtArgs = @()
     if ($IsWindows -and $tabs.Count -gt 0) {
         $wtArgs = if ($NewWindow) { @('-w', 'new') } else { @('-w', '0') }
@@ -2222,17 +2267,7 @@ function Resume-CcSessions {
         }
     }
 
-    $moves = @($launch | Where-Object MoveTo)
-    $what = ($launch | ForEach-Object { "$($_.Tool):$($_.Title)$(if ($_.MoveTo) { " -> account $($_.MoveTo.Label)" })" }) -join ', '
-    if ($PSCmdlet.ShouldProcess($what, "open as terminal tabs$(if ($moves.Count) { ", re-homing $($moves.Count)" })")) {
-        # Re-home first, so the resume finds the transcript in its new dir.
-        foreach ($m in $moves) {
-            try {
-                $null = Move-CcrSessionToRoot -Session $m.Session -TargetRoot $m.MoveTo
-                Write-Host "ccr: moved '$($m.Title)' to account '$($m.MoveTo.Label)'"
-            }
-            catch { Write-Warning "ccr: could not move '$($m.Title)' to '$($m.MoveTo.Label)': $_ - it will not resume there" }
-        }
+    if ($go) {
         if ($tabs.Count -gt 0) {
             if ($IsWindows) { wt.exe @wtArgs }
             else {

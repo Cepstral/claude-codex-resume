@@ -172,14 +172,11 @@ account first (a green dot — a plain open), then the others (a magenta digit),
 ```
 filter>                                                              198/198 · 1 marked · 1 re-homed
   1 default    claude ~\OneDrive\.claude  codex ~\.codex        me@company.com
-  2 lpaliotto  claude ~\OneDrive\.claude-lpaliotto  codex ~\.codex-lpaliotto  me@gmail.com
+  2 personal   claude ~\OneDrive\.claude-personal  codex ~\.codex-personal  me@gmail.com
 ↑↓ move · Space cycles the account (dot = as is) · Enter open · Ctrl+N new · Ctrl+M accounts · Del delete · Esc cancel
-2 claude default    1h  Billing API pagination          D:
-epospi-server
-● claude lpaliotto  3h  Home automation bridge          D:
-epos\home
-  codex  default    5h  migrate build to vite           D:
-epos\web-app
+2 claude default    1h  Billing API pagination          D:\repos\api-server
+● claude personal   3h  Home automation bridge          D:\repos\home
+  codex  default    5h  migrate build to vite           D:\repos\web-app
 ```
 
 `Enter` opens every marked row under the chosen account. When the digit differs from the account
