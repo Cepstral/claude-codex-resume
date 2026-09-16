@@ -1123,27 +1123,9 @@ function Resume-CcSessions {
         # installs/refreshes the side-by-side test copy (run it as ccrtest),
         # -Channel stable the stable one.
         [ValidateSet('stable', 'test')][string]$Channel = '',
-        [switch]$Update,
-        # Self-update: -Channel stable|test downloads that branch's script over
-        # the loaded copy and remembers the channel; -Update refreshes the
-        # remembered channel (stable if none was ever chosen).
-        [ValidateSet('stable', 'test')][string]$Channel = '',
         [switch]$Update
     )
     $filterText = if ($Filter) { ($Filter -join ' ').Trim() } else { '' }
-
-    # --- self-update from a channel (before the self-heal, on purpose) ------
-    if ($Update -or $Channel) {
-        $selfPath = $MyInvocation.MyCommand.ScriptBlock.File
-        if (-not $selfPath) { $selfPath = Join-Path (Split-Path -Parent $PROFILE) 'Resume-CcSessions.ps1' }
-        $ch = $Channel
-        if (-not $ch) {
-            $chFile = Join-Path (Split-Path -Parent $selfPath) 'ccr.channel'
-            $ch = if (Test-Path -LiteralPath $chFile) { (Get-Content -LiteralPath $chFile -Raw).Trim() } else { 'stable' }
-        }
-        Update-CcrSelf -Channel $ch -SelfPath $selfPath -WhatIf:$WhatIfPreference
-        return
-    }
 
     # --- release channels (before the self-heal, on purpose) -----------------
     if ($Update -or $Channel) {
