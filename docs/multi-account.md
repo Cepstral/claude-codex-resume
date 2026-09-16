@@ -50,7 +50,6 @@ Accounts  C:\Users\me\OneDrive\.claude\pwsh\ccr.json
   forgets them. Refused while one of its sessions is running.
 - `X` turns multi-account mode off: the same for every account at once, and `ccr.json` goes back
   to no accounts, so both tools are on their single default dir again.
-- `Enter` switches the picker to account mode (below).
 
 The same from the command line:
 
@@ -159,28 +158,33 @@ account for the new conversation
 Enter starts `claude --name "<name>"` (or `codex`) in the chosen dir; Esc steps back one level.
 The account question only appears for a tool that has several accounts configured.
 
-## Opening a conversation under another account — account mode
+## Opening a conversation under another account — Space
 
-On the account page press `Enter` (Ctrl+A works as Ctrl+M too, for terminals that deliver
-Ctrl+M as Enter). The picker's hint line turns into the account list, and `Space` now cycles a
-**number** on the highlighted row instead of the dot:
+While multi-account mode is on, the picker shows a fixed legend under the filter line, one
+account per line, and `Space` cycles the account the highlighted row will open under: its own
+account first (a green dot — a plain open), then the others (a magenta digit), then none.
 
 ```
-ACCOUNT MODE: 1 default (me@gmail.com) · 2 work (me@company.com) · Space cycles the number · Enter open · Ctrl+M back
-1 claude work      1h  Billing API pagination          D:\repos\api-server
-2 claude default   3h  Home automation bridge          D:\repos\home
-  codex  work      5h  migrate build to vite           D:\repos\web-app
+filter>                                                              198/198 · 1 marked · 1 re-homed
+  1 default    claude ~\OneDrive\.claude  codex ~\.codex        me@company.com
+  2 lpaliotto  claude ~\OneDrive\.claude-lpaliotto  codex ~\.codex-lpaliotto  me@gmail.com
+↑↓ move · Space cycles the account (dot = as is) · Enter open · Ctrl+N new · Ctrl+M accounts · Del delete · Esc cancel
+2 claude default    1h  Billing API pagination          D:epospi-server
+● claude lpaliotto  3h  Home automation bridge          D:epos\home
+  codex  default    5h  migrate build to vite           D:epos\web-app
 ```
 
-`Enter` opens every numbered row **under that account**. When the number differs from the
-account the conversation currently belongs to, ccr first **moves** the conversation into that
-account's dir (Claude: the transcript and its sidecar folder into the same project slug;
-Codex: the rollout file into the same `sessions/YYYY/MM/DD` path — the new home indexes it on
-first resume), then resumes it there. From then on it lives in that account. The counter in the
-header shows how many rows will be re-homed, `-WhatIf` lists the moves, and a running session is
-refused (close its tab first). Only accounts that have a dir for the row's tool are offered.
+`Enter` opens every marked row under the chosen account. When the digit differs from the account
+the conversation currently belongs to, ccr first **moves** the conversation into that account's
+dir (Claude: the transcript and its sidecar folder into the same project slug; Codex: the
+rollout file into the same `sessions/YYYY/MM/DD` path — the new home indexes it on first
+resume), then resumes it there. From then on it lives in that account. The header counts the
+rows to be re-homed, `-WhatIf` lists the moves, and a running session is refused (close its tab
+first). Only accounts that have a dir for the row's tool are offered. The identity next to each
+account appears once the account page (`Ctrl+M`) has looked it up.
 
-`Ctrl+M` again returns to normal green marks; numbered rows keep their numbers.
+This is not a mode you switch on per run: it is simply how the picker works while accounts are
+configured. `X` on the account page turns it off and moves every conversation back to `default`.
 
 ## Moving a conversation to the other account
 

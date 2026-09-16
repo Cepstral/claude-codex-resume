@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.29'
+$script:CcrVersion = '0.30'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -896,13 +896,12 @@ function Write-CcrScreen([string[]]$Lines) {
 # Account page (Ctrl+M in the picker). The first time it explains what
 # turning multi-account mode on does and goes straight to adding the first
 # extra account (tool, then label). Afterwards it lists the accounts per
-# tool - with who is logged in where - and offers: Enter = account mode in
-# the picker (number the rows), + = add an account, Del = remove the
-# highlighted one (its sessions go to the default account), X = turn
-# multi-account mode off (every session goes to the default account).
-# Runs inside the alt buffer; the work itself is done by the caller on the
-# main screen. Returns @{ Action = 'mode' | 'add' | 'remove' | 'disable';
-# Tool; Label } or $null on Esc.
+# account - with who is logged in where - and offers: + = add an account,
+# Del = remove the highlighted one (its sessions go to the default
+# account), X = turn multi-account mode off (every session goes to the
+# default account). Runs inside the alt buffer; the work itself is done by
+# the caller on the main screen. Returns @{ Action = 'add' | 'remove' |
+# 'disable'; Tool; Label } or $null on Esc/Enter.
 function Show-CcrAccountPage {
     param([object[]]$ClaudeRoots = @(), [object[]]$CodexRoots = @(), [hashtable]$Identity = @{})
     $dot = [char]0x00B7
@@ -923,9 +922,13 @@ function Show-CcrAccountPage {
         }
     }
 
-    $rows = @(foreach ($t in 'claude', 'codex') {
-            foreach ($r in @(if ($t -eq 'claude') { $ClaudeRoots } else { $CodexRoots })) {
-                if ($r.Label) { [pscustomobject]@{ Tool = $t; Label = $r.Label; Path = $r.Path; Default = $r.Default } }
+    # One row per (account, tool), grouped by account in config order.
+    $labels = @(@(@($ClaudeRoots) + @($CodexRoots) | ForEach-Object { "$($_.Label)" } | Where-Object { $_ }) | Select-Object -Unique)
+    $rows = @(foreach ($lbl in $labels) {
+            foreach ($t in 'claude', 'codex') {
+                foreach ($r in @(@(if ($t -eq 'claude') { $ClaudeRoots } else { $CodexRoots }) | Where-Object { $_.Label -eq $lbl })) {
+                    [pscustomobject]@{ Tool = $t; Label = $r.Label; Path = $r.Path; Default = $r.Default }
+                }
             }
         })
 
@@ -961,31 +964,27 @@ function Show-CcrAccountPage {
     }
     $cursor = 0
     $labelW = [Math]::Max(7, ($rows | ForEach-Object { $_.Label.Length } | Measure-Object -Maximum).Maximum)
-    $multi = ($ClaudeRoots.Count -gt 1) -or ($CodexRoots.Count -gt 1)
     while ($true) {
         $lines = [System.Collections.Generic.List[string]]::new()
         $lines.Add("`e[1mAccounts`e[22m  `e[2m$($script:CcrConfigPath)`e[22m")
-        $lines.Add("`e[2m$([char]0x2191)$([char]0x2193) move $dot Enter account mode (number the rows) $dot + add $dot Del remove $dot X turn off $dot Esc back`e[22m")
+        $lines.Add("`e[2m$([char]0x2191)$([char]0x2193) move $dot + add $dot Del remove $dot X turn off $dot Esc back`e[22m")
         for ($i = 0; $i -lt $rows.Count; $i++) {
             $r = $rows[$i]
             $toolColor = if ($r.Tool -eq 'claude') { "`e[38;5;208m" } else { "`e[36m" }
             $who = $Identity["$($r.Tool)|$($r.Label)"]
-            $row = "  $toolColor$($r.Tool.PadRight(7))`e[39m`e[35m$($r.Label.PadRight($labelW))`e[39m  $((Format-CcrCwd $r.Path 40).PadRight(40))  $who$(if ($r.Default) { "  `e[2m(default)`e[22m" })"
+            $row = "  `e[35m$($r.Label.PadRight($labelW))`e[39m  $toolColor$($r.Tool.PadRight(7))`e[39m $((Format-CcrCwd $r.Path 40).PadRight(40))  $who$(if ($r.Default) { "  `e[2m(default)`e[22m" })"
             if ($i -eq $cursor) { $row = "`e[7m$row`e[27m" }
             $lines.Add($row)
         }
         $lines.Add('')
-        $lines.Add("  `e[2mA session always resumes under the account whose dir it lives in. Account mode moves one to another account.`e[22m")
+        $lines.Add("  `e[2mA session always resumes under the account whose dir it lives in. In the picker, Space cycles the account a row opens under.`e[22m")
         Write-CcrScreen $lines
         $k = [Console]::ReadKey($true)
         if ($k.Key -eq [ConsoleKey]::C -and ($k.Modifiers -band [ConsoleModifiers]::Control)) { return $null }
         switch ($k.Key) {
             'UpArrow' { if ($cursor -gt 0) { $cursor-- } }
             'DownArrow' { if ($cursor -lt $rows.Count - 1) { $cursor++ } }
-            'Enter' {
-                if ($multi) { return [pscustomobject]@{ Action = 'mode' } }
-                Show-CcrNotice "ccr: add a second account first (+) - account mode needs something to move to" '33'
-            }
+            'Enter' { return $null }
             'Escape' { return $null }
             'Insert' { $r = Read-CcrNewAccount; if ($r) { return $r } }
             'Delete' {
@@ -1273,11 +1272,13 @@ function Select-CcrSession {
     }
 
     $sel = [System.Collections.Generic.HashSet[string]]::new()
-    # Account mode (Ctrl+M): Space cycles a numeric mark = the account the row
-    # will be opened under (re-homed first when it differs). Accounts are the
-    # union of labels across both tools, numbered in config order.
+    # Account mode = multi-account is on (several dirs for a tool): Space
+    # cycles the account the row will be opened under - its own first (a
+    # plain open, green dot), then the others (magenta digit = re-homed
+    # first), then none. Accounts are the union of labels across both tools,
+    # numbered in config order. Persistent: it is the config, not a toggle.
     $acct = @{}
-    $acctMode = $false
+    $acctMode = $multiRoot
     $accounts = @(@(@($ClaudeRoots) + @($CodexRoots) | ForEach-Object { "$($_.Label)" } | Where-Object { $_ }) | Select-Object -Unique)
     $acctIdent = @{}   # "tool|label" -> who is logged in there; filled by the account page
     function Get-CcrAcctAvail([object]$row) {
@@ -1307,7 +1308,7 @@ function Select-CcrSession {
             # --- layout ---
             $w = [Console]::WindowWidth
             $h = [Console]::WindowHeight
-            $viewH = [Math]::Max(1, $h - 2)
+            $viewH = [Math]::Max(1, $h - 2 - $(if ($acctMode) { $accounts.Count } else { 0 }))
             if ($cursor -gt $view.Count - 1) { $cursor = [Math]::Max(0, $view.Count - 1) }
             if ($cursor -lt $top) { $top = $cursor }
             elseif ($cursor -ge $top + $viewH) { $top = $cursor - $viewH + 1 }
@@ -1322,8 +1323,10 @@ function Select-CcrSession {
             $sb = [System.Text.StringBuilder]::new()
             [void]$sb.Append("`e[H")
             $counts = "$($view.Count)/$($Sessions.Count)"
-            if ($sel.Count) { $counts += " $([char]0x00B7) $($sel.Count) marked" }
-            if ($acct.Count) { $counts += " $([char]0x00B7) $($acct.Count) re-homed" }
+            $nMove = 0; $nSame = 0
+            foreach ($s in $Sessions) { $k2 = "$($s.Tool)|$($s.SessionId)"; if ($acct.ContainsKey($k2)) { if ($acct[$k2] -eq "$($s.Root)") { $nSame++ } else { $nMove++ } } }
+            if ($sel.Count + $nSame) { $counts += " $([char]0x00B7) $($sel.Count + $nSame) marked" }
+            if ($nMove) { $counts += " $([char]0x00B7) $nMove re-homed" }
             if ($NoMultiOpen -and ($sel.Count + $acct.Count) -gt 1) { $counts += " ! only the first will open (no tmux)" }
             $hdr = "filter> $filter"
             $pad = $w - 1 - $hdr.Length - $counts.Length - 2
@@ -1332,14 +1335,24 @@ function Select-CcrSession {
             if ($line1.Length -gt $w - 1) { $line1 = $line1.Substring(0, $w - 1) }
             [void]$sb.Append($line1).Append("`e[K`n")
             if ($acctMode) {
-                $legend = for ($ai = 0; $ai -lt $accounts.Count; $ai++) {
-                    $id = $acctIdent["claude|$($accounts[$ai])"]; if (-not $id) { $id = $acctIdent["codex|$($accounts[$ai])"] }
-                    $who = if ($id) { " ($($id -replace ' \(.*\)$', ''))" } else { '' }
-                    "$($ai + 1) $($accounts[$ai])$who"
+                # Legend, one line per account: number, label, the dirs per
+                # tool, and who is logged in there once the account page has
+                # looked it up.
+                $lblW = ($accounts | ForEach-Object Length | Measure-Object -Maximum).Maximum
+                for ($ai = 0; $ai -lt $accounts.Count; $ai++) {
+                    $lbl = $accounts[$ai]
+                    $dirs = foreach ($t in 'claude', 'codex') {
+                        $r = @(@(if ($t -eq 'claude') { $ClaudeRoots } else { $CodexRoots }) | Where-Object { $_.Label -eq $lbl })
+                        if ($r.Count) { "$t $(Format-CcrCwd $r[0].Path 28)" }
+                    }
+                    $id = $acctIdent["claude|$lbl"]; if (-not $id) { $id = $acctIdent["codex|$lbl"] }
+                    $who = if ($id) { "  $($id -replace ' \(.*\)$', '')" } else { '' }
+                    $line = "  `e[1;35m$($ai + 1)`e[22m $($lbl.PadRight($lblW))`e[39m  `e[2m$($dirs -join '  ')$who`e[22m"
+                    [void]$sb.Append($line).Append("`e[K`n")
                 }
-                $hint = "ACCOUNT MODE: $($legend -join " $([char]0x00B7) ") $([char]0x00B7) Space cycles the number $([char]0x00B7) Enter open $([char]0x00B7) Ctrl+M back"
+                $hint = "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space cycles the account (dot = as is) $([char]0x00B7) Enter open $([char]0x00B7) Ctrl+N new $([char]0x00B7) Ctrl+M accounts $([char]0x00B7) Del delete $([char]0x00B7) Esc cancel $([char]0x00B7) v$script:CcrVersion"
                 if ($hint.Length -gt $w - 1) { $hint = $hint.Substring(0, $w - 1) }
-                [void]$sb.Append("`e[35m").Append($hint).Append("`e[39m`e[K")
+                [void]$sb.Append("`e[2m").Append($hint).Append("`e[22m`e[K")
             }
             else {
                 $hint = "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space mark $([char]0x00B7) Enter open $([char]0x00B7) Ctrl+N new $([char]0x00B7) Del delete $([char]0x00B7) Ctrl+M accounts $([char]0x00B7) Esc cancel $([char]0x00B7) type to filter $([char]0x00B7) v$script:CcrVersion"
@@ -1359,8 +1372,8 @@ function Select-CcrSession {
                     # red "run" in the age column (informational only).
                     # Green dot = open as is; magenta digit = open under account N
                     # (moving the conversation there first).
-                    $mark = if ($acct.ContainsKey($key)) { "`e[1;35m$([array]::IndexOf($accounts, $acct[$key]) + 1)`e[22;39m" }
-                    elseif ($sel.Contains($key)) { "`e[32m$([char]0x25CF)`e[39m" }
+                    $mark = if ($acct.ContainsKey($key) -and $acct[$key] -ne "$($s.Root)") { "`e[1;35m$([array]::IndexOf($accounts, $acct[$key]) + 1)`e[22;39m" }
+                    elseif ($acct.ContainsKey($key) -or $sel.Contains($key)) { "`e[32m$([char]0x25CF)`e[39m" }
                     else { ' ' }
                     $toolColor = if ($s.Tool -eq 'claude') { "`e[38;5;208m" } else { "`e[36m" }
                     $age = if ($s.Running) { "`e[31m" + 'run'.PadLeft(6) + "`e[39m" } else { (Format-CcrAge $s.LastActivity).PadLeft(6) }
@@ -1394,15 +1407,12 @@ function Select-CcrSession {
             $k = [Console]::ReadKey($true)
             if ($k.Key -eq [ConsoleKey]::C -and ($k.Modifiers -band [ConsoleModifiers]::Control)) { return $null }
             $ctrl = [bool]($k.Modifiers -band [ConsoleModifiers]::Control)
-            # Ctrl+M: the account page (or, from account mode, back to normal
-            # marks). Some terminals deliver Ctrl+M as Enter with Control set
-            # (it is the CR byte); Ctrl+A is an alias that survives every
-            # terminal.
+            # Ctrl+M: the account page. Some terminals deliver Ctrl+M as Enter
+            # with Control set (it is the CR byte); Ctrl+A is an alias that
+            # survives every terminal.
             if ($ctrl -and ($k.Key -in [ConsoleKey]::M, [ConsoleKey]::A, [ConsoleKey]::Enter)) {
-                if ($acctMode) { $acctMode = $false; continue }
                 $act = Show-CcrAccountPage -ClaudeRoots $ClaudeRoots -CodexRoots $CodexRoots -Identity $acctIdent
                 if ($null -eq $act) { continue }
-                if ($act.Action -eq 'mode') { $acctMode = $true; continue }
                 # add / remove / disable: leave the alt buffer (login flows and
                 # progress draw on the main screen), do it, then restart the
                 # picker so the listing reflects the new ccr.json.
@@ -1444,13 +1454,14 @@ function Select-CcrSession {
                         $row = $view[$cursor]
                         $key = "$($row.Tool)|$($row.SessionId)"
                         if ($acctMode) {
-                            # none -> 1 -> 2 -> ... -> none, over the accounts that
-                            # have a dir for this row's tool.
-                            $avail = Get-CcrAcctAvail $row
-                            if ($avail.Count -eq 0) { Show-CcrNotice "ccr: no account has a $($row.Tool) dir configured" '33' }
+                            # none -> own account -> the others -> none, over the
+                            # accounts that have a dir for this row's tool.
+                            $own = "$($row.Root)"
+                            $cycle = @(@($own) + @(Get-CcrAcctAvail $row | Where-Object { $_ -ne $own }) | Where-Object { $_ })
+                            if ($cycle.Count -eq 0) { Show-CcrNotice "ccr: no account has a $($row.Tool) dir configured" '33' }
                             else {
-                                $cur = if ($acct.ContainsKey($key)) { [array]::IndexOf($avail, $acct[$key]) } else { -1 }
-                                if ($cur + 1 -ge $avail.Count) { $acct.Remove($key) } else { $acct[$key] = $avail[$cur + 1] }
+                                $cur = if ($acct.ContainsKey($key)) { [array]::IndexOf($cycle, $acct[$key]) } else { -1 }
+                                if ($cur + 1 -ge $cycle.Count) { $acct.Remove($key) } else { $acct[$key] = $cycle[$cur + 1] }
                                 [void]$sel.Remove($key)
                             }
                         }
@@ -1666,17 +1677,17 @@ function Resume-CcSessions {
         The account page. The first time it explains that the dirs in use
         today become the "default" account and asks tool + label for the
         additional one, then runs that tool's login (like ccr -AddAccount).
-        Afterwards it lists the accounts with who is logged in where:
-        + adds one, Del removes the highlighted one (its sessions go to
-        the default account), X turns multi-account mode off (every
-        session goes to the default account), Enter switches the picker to
-        ACCOUNT MODE: the hint line numbers the accounts and Space cycles a
-        number on the highlighted row (none -> 1 -> 2 -> none) instead of
-        the dot; Enter then opens each row under the chosen account, moving
-        the conversation into that account's dir first when it differs
-        (both claude and codex; running sessions are refused). Ctrl+M again
-        returns to normal marks. Ctrl+A is an alias for terminals that
-        deliver Ctrl+M as Enter.
+        Afterwards it lists the accounts (grouped by account) with who is
+        logged in where: + adds one, Del removes the highlighted one (its
+        sessions go to the default account), X turns multi-account mode
+        off (every session goes to the default account).
+        While multi-account mode is on, the picker's Space cycles the
+        account a row opens under: its own (green dot = plain open), then
+        the others (magenta digit, see the hint line), then none. Enter
+        opens each row under the chosen account, moving the conversation
+        into that account's dir first when it differs (both claude and
+        codex; running sessions are refused). Ctrl+A is an alias for
+        terminals that deliver Ctrl+M as Enter.
     .EXAMPLE
         ccr -Root work
         With several accounts configured, list only the "work" account's
