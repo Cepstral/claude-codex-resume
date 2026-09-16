@@ -117,8 +117,10 @@ default account in parentheses; above the rows, a legend lists the accounts (see
 ```
 filter>                                                 88/121 · 2 marked
 Multi-account mode active.
-  1 (default)  claude ~\.claude       me@gmail.com    codex ~\.codex       me@gmail.com
-  2 work       claude ~\.claude-work  me@company.com  codex ~\.codex-work  me@company.com
+  claude  1 (default)  ~\.claude       me@gmail.com
+          2 work       ~\.claude-work  me@company.com
+  codex   3 (default)  ~\.codex        me@gmail.com
+          4 work       ~\.codex-work   me@company.com
 ↑↓ move · Space cycles the account (dot = as is) · Enter open · Ctrl+N new · Ctrl+A accounts · Del delete · Esc cancel
 ● claude work       1h  Billing API pagination          D:\repos\api-server
   claude (default)  3h  Home automation bridge          D:\repos\home
@@ -177,25 +179,27 @@ The account question only appears for a tool that has several accounts configure
 ## Opening a conversation under another account — Space
 
 While multi-account mode is on, the picker shows a fixed legend under the filter line, one
-account per line, and `Space` cycles the account the highlighted row will open under: its own
-account first (a green dot — a plain open), then the others (a magenta digit), then none.
+line per **tool and account**, numbered straight through (claude first, then codex) with the
+number in the tool's colour. `Space` cycles the account the highlighted row will open under:
+its own account first (a green dot — a plain open), then the other accounts **of its tool**
+(the entry's number, in the tool's colour), then none — a claude row only ever shows claude
+numbers, a codex row only codex numbers.
 
 ```
-filter>                                                                       198/198 · 1 marked · 1 re-homed
+filter>                                                              198/198 · 1 marked · 1 re-homed
 Multi-account mode active.
-  1 (default)  claude ~\OneDrive\.claude           me@company.com  codex ~\.codex           me@company.com
-  2 personal   claude ~\OneDrive\.claude-personal  me@gmail.com    codex ~\.codex-personal  me@gmail.com
+  claude  1 (default)  ~\OneDrive\.claude           me@company.com
+          2 personal   ~\OneDrive\.claude-personal  me@gmail.com
+  codex   3 (default)  ~\.codex                     me@company.com
+          4 personal   ~\.codex-personal            me@gmail.com
 ↑↓ move · Space cycles the account (dot = as is) · Enter open · Ctrl+N new · Ctrl+A accounts · Del delete · Esc cancel
 2 claude (default)  1h  Billing API pagination          D:\repos\api-server
 ● claude personal   3h  Home automation bridge          D:\repos\home
-  codex  (default)  5h  migrate build to vite           D:\repos\web-app
+4 codex  (default)  5h  migrate build to vite           D:\repos\web-app
 ```
 
-One line per **account**, because an account label spans both tools: the digit is what `Space`
-(or `Ctrl-O` on macOS) targets, and the line says under which dir and login each tool runs for
-that account — the email is read per tool from that dir's own files, so the two can differ. The
-`Ctrl+A` page lists one row per tool instead, because its actions (remove, copy settings) are
-per tool.
+The email is read per dir from that dir's own files, so the same account can show different
+logins for the two tools. The `Ctrl+A` page uses the same one-row-per-tool grouping.
 
 `Enter` opens every marked row under the chosen account. When the digit differs from the account
 the conversation currently belongs to, ccr first **moves** the conversation into that account's
@@ -229,7 +233,7 @@ Everything above exists in the Python version with the same `ccr.json` keys (fil
 |-----------------------------------------|-------------------------------------------------|
 | `-Root work` · `-Accounts` · `-AddAccount work -CopySettings` · `-RemoveAccount work` · `-DisableAccounts` | `--root work` · `--accounts` · `--add-account work --copy-settings` · `--remove-account work` · `--disable-accounts` |
 | `Ctrl+A` account page: `+` add, `Del` remove, `S` copy settings, `X` off | `Ctrl-A` account page: `+` and `X` are rows you pick with Enter, `Del` removes, `Ctrl-S` copies settings |
-| `Space` cycles the account a row opens under (per row) | `Tab` marks rows as usual, `Ctrl-O` opens the marked rows under an account chosen from a menu (one target for the whole selection) |
+| `Space` cycles the account a row opens under (per row) | `Tab` marks rows as usual, `Ctrl-O` opens the marked rows under an entry chosen from a menu with the legend's numbering (one target for the whole selection) |
 | account column and legend in the picker | the same; the label is part of the fuzzy-searchable text |
 | `-WhatIf` lists the moves and the `$env:` prefixes | `--dry-run` lists the moves and the `CLAUDE_CONFIG_DIR='…'` / `CODEX_HOME='…'` prefixes |
 

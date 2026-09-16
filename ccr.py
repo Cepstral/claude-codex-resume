@@ -29,7 +29,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.47"
+VERSION = "0.48"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -1094,11 +1094,14 @@ class Ctx:
         self.multi_root = len(self.claude) > 1 or len(self.codex) > 1
         self.def_label = {"claude": next((r.label for r in self.claude if r.default), ""),
                           "codex": next((r.label for r in self.codex if r.default), "")}
-        # Accounts = the union of labels across both tools, in config order.
-        self.accounts = []
-        for r in self.claude + self.codex:
-            if r.label and r.label not in self.accounts:
-                self.accounts.append(r.label)
+        # Legend entries: one per tool and account - claude first, then
+        # codex, in config order - numbered straight through, so a row only
+        # ever targets its own tool's numbers.
+        self.entries = []
+        for t in ("claude", "codex"):
+            for r in self.roots(t):
+                if r.label:
+                    self.entries.append((len(self.entries) + 1, t, r))
         self.quick = {}   # "tool|label" -> email from the dir's own files
 
     def roots(self, tool: str, all_: bool = False) -> list:
@@ -1110,44 +1113,34 @@ class Ctx:
         """The env var to set for a launch, or None when the tool has one dir."""
         return ROOT_VAR[tool] if self.multi[tool] else None
 
-    def is_default(self, label: str) -> bool:
-        return any(r.label == label and r.default for r in self.claude + self.codex)
-
     def legend(self) -> list:
-        """One line per account: number, label, and per tool the dir and the
-        email logged in there. Columns aligned across accounts; dirs are
-        dropped when the lines would not fit."""
+        """One line per tool and account: the tool (once per group), the
+        number in the tool's colour, the label, the dir and the email logged
+        in there. Dirs are dropped when the lines would not fit."""
         width = shutil.get_terminal_size((100, 24)).columns - 4
-        lbl_w = max(len(acct_label(a, self.is_default(a))) for a in self.accounts)
-        cells, col_w = {}, {}
-        for t in ("claude", "codex"):
-            col_w[t] = [0, 0]
-            for a in self.accounts:
-                r = next((x for x in self.roots(t) if x.label == a), None)
-                if not r:
-                    continue
-                qk = f"{t}|{a}"
-                if qk not in self.quick:
-                    self.quick[qk] = quick_identity(t, r.path)
-                cell = (fmt_cwd(r.path, 28), self.quick[qk] or "not logged in")
-                cells[qk] = cell
-                col_w[t] = [max(col_w[t][0], len(cell[0])), max(col_w[t][1], len(cell[1]))]
-        full = 4 + lbl_w + 2 + sum(len(t) + 1 + col_w[t][0] + 1 + col_w[t][1] + 2
-                                   for t in ("claude", "codex") if col_w[t][1])
-        with_dirs = full <= width
+        lbl_w = max(len(acct_label(r.label, r.default)) for _, _, r in self.entries)
+        n_w = len(str(len(self.entries)))
+        cells = {}
+        for n, t, r in self.entries:
+            qk = f"{t}|{r.label}"
+            if qk not in self.quick:
+                self.quick[qk] = quick_identity(t, r.path)
+            cells[n] = (fmt_cwd(r.path, 28), self.quick[qk] or "not logged in")
+        dir_w = max(len(c[0]) for c in cells.values())
+        who_w = max(len(c[1]) for c in cells.values())
+        with_dirs = 2 + 6 + 2 + n_w + 1 + lbl_w + 2 + dir_w + 2 + who_w <= width
         lines = [f"{BOLD}{MAGENTA}Multi-account mode active.{RESET}"]
-        for i, a in enumerate(self.accounts):
-            parts = []
-            for t in ("claude", "codex"):
-                if not col_w[t][1]:
-                    continue
-                d, who = cells.get(f"{t}|{a}", ("", ""))
-                if with_dirs:
-                    parts.append(f"{TOOL_COLOR[t]}{t}{RESET} {d:<{col_w[t][0]}} {DIM}{who:<{col_w[t][1]}}{RESET}")
-                else:
-                    parts.append(f"{TOOL_COLOR[t]}{t}{RESET} {DIM}{who:<{col_w[t][1]}}{RESET}")
-            lines.append(f"  {BOLD}{MAGENTA}{i + 1}{RESET} {MAGENTA}{acct_label(a, self.is_default(a)):<{lbl_w}}{RESET}"
-                         f"  {'  '.join(parts)}")
+        prev = ""
+        for n, t, r in self.entries:
+            d, who = cells[n]
+            tool_txt = f"{t:<6}" if t != prev else " " * 6
+            prev = t
+            line = (f"  {TOOL_COLOR[t]}{tool_txt}{RESET}  {TOOL_COLOR[t]}{BOLD}{n:>{n_w}}{RESET} "
+                    f"{MAGENTA}{acct_label(r.label, r.default):<{lbl_w}}{RESET}")
+            if with_dirs:
+                line += f"  {d:<{dir_w}}"
+            line += f"  {DIM}{who:<{who_w}}{RESET}"
+            lines.append(line)
         return lines
 
 
@@ -2072,18 +2065,22 @@ def main():
                     print("ccr: no accounts configured - Ctrl-A adds one.")
                     pause()
                     continue
-                labels = []
-                for s in picked:
-                    for r in ctx.roots(s.tool, all_=True):
-                        if r.label and r.label not in labels:
-                            labels.append(r.label)
-                menu = [(l, "  ".join(f"{t} {fmt_cwd(r.path, 30)}" for t in ("claude", "codex")
-                                      for r in ctx.roots(t, all_=True) if r.label == l),
-                         ctx.is_default(l)) for l in labels]
-                n = len(picked)
-                lbl = choose_account(menu, f"open {n} conversation{'' if n == 1 else 's'} under which account?")
-                if lbl is None:
+                # The menu is the legend's numbering: one entry per tool and
+                # account, only for the tools of the marked rows. Picking an
+                # entry sets its label on every marked row (a row of the
+                # other tool without a dir for that label is reported at
+                # launch and stays where it is).
+                tools = {s.tool for s in picked}
+                rows = [f"{n}\t{TOOL_COLOR[t]}{BOLD}{n}{RESET} {MAGENTA}{acct_label(r.label, r.default):<14}{RESET} "
+                        f"{TOOL_COLOR[t]}{t:<6}{RESET} {DIM}{fmt_cwd(r.path, 50)}{RESET}\t{r.path}"
+                        for n, t, r in ctx.entries if t in tools]
+                cnt = len(picked)
+                res = run_fzf(rows, hint(("Enter", "choose"), ("Esc", "back"),
+                                         tail=f"open {cnt} conversation{'' if cnt == 1 else 's'} under which account?"),
+                              multi=False, preview=False, prompt="account> ")
+                if not res or not res[1]:
                     continue
+                lbl = next(r.label for n, t, r in ctx.entries if str(n) == res[1][0])
                 for s in picked:
                     s.target_root = lbl
             launch(picked, a.new_window, a.dry_run, ctx, a.terminal, a.tabs)

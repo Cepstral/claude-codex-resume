@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.47'
+$script:CcrVersion = '0.48'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -1541,18 +1541,29 @@ function Select-CcrSession {
     $sel = [System.Collections.Generic.HashSet[string]]::new()
     # Account mode = multi-account is on (several dirs for a tool): Space
     # cycles the account the row will be opened under - its own first (a
-    # plain open, green dot), then the others (magenta digit = re-homed
-    # first), then none. Accounts are the union of labels across both tools,
-    # numbered in config order. Persistent: it is the config, not a toggle.
+    # plain open, green dot), then the others (a digit in the tool's colour
+    # = re-homed first), then none. The legend numbers one entry per tool
+    # and account - claude first, then codex, in config order - so a row
+    # only ever cycles through its own tool's numbers. Persistent: it is
+    # the config, not a toggle.
     $acct = @{}
     $acctMode = $multiRoot
-    $accounts = @(@(@($ClaudeRoots) + @($CodexRoots) | ForEach-Object { "$($_.Label)" } | Where-Object { $_ }) | Select-Object -Unique)
+    $entries = @()
+    $n = 0
+    foreach ($t in 'claude', 'codex') {
+        foreach ($r in @(@(if ($t -eq 'claude') { $ClaudeRoots } else { $CodexRoots }) | Where-Object { $_.Label })) {
+            $n++
+            $entries += [pscustomobject]@{ N = $n; Tool = $t; Label = $r.Label; Path = $r.Path; Default = $r.Default; Dir = ''; Who = '' }
+        }
+    }
     $acctIdent = @{}   # "tool|label" -> who is logged in there; filled by the account page
     $acctQuick = @{}   # "tool|label" -> email from the dir's own files; filled by the legend
-    function Get-CcrAcctAvail([object]$row) {
-        $roots = if ($row.Tool -eq 'codex') { $CodexRoots } else { $ClaudeRoots }
-        @($accounts | Where-Object { $lbl = $_; @($roots | Where-Object { $_.Label -eq $lbl }).Count -gt 0 })
+    function Get-CcrAcctAvail([object]$row) { @($entries | Where-Object { $_.Tool -eq $row.Tool } | ForEach-Object Label) }
+    function Get-CcrAcctNumber([string]$tool, [string]$label) {
+        $e = @($entries | Where-Object { $_.Tool -eq $tool -and $_.Label -eq $label })
+        if ($e.Count) { "$($e[0].N)" } else { '?' }
     }
+    function Get-CcrToolColor([string]$tool) { if ($tool -eq 'claude') { "`e[38;5;208m" } else { "`e[36m" } }
     $filter = $InitialFilter
     $cursor = 0
     $top = 0
@@ -1576,7 +1587,7 @@ function Select-CcrSession {
             # --- layout ---
             $w = [Console]::WindowWidth
             $h = [Console]::WindowHeight
-            $viewH = [Math]::Max(1, $h - 2 - $(if ($acctMode) { $accounts.Count + 1 } else { 0 }))
+            $viewH = [Math]::Max(1, $h - 2 - $(if ($acctMode) { $entries.Count + 1 } else { 0 }))
             if ($cursor -gt $view.Count - 1) { $cursor = [Math]::Max(0, $view.Count - 1) }
             if ($cursor -lt $top) { $top = $cursor }
             elseif ($cursor -ge $top + $viewH) { $top = $cursor - $viewH + 1 }
@@ -1603,43 +1614,32 @@ function Select-CcrSession {
             if ($line1.Length -gt $w - 1) { $line1 = $line1.Substring(0, $w - 1) }
             [void]$sb.Append($line1).Append("`e[K`n")
             if ($acctMode) {
-                # Legend, one line per account: number, label, and per tool
-                # the dir and the email logged in there (from the tools' own
-                # files, see Get-CcrQuickIdentity). Columns are aligned across
-                # accounts; dirs are dropped when the lines would not fit.
+                # Legend, one line per tool and account: the tool (once per
+                # group), the number in the tool's colour, the label, the dir
+                # and the email logged in there (from the dir's own files, see
+                # Get-CcrQuickIdentity). Dirs are dropped when the lines would
+                # not fit.
                 [void]$sb.Append("`e[1;35mMulti-account mode active.`e[22;39m`e[K`n")
-                $isDef = @{}
-                foreach ($lbl in $accounts) { $isDef[$lbl] = [bool](@(@($ClaudeRoots) + @($CodexRoots) | Where-Object { $_.Label -eq $lbl -and $_.Default }).Count) }
-                $lblW = ($accounts | ForEach-Object { (Format-CcrAcctLabel $_ $isDef[$_]).Length } | Measure-Object -Maximum).Maximum
-                $cells = @{}   # "tool|label" -> @{ Dir; Who }
-                $colW = @{}    # tool -> @{ Dir; Who } max widths
-                foreach ($t in 'claude', 'codex') {
-                    $colW[$t] = @{ Dir = 0; Who = 0 }
-                    foreach ($lbl in $accounts) {
-                        $r = @(@(if ($t -eq 'claude') { $ClaudeRoots } else { $CodexRoots }) | Where-Object { $_.Label -eq $lbl })
-                        if ($r.Count -eq 0) { continue }
-                        $qk = "$t|$lbl"
-                        if (-not $acctQuick.ContainsKey($qk)) { $acctQuick[$qk] = Get-CcrQuickIdentity -Tool $t -RootPath $r[0].Path }
-                        $cell = @{ Dir = (Format-CcrCwd $r[0].Path 28); Who = $(if ($acctQuick[$qk]) { $acctQuick[$qk] } else { 'not logged in' }) }
-                        $cells[$qk] = $cell
-                        if ($cell.Dir.Length -gt $colW[$t].Dir) { $colW[$t].Dir = $cell.Dir.Length }
-                        if ($cell.Who.Length -gt $colW[$t].Who) { $colW[$t].Who = $cell.Who.Length }
-                    }
+                $lblW = ($entries | ForEach-Object { (Format-CcrAcctLabel $_.Label $_.Default).Length } | Measure-Object -Maximum).Maximum
+                $nW = "$($entries.Count)".Length
+                $dirW = 0; $whoW = 0
+                foreach ($e in $entries) {
+                    $qk = "$($e.Tool)|$($e.Label)"
+                    if (-not $acctQuick.ContainsKey($qk)) { $acctQuick[$qk] = Get-CcrQuickIdentity -Tool $e.Tool -RootPath $e.Path }
+                    $e.Dir = Format-CcrCwd $e.Path 28
+                    $e.Who = if ($acctQuick[$qk]) { $acctQuick[$qk] } else { 'not logged in' }
+                    if ($e.Dir.Length -gt $dirW) { $dirW = $e.Dir.Length }
+                    if ($e.Who.Length -gt $whoW) { $whoW = $e.Who.Length }
                 }
-                $fullLen = 4 + $lblW + 2 + (('claude', 'codex' | ForEach-Object { if ($colW[$_].Who) { $_.Length + 1 + $colW[$_].Dir + 1 + $colW[$_].Who + 2 } else { 0 } } | Measure-Object -Sum).Sum)
-                $withDirs = $fullLen -le $w - 1
-                for ($ai = 0; $ai -lt $accounts.Count; $ai++) {
-                    $lbl = $accounts[$ai]
-                    $parts = foreach ($t in 'claude', 'codex') {
-                        if (-not $colW[$t].Who) { continue }
-                        $tc = if ($t -eq 'claude') { "`e[38;5;208m" } else { "`e[36m" }
-                        $cell = $cells["$t|$lbl"]
-                        $dir = if ($cell) { $cell.Dir } else { '' }
-                        $who = if ($cell) { $cell.Who } else { '' }
-                        if ($withDirs) { "$tc$t`e[39m $($dir.PadRight($colW[$t].Dir)) `e[2m$($who.PadRight($colW[$t].Who))`e[22m" }
-                        else { "$tc$t`e[39m `e[2m$($who.PadRight($colW[$t].Who))`e[22m" }
-                    }
-                    $line = "  `e[1;35m$($ai + 1)`e[22m $((Format-CcrAcctLabel $lbl $isDef[$lbl]).PadRight($lblW))`e[39m  $($parts -join '  ')"
+                $withDirs = (2 + 6 + 2 + $nW + 1 + $lblW + 2 + $dirW + 2 + $whoW) -le $w - 1
+                $prevTool = ''
+                foreach ($e in $entries) {
+                    $tc = Get-CcrToolColor $e.Tool
+                    $toolTxt = if ($e.Tool -ne $prevTool) { $e.Tool.PadRight(6) } else { ' ' * 6 }
+                    $prevTool = $e.Tool
+                    $line = "  $tc$toolTxt`e[39m  $tc`e[1m$("$($e.N)".PadLeft($nW))`e[22;39m `e[35m$((Format-CcrAcctLabel $e.Label $e.Default).PadRight($lblW))`e[39m"
+                    if ($withDirs) { $line += "  $($e.Dir.PadRight($dirW))" }
+                    $line += "  `e[2m$($e.Who.PadRight($whoW))`e[22m"
                     [void]$sb.Append($line).Append("`e[K`n")
                 }
                 $hint = "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space cycles the account (dot = as is) $([char]0x00B7) Enter open $([char]0x00B7) Ctrl+N new $([char]0x00B7) Ctrl+A accounts $([char]0x00B7) Del delete $([char]0x00B7) Esc cancel $([char]0x00B7) v$script:CcrVersion"
@@ -1662,9 +1662,9 @@ function Select-CcrSession {
                     $key = "$($s.Tool)|$($s.SessionId)"
                     # Green dot = marked for opening. Running sessions show a
                     # red "run" in the age column (informational only).
-                    # Green dot = open as is; magenta digit = open under account N
-                    # (moving the conversation there first).
-                    $mark = if ($acct.ContainsKey($key) -and $acct[$key] -ne "$($s.Root)") { "`e[1;35m$([array]::IndexOf($accounts, $acct[$key]) + 1)`e[22;39m" }
+                    # Green dot = open as is; a digit in the tool's colour = open
+                    # under legend entry N (moving the conversation there first).
+                    $mark = if ($acct.ContainsKey($key) -and $acct[$key] -ne "$($s.Root)") { "$(Get-CcrToolColor $s.Tool)`e[1m$(Get-CcrAcctNumber $s.Tool $acct[$key])`e[22;39m" }
                     elseif ($acct.ContainsKey($key) -or $sel.Contains($key)) { "`e[32m$([char]0x25CF)`e[39m" }
                     else { ' ' }
                     $toolColor = if ($s.Tool -eq 'claude') { "`e[38;5;208m" } else { "`e[36m" }
@@ -1993,7 +1993,8 @@ function Resume-CcSessions {
         goes to the default account).
         While multi-account mode is on, the picker's Space cycles the
         account a row opens under: its own (green dot = plain open), then
-        the others (magenta digit, see the hint line), then none. Enter
+        the others (a digit in the tool's colour, numbered as in the
+        legend: one entry per tool and account), then none. Enter
         opens each row under the chosen account, moving the conversation
         into that account's dir first when it differs (both claude and
         codex; running sessions are refused).
