@@ -29,7 +29,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.46"
+VERSION = "0.47"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -650,7 +650,46 @@ def move_session_to_root(s: Session, target: Root) -> str:
     dst = Path(target.path) / "sessions" / rel
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(src), str(dst))
+    # A /rename name lives in the source account's catalog, not in the
+    # rollout. Carry it over through session_index.jsonl - the legacy index
+    # codex still honours - rather than writing into its sqlite catalog.
+    # Best effort: a name that cannot be read or written is just not moved.
+    try:
+        name = codex_curated_name(s.root_path, s.id)
+        if name:
+            add_codex_index_name(target.path, s.id, name)
+    except Exception as e:
+        if os.environ.get("CCR_DEBUG"):
+            print(f"ccr: thread name of {s.id} not carried over: {e}", file=sys.stderr)
     return str(dst)
+
+
+_CODEX_NAMES = {}   # root path -> codex_title_map(root path)
+
+
+def codex_curated_name(root_path: str, sid: str) -> str:
+    """The /rename name of one codex thread in one account (catalog + legacy
+    index), from a per-root cache; '' when none."""
+    if root_path not in _CODEX_NAMES:
+        _CODEX_NAMES[root_path] = codex_title_map(root_path)
+    return str(_CODEX_NAMES[root_path].get(sid) or "")
+
+
+def add_codex_index_name(root_path: str, sid: str, name: str):
+    """Append one {"id","thread_name","updated_at"} line to an account's
+    session_index.jsonl, the format codex writes there (last entry wins)."""
+    idx = Path(root_path) / "session_index.jsonl"
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+    line = json.dumps({"id": sid, "thread_name": name, "updated_at": stamp}, ensure_ascii=False) + "\n"
+    if idx.is_file() and idx.stat().st_size > 0:
+        with open(idx, "rb") as f:
+            f.seek(-1, 2)
+            if f.read(1) != b"\n":
+                line = "\n" + line
+    with open(idx, "a", encoding="utf-8") as f:
+        f.write(line)
+    if root_path in _CODEX_NAMES:
+        _CODEX_NAMES[root_path][sid] = name
 
 
 # ----------------------------------------------------------------------------

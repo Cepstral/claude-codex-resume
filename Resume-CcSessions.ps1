@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.46'
+$script:CcrVersion = '0.47'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -761,7 +761,10 @@ function Get-CcrCodexTitleMap {
             Where-Object { $_.BaseName -match '^state_\d+$' } |
             Sort-Object { [int]($_.BaseName -replace '^state_', '') } |
             Select-Object -Last 1
-        if (-not $stateDb) { return $map }
+        # No early return here: the legacy index below must still be read
+        # (a dir with no catalog yet - e.g. one a session was just moved to -
+        # may carry names there). The catch is the one exit of this block.
+        if (-not $stateDb) { throw 'no state_N.sqlite catalog in this dir' }
         Initialize-CcrSqlite
 
         # Snapshot db + wal/shm so the live catalog is never touched; the copy
@@ -777,11 +780,11 @@ function Get-CcrCodexTitleMap {
         }
         try {
             $db = [IntPtr]::Zero
-            if ([CcrSqlite]::sqlite3_open_v2($tmp, [ref]$db, 2, [IntPtr]::Zero) -ne 0) { return $map }
+            if ([CcrSqlite]::sqlite3_open_v2($tmp, [ref]$db, 2, [IntPtr]::Zero) -ne 0) { throw 'catalog snapshot would not open' }
             try {
                 $sql = "SELECT id, COALESCE(NULLIF(TRIM(name),''), CASE WHEN TRIM(title) <> '' AND title <> first_user_message THEN title END) FROM threads"
                 $stmt = [IntPtr]::Zero
-                if ([CcrSqlite]::sqlite3_prepare_v2($db, $sql, -1, [ref]$stmt, [IntPtr]::Zero) -ne 0) { return $map }
+                if ([CcrSqlite]::sqlite3_prepare_v2($db, $sql, -1, [ref]$stmt, [IntPtr]::Zero) -ne 0) { throw 'threads table not readable' }
                 try {
                     while ([CcrSqlite]::sqlite3_step($stmt) -eq 100) {
                         $id = [Runtime.InteropServices.Marshal]::PtrToStringUTF8([CcrSqlite]::sqlite3_column_text($stmt, 0))
@@ -966,7 +969,39 @@ function Move-CcrSessionToRoot {
     $dst = Join-Path (Join-Path $TargetRoot.Path 'sessions') $rel
     New-Item -ItemType Directory -Path (Split-Path -Parent $dst) -Force | Out-Null
     Move-Item -LiteralPath $src.FullName -Destination $dst -Force
+    # A /rename name lives in the source account's catalog, not in the
+    # rollout. Carry it over through session_index.jsonl - the legacy index
+    # codex still honours - rather than writing into its sqlite catalog.
+    # Best effort: a name that cannot be read or written is just not moved.
+    try {
+        $name = Get-CcrCodexCuratedName -RootPath $Session.RootPath -SessionId $Session.SessionId
+        if ($name) { Add-CcrCodexIndexName -RootPath $TargetRoot.Path -SessionId $Session.SessionId -Name $name }
+    }
+    catch { Write-Verbose "ccr: thread name of $($Session.SessionId) not carried over: $_" }
     $dst
+}
+
+# The /rename name of one codex thread in one account (catalog + legacy
+# index), from a per-root cache of Get-CcrCodexTitleMap; '' when none.
+$script:CcrCodexNames = @{}
+function Get-CcrCodexCuratedName([string]$RootPath, [string]$SessionId) {
+    if (-not $script:CcrCodexNames.ContainsKey($RootPath)) { $script:CcrCodexNames[$RootPath] = Get-CcrCodexTitleMap -RootPath $RootPath }
+    $map = $script:CcrCodexNames[$RootPath]
+    if ($map.ContainsKey($SessionId)) { "$($map[$SessionId])" } else { '' }
+}
+
+# Append one {"id","thread_name","updated_at"} line to an account's
+# session_index.jsonl, the format codex writes there (last entry wins).
+function Add-CcrCodexIndexName([string]$RootPath, [string]$SessionId, [string]$Name) {
+    $idx = Join-Path $RootPath 'session_index.jsonl'
+    $line = ([ordered]@{ id = $SessionId; thread_name = $Name; updated_at = [DateTime]::UtcNow.ToString('o') } | ConvertTo-Json -Compress) + "`n"
+    if ((Test-Path -LiteralPath $idx) -and (Get-Item -LiteralPath $idx).Length -gt 0) {
+        $fs = [IO.File]::Open($idx, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        try { $null = $fs.Seek(-1, [IO.SeekOrigin]::End); $last = $fs.ReadByte() } finally { $fs.Dispose() }
+        if ($last -ne 10) { $line = "`n" + $line }
+    }
+    [IO.File]::AppendAllText($idx, $line, [Text.UTF8Encoding]::new($false))
+    if ($script:CcrCodexNames.ContainsKey($RootPath)) { $script:CcrCodexNames[$RootPath][$SessionId] = $Name }
 }
 
 # Full-screen confirmation before deleting; returns $true when the user picked

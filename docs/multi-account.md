@@ -189,7 +189,8 @@ filter>                                                              198/198 · 
 the conversation currently belongs to, ccr first **moves** the conversation into that account's
 dir (Claude: the transcript and its sidecar folder into the same project slug; Codex: the
 rollout file into the same `sessions/YYYY/MM/DD` path — the new home indexes it on first
-resume), then resumes it there. From then on it lives in that account. The header counts the
+resume — plus a line in the new dir's `session_index.jsonl` carrying the `/rename` name, if the
+thread had one), then resumes it there. From then on it lives in that account. The header counts the
 rows to be re-homed, `-WhatIf` lists the moves, and a running session is refused (close its tab
 first). Only accounts that have a dir for the row's tool are offered. The identity next to each
 account appears once the account page (`Ctrl+A`) has looked it up.
@@ -250,6 +251,6 @@ Every account feature exists for both tools. Where a concept has no counterpart,
 | Settings copied from the default account  | status line (`statusLine` + `statusline*` files)         | `config.toml`                                                    |
 | First-start wizard skipped in a new dir   | `.claude.json` seeded with `hasCompletedOnboarding`      | **not applicable** — Codex has no wizard to skip                 |
 | Moving a conversation between accounts    | transcript + sidecar folder, same project slug           | rollout file, same `sessions/YYYY/MM/DD` path                    |
-| Title after a move                        | travels with the transcript                              | **not applicable** — `/rename` titles stay in the old catalog    |
+| Title after a move                        | travels with the transcript                              | the `/rename` name is appended to the new dir's `session_index.jsonl` (the legacy index Codex still honours; ccr never writes its sqlite catalog) — best effort |
 | Per-launch account selection              | `CLAUDE_CONFIG_DIR` set on the process                   | `CODEX_HOME` set on the process; the desktop app cannot be given one, it always runs as the default account |
 | Delete a conversation                     | transcript + sidecar removed                             | `codex delete <id>`                                              |

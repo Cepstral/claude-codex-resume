@@ -19,8 +19,10 @@ record it in the parity table in `docs/multi-account.md`. Known cases so far:
   per-project trust) are the "settings to copy" of each tool.
 - The Codex desktop app reads the same dir as the CLI and cannot be given a
   dir per launch, so it always runs as the default account.
-- Codex titles set with `/rename` live in the account's own catalog and do not
-  travel with a moved rollout; Claude titles are inside the transcript and do.
+- Codex titles set with `/rename` live in the account's own catalog, not in
+  the rollout; a move carries them over by appending to the destination's
+  `session_index.jsonl` (the legacy index Codex still reads) — ccr never
+  writes Codex's sqlite catalog. Claude titles are inside the transcript.
 
 ## PowerShell ↔ Python parity (hard rule)
 
