@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.37'
+$script:CcrVersion = '0.38'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -283,6 +283,9 @@ function Save-CcrConfig([object]$Config) {
 # so the sessions already there keep an account name: that label is fixed,
 # "default", and nothing moves.
 $script:CcrDefaultLabel = 'default'
+
+# How an account label is shown: the default account always in parentheses.
+function Format-CcrAcctLabel([string]$Label, [bool]$IsDefault) { if ($IsDefault) { "($Label)" } else { $Label } }
 
 function Get-CcrMapCount([object]$Map) { if ($Map) { @($Map.PSObject.Properties).Count } else { 0 } }
 
@@ -1070,7 +1073,7 @@ function Show-CcrAccountPage {
         }
     }
     $cursor = 0
-    $labelW = [Math]::Max(7, ($rows | ForEach-Object { $_.Label.Length } | Measure-Object -Maximum).Maximum)
+    $labelW = [Math]::Max(7, ($rows | ForEach-Object { (Format-CcrAcctLabel $_.Label $_.Default).Length } | Measure-Object -Maximum).Maximum)
     $dirW = [Math]::Min(40, ($rows | ForEach-Object { (Format-CcrCwd $_.Path 40).Length } | Measure-Object -Maximum).Maximum)
     $whoW = ($rows | ForEach-Object { "$($Identity["$($_.Tool)|$($_.Label)"])".Length } | Measure-Object -Maximum).Maximum
     while ($true) {
@@ -1081,7 +1084,7 @@ function Show-CcrAccountPage {
             $r = $rows[$i]
             $toolColor = if ($r.Tool -eq 'claude') { "`e[38;5;208m" } else { "`e[36m" }
             $who = $Identity["$($r.Tool)|$($r.Label)"]
-            $row = "  `e[35m$($r.Label.PadRight($labelW))`e[39m  $toolColor$($r.Tool.PadRight(6))`e[39m  $((Format-CcrCwd $r.Path 40).PadRight($dirW))  `e[2m$("$who".PadRight($whoW))`e[22m$(if ($r.Default) { "  `e[2m(default)`e[22m" })"
+            $row = "  `e[35m$((Format-CcrAcctLabel $r.Label $r.Default).PadRight($labelW))`e[39m  $toolColor$($r.Tool.PadRight(6))`e[39m  $((Format-CcrCwd $r.Path 40).PadRight($dirW))  `e[2m$("$who".PadRight($whoW))`e[22m"
             if ($i -eq $cursor) { $row = "`e[7m$row`e[27m" }
             $lines.Add($row)
         }
@@ -1197,7 +1200,7 @@ function Select-CcrRoot {
         [void]$sb.Append("`e[2m$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Enter choose $([char]0x00B7) Esc back`e[22m`e[K")
         for ($i = 0; $i -lt $Roots.Count; $i++) {
             $r = $Roots[$i]
-            $row = "  `e[35m$($r.Label.PadRight(12))`e[39m `e[2m$(Format-CcrCwd $r.Path 60)$(if ($r.Default) { '  (default)' })`e[22m"
+            $row = "  `e[35m$((Format-CcrAcctLabel $r.Label $r.Default).PadRight(14))`e[39m `e[2m$(Format-CcrCwd $r.Path 60)`e[22m"
             if ($i -eq $cursor) { $row = "`e[7m$row`e[27m" }
             [void]$sb.Append("`n").Append($row).Append("`e[K")
         }
@@ -1389,8 +1392,9 @@ function Select-CcrSession {
         [object[]]$CodexRoots = @()
     )
     $multiRoot = ($ClaudeRoots.Count -gt 1) -or ($CodexRoots.Count -gt 1)
+    $defLabel = @{ claude = "$(@($ClaudeRoots | Where-Object Default)[0].Label)"; codex = "$(@($CodexRoots | Where-Object Default)[0].Label)" }
     $rootW = if ($multiRoot) {
-        [Math]::Min(12, (@($ClaudeRoots) + @($CodexRoots) | ForEach-Object { "$($_.Label)".Length } | Measure-Object -Maximum).Maximum)
+        [Math]::Min(14, (@($ClaudeRoots) + @($CodexRoots) | ForEach-Object { (Format-CcrAcctLabel $_.Label $_.Default).Length } | Measure-Object -Maximum).Maximum)
     }
     else { 0 }
 
@@ -1469,7 +1473,9 @@ function Select-CcrSession {
                 # files, see Get-CcrQuickIdentity). Columns are aligned across
                 # accounts; dirs are dropped when the lines would not fit.
                 [void]$sb.Append("`e[1;35mMulti-account mode active.`e[22;39m`e[K`n")
-                $lblW = ($accounts | ForEach-Object Length | Measure-Object -Maximum).Maximum
+                $isDef = @{}
+                foreach ($lbl in $accounts) { $isDef[$lbl] = [bool](@(@($ClaudeRoots) + @($CodexRoots) | Where-Object { $_.Label -eq $lbl -and $_.Default }).Count) }
+                $lblW = ($accounts | ForEach-Object { (Format-CcrAcctLabel $_ $isDef[$_]).Length } | Measure-Object -Maximum).Maximum
                 $cells = @{}   # "tool|label" -> @{ Dir; Who }
                 $colW = @{}    # tool -> @{ Dir; Who } max widths
                 foreach ($t in 'claude', 'codex') {
@@ -1498,7 +1504,7 @@ function Select-CcrSession {
                         if ($withDirs) { "$tc$t`e[39m $($dir.PadRight($colW[$t].Dir)) `e[2m$($who.PadRight($colW[$t].Who))`e[22m" }
                         else { "$tc$t`e[39m `e[2m$($who.PadRight($colW[$t].Who))`e[22m" }
                     }
-                    $line = "  `e[1;35m$($ai + 1)`e[22m $($lbl.PadRight($lblW))`e[39m  $($parts -join '  ')"
+                    $line = "  `e[1;35m$($ai + 1)`e[22m $((Format-CcrAcctLabel $lbl $isDef[$lbl]).PadRight($lblW))`e[39m  $($parts -join '  ')"
                     [void]$sb.Append($line).Append("`e[K`n")
                 }
                 $hint = "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space cycles the account (dot = as is) $([char]0x00B7) Enter open $([char]0x00B7) Ctrl+N new $([char]0x00B7) Ctrl+M accounts $([char]0x00B7) Del delete $([char]0x00B7) Esc cancel $([char]0x00B7) v$script:CcrVersion"
@@ -1542,7 +1548,7 @@ function Select-CcrSession {
                     # Account column (multi-root only): the config dir this claude
                     # session lives in; codex rows have none.
                     $rootTxt = if ($multiRoot) {
-                        $lbl = "$($s.Root)"; if ($lbl.Length -gt $rootW) { $lbl = $lbl.Substring(0, $rootW) }
+                        $lbl = Format-CcrAcctLabel "$($s.Root)" ("$($s.Root)" -eq $defLabel[$s.Tool]); if ($lbl.Length -gt $rootW) { $lbl = $lbl.Substring(0, $rootW) }
                         "`e[35m $($lbl.PadRight($rootW))`e[39m"
                     }
                     else { '' }
