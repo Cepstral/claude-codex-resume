@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.34'
+$script:CcrVersion = '0.35'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -229,6 +229,30 @@ function Get-CcrLoginIdentity {
     }
     catch { '(unknown)' }
     finally { [System.Environment]::SetEnvironmentVariable($var, $prev) }
+}
+
+# The logged-in email of a config dir, read from the files the tools keep
+# there - no process spawned, so it is cheap enough for every picker start.
+# Claude: .claude.json oauthAccount.emailAddress. Codex: the email claim of
+# the OpenID token in auth.json (its payload is plain base64url JSON).
+# '' when there is no login there.
+function Get-CcrQuickIdentity {
+    param([Parameter(Mandatory)][ValidateSet('claude', 'codex')][string]$Tool, [Parameter(Mandatory)][string]$RootPath)
+    try {
+        if ($Tool -eq 'claude') {
+            $f = Join-Path $RootPath '.claude.json'
+            if (-not (Test-Path -LiteralPath $f)) { return '' }
+            return "$((Get-Content -LiteralPath $f -Raw | ConvertFrom-Json).oauthAccount.emailAddress)"
+        }
+        $f = Join-Path $RootPath 'auth.json'
+        if (-not (Test-Path -LiteralPath $f)) { return '' }
+        $jwt = "$((Get-Content -LiteralPath $f -Raw | ConvertFrom-Json).tokens.id_token)"
+        if (-not $jwt) { return '' }
+        $b = $jwt.Split('.')[1].Replace('-', '+').Replace('_', '/')
+        $b += '=' * ((4 - $b.Length % 4) % 4)
+        return "$(([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b)) | ConvertFrom-Json).email)"
+    }
+    catch { '' }
 }
 
 function Show-CcrAccounts {
@@ -1379,6 +1403,7 @@ function Select-CcrSession {
     $acctMode = $multiRoot
     $accounts = @(@(@($ClaudeRoots) + @($CodexRoots) | ForEach-Object { "$($_.Label)" } | Where-Object { $_ }) | Select-Object -Unique)
     $acctIdent = @{}   # "tool|label" -> who is logged in there; filled by the account page
+    $acctQuick = @{}   # "tool|label" -> email from the dir's own files; filled by the legend
     function Get-CcrAcctAvail([object]$row) {
         $roots = if ($row.Tool -eq 'codex') { $CodexRoots } else { $ClaudeRoots }
         @($accounts | Where-Object { $lbl = $_; @($roots | Where-Object { $_.Label -eq $lbl }).Count -gt 0 })
@@ -1433,21 +1458,31 @@ function Select-CcrSession {
             if ($line1.Length -gt $w - 1) { $line1 = $line1.Substring(0, $w - 1) }
             [void]$sb.Append($line1).Append("`e[K`n")
             if ($acctMode) {
-                # Legend, one line per account: number, label, the dirs per
-                # tool, and who is logged in there once the account page has
-                # looked it up.
+                # Legend, one line per account: number, label, and per tool
+                # the dir and the email logged in there (from the tools' own
+                # files, see Get-CcrQuickIdentity). Dirs are dropped when the
+                # line would not fit.
                 [void]$sb.Append("`e[1;35mMulti-account mode active.`e[22;39m`e[K`n")
                 $lblW = ($accounts | ForEach-Object Length | Measure-Object -Maximum).Maximum
                 for ($ai = 0; $ai -lt $accounts.Count; $ai++) {
                     $lbl = $accounts[$ai]
-                    $dirs = foreach ($t in 'claude', 'codex') {
+                    $full = [System.Collections.Generic.List[string]]::new()
+                    $short = [System.Collections.Generic.List[string]]::new()
+                    $plainLen = 0
+                    foreach ($t in 'claude', 'codex') {
                         $r = @(@(if ($t -eq 'claude') { $ClaudeRoots } else { $CodexRoots }) | Where-Object { $_.Label -eq $lbl })
+                        if ($r.Count -eq 0) { continue }
                         $tc = if ($t -eq 'claude') { "`e[38;5;208m" } else { "`e[36m" }
-                        if ($r.Count) { "$tc$t`e[39m $(Format-CcrCwd $r[0].Path 28)" }
+                        $qk = "$t|$lbl"
+                        if (-not $acctQuick.ContainsKey($qk)) { $acctQuick[$qk] = Get-CcrQuickIdentity -Tool $t -RootPath $r[0].Path }
+                        $who = if ($acctQuick[$qk]) { $acctQuick[$qk] } else { 'not logged in' }
+                        $dir = Format-CcrCwd $r[0].Path 28
+                        $full.Add("$tc$t`e[39m $dir `e[2m$who`e[22m")
+                        $short.Add("$tc$t`e[39m `e[2m$who`e[22m")
+                        $plainLen += $t.Length + 1 + $dir.Length + 1 + $who.Length + 2
                     }
-                    $id = $acctIdent["claude|$lbl"]; if (-not $id) { $id = $acctIdent["codex|$lbl"] }
-                    $who = if ($id) { "  $($id -replace ' \(.*\)$', '')" } else { '' }
-                    $line = "  `e[1;35m$($ai + 1)`e[22m $($lbl.PadRight($lblW))`e[39m  $($dirs -join '  ')`e[2m$who`e[22m"
+                    $parts = if (4 + $lblW + 2 + $plainLen -gt $w - 1) { $short } else { $full }
+                    $line = "  `e[1;35m$($ai + 1)`e[22m $($lbl.PadRight($lblW))`e[39m  $($parts -join '  ')"
                     [void]$sb.Append($line).Append("`e[K`n")
                 }
                 $hint = "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space cycles the account (dot = as is) $([char]0x00B7) Enter open $([char]0x00B7) Ctrl+N new $([char]0x00B7) Ctrl+M accounts $([char]0x00B7) Del delete $([char]0x00B7) Esc cancel $([char]0x00B7) v$script:CcrVersion"
