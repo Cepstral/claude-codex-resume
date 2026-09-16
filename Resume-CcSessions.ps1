@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.38'
+$script:CcrVersion = '0.39'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -362,9 +362,26 @@ function Add-CcrAccount {
         New-Item -ItemType Directory -Path $dir -Force | Out-Null
         $map | Add-Member -NotePropertyName $Label -NotePropertyValue $dir
         Save-CcrConfig $cfg   # record first, so an aborted login still leaves a usable entry
-        if ($t -eq 'claude' -and $CopyStatusline) {
+        if ($t -eq 'claude') {
             $from = @(Get-CcrRoots -Tool claude | Where-Object Default)[0].Path
-            try { Copy-CcrStatusline -FromPath $from -ToPath $dir } catch { Write-Warning "$_" }
+            # A fresh dir has no .claude.json, and the first interactive
+            # claude there runs the first-start wizard (theme, login...)
+            # even though `claude auth login` already stored credentials.
+            # Seed the flag it checks, plus the default account's theme.
+            $cj = Join-Path $dir '.claude.json'
+            if (-not (Test-Path -LiteralPath $cj)) {
+                $seed = [ordered]@{ hasCompletedOnboarding = $true }
+                try {
+                    $defCj = Join-Path $from '.claude.json'
+                    if (Test-Path -LiteralPath $defCj) {
+                        $dj = Get-Content -LiteralPath $defCj -Raw | ConvertFrom-Json
+                        foreach ($k in 'theme', 'lastOnboardingVersion') { if ($dj.PSObject.Properties[$k]) { $seed[$k] = $dj.$k } }
+                    }
+                }
+                catch { }
+                $seed | ConvertTo-Json | Set-Content -LiteralPath $cj -Encoding utf8NoBOM
+            }
+            if ($CopyStatusline) { try { Copy-CcrStatusline -FromPath $from -ToPath $dir } catch { Write-Warning "$_" } }
         }
         Write-Host "ccr: $t account '$Label' -> $dir  - starting the $t login flow in that dir" -ForegroundColor Yellow
         $var = if ($t -eq 'claude') { 'CLAUDE_CONFIG_DIR' } else { 'CODEX_HOME' }
