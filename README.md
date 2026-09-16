@@ -172,7 +172,15 @@ and which folder you chose. A preview pane shows the full title, folder, how the
 session id of the highlighted row. Everything beyond the plain picker is version-gated, so an older fzf loses the
 marked counter or the line highlight rather than refusing to start. Outside iTerm2/Terminal.app/tmux (e.g. a bare SSH shell) only the first selection can start, in the current terminal; ccr says so.
 
-*The Python port is verified against the same session data as the PowerShell version, but the macOS tab scripting (osascript) was written from the iTerm2/Terminal.app dictionaries and not yet exercised on a Mac — report anything odd with `ccr --dry-run`, which prints the exact AppleScript it would run.*
+**Terminal.app tabs ask for permission once.** Terminal has no AppleScript verb for "new tab", so ccr presses `Cmd-T`
+through System Events, and macOS gates that behind *Privacy & Security → Automation → Terminal → System Events* — the
+prompt appears the first time you open two sessions at once. Decline it and ccr opens a **new window** for those
+sessions instead, saying why; nothing is lost silently. iTerm2 creates tabs natively and asks for nothing, and so does
+`--new-window`, tmux, or sending Codex conversations to the desktop app.
+
+*The Python port is verified against the same session data as the PowerShell version. The Terminal.app path has since
+been exercised on a Mac; the iTerm2 scripting is still written from the dictionary alone — report anything odd with
+`ccr --dry-run`, which prints the exact AppleScript it would run.*
 
 ## License
 

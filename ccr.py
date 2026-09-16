@@ -23,7 +23,7 @@ import urllib.parse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "0.24"
+VERSION = "0.25"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -676,6 +676,21 @@ def applescript_str(s: str) -> str:
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+def run_osascript(script: str):
+    """(ok, message). osascript reports refusals on stderr with a non-zero exit."""
+    try:
+        r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    except OSError as e:
+        return False, str(e)
+    err = (r.stderr or "").strip().splitlines()
+    msg = err[-1] if err else ""
+    msg = msg.split("execution error:", 1)[-1].strip() or msg
+    if "-1743" in msg:
+        # The tab keystroke needs Automation rights the user just declined.
+        msg += "  (System Settings › Privacy & Security › Automation › Terminal › System Events)"
+    return r.returncode == 0, msg[:200]
+
+
 def open_tab(cwd: str, cmd: str, new_window: bool, dry: bool) -> bool:
     """Run cmd in a new terminal surface: a tmux window when inside tmux,
     else an iTerm2 / Terminal.app tab (or window). False = no backend."""
@@ -689,26 +704,33 @@ def open_tab(cwd: str, cmd: str, new_window: bool, dry: bool) -> bool:
             subprocess.run(argv)
         return True
     if tp == "iTerm.app":
-        if new_window:
-            script = ('tell application "iTerm2"\n  tell current session of (create window with default profile) '
-                      f'to write text {applescript_str(shell_cmd)}\nend tell')
-        else:
-            script = ('tell application "iTerm2"\n  tell current window\n    tell current session of '
-                      f'(create tab with default profile) to write text {applescript_str(shell_cmd)}\n'
-                      '  end tell\nend tell')
+        window = ('tell application "iTerm2"\n  tell current session of (create window with default profile) '
+                  f'to write text {applescript_str(shell_cmd)}\nend tell')
+        tab = ('tell application "iTerm2"\n  tell current window\n    tell current session of '
+               f'(create tab with default profile) to write text {applescript_str(shell_cmd)}\n'
+               '  end tell\nend tell')
     elif tp == "Apple_Terminal":
-        if new_window:
-            script = f'tell application "Terminal" to do script {applescript_str(shell_cmd)}'
-        else:
-            script = ('tell application "Terminal"\n  activate\n  tell application "System Events" to keystroke "t" '
-                      f'using command down\n  delay 0.3\n  do script {applescript_str(shell_cmd)} in selected tab of '
-                      'front window\nend tell')
+        window = f'tell application "Terminal" to do script {applescript_str(shell_cmd)}'
+        # Terminal.app has no "new tab" verb, so the tab is a Cmd-T keystroke
+        # through System Events - which macOS gates behind Automation rights.
+        tab = ('tell application "Terminal"\n  activate\n  tell application "System Events" to keystroke "t" '
+               f'using command down\n  delay 0.3\n  do script {applescript_str(shell_cmd)} in selected tab of '
+               'front window\nend tell')
     else:
         return False
+    scripts = [window] if new_window else [tab, window]
     if dry:
-        print("  osascript:\n    " + script.replace("\n", "\n    "))
-    else:
-        subprocess.run(["osascript", "-e", script], capture_output=True)
+        print("  osascript:\n    " + scripts[0].replace("\n", "\n    "))
+        if len(scripts) > 1:
+            print(f"    {DIM}(a new window instead, if the tab is refused){RESET}")
+        return True
+    ok, msg = run_osascript(scripts[0])
+    if not ok and len(scripts) > 1:
+        print(f"ccr: no new tab - {msg or 'the terminal refused it'}\n"
+              f"     opening a window instead", file=sys.stderr)
+        ok, msg = run_osascript(scripts[1])
+    if not ok:
+        print(f"ccr: could not start '{cmd}' - {msg or 'the terminal refused it'}", file=sys.stderr)
     return True
 
 
