@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.33'
+$script:CcrVersion = '0.34'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -1442,11 +1442,12 @@ function Select-CcrSession {
                     $lbl = $accounts[$ai]
                     $dirs = foreach ($t in 'claude', 'codex') {
                         $r = @(@(if ($t -eq 'claude') { $ClaudeRoots } else { $CodexRoots }) | Where-Object { $_.Label -eq $lbl })
-                        if ($r.Count) { "$t $(Format-CcrCwd $r[0].Path 28)" }
+                        $tc = if ($t -eq 'claude') { "`e[38;5;208m" } else { "`e[36m" }
+                        if ($r.Count) { "$tc$t`e[39m $(Format-CcrCwd $r[0].Path 28)" }
                     }
                     $id = $acctIdent["claude|$lbl"]; if (-not $id) { $id = $acctIdent["codex|$lbl"] }
                     $who = if ($id) { "  $($id -replace ' \(.*\)$', '')" } else { '' }
-                    $line = "  `e[1;35m$($ai + 1)`e[22m $($lbl.PadRight($lblW))`e[39m  `e[2m$($dirs -join '  ')$who`e[22m"
+                    $line = "  `e[1;35m$($ai + 1)`e[22m $($lbl.PadRight($lblW))`e[39m  $($dirs -join '  ')`e[2m$who`e[22m"
                     [void]$sb.Append($line).Append("`e[K`n")
                 }
                 $hint = "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space cycles the account (dot = as is) $([char]0x00B7) Enter open $([char]0x00B7) Ctrl+N new $([char]0x00B7) Ctrl+M accounts $([char]0x00B7) Del delete $([char]0x00B7) Esc cancel $([char]0x00B7) v$script:CcrVersion"
