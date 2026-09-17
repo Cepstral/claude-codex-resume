@@ -64,6 +64,12 @@ pane, which shows the full title and folder of the highlighted row.
   installed copies refresh with `ccr -Update` (main) / `ccrtest -Update` (test
   branch). Bump `$script:CcrVersion` on every behavior change (the loaded
   function self-heals only when the version string differs).
+- Auto-update never runs for a copy that sits in a git checkout (a `.git`
+  next to the script) and never downgrades. Reason: on 2026-09-17 a test run
+  of `ccr.py` from this repo, without `--dry-run`, auto-"updated" the
+  working copy to the pushed (older) version and silently discarded
+  uncommitted edits. When testing from the checkout anyway, set
+  `CCR_AUTO_UPDATE=0` and prefer `--dry-run` / `-WhatIf`.
 - Account dirs are created next to the tool's default dir (never a fixed
   `~\.claude-<label>`), and reused without a new login when they already hold one.
 - No absolute machine paths, no personal data in the repo or docs.

@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.55'
+$script:CcrVersion = '0.56'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -2233,9 +2233,19 @@ function Set-CcrChannelState([string]$Channel, [hashtable]$Values) {
     $state | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $p -Encoding utf8NoBOM
 }
 
+function ConvertTo-CcrVersion([string]$V) {
+    try { [version]($V -replace '[^0-9.]', '' -replace '^\.+|\.+$', '') } catch { [version]'0.0' }
+}
+
+# Is this copy a file of a git checkout (a .git next to it)? Then it is a
+# developer's working copy: never replaced by itself.
+function Test-CcrInCheckout([string]$Path) { Test-Path -LiteralPath (Join-Path (Split-Path -Parent $Path) '.git') }
+
 # Returns @{ From; To } when a newer version was installed, else $null.
+# Never a downgrade, and never inside a git checkout - an uncommitted edit
+# would be silently replaced by the pushed version.
 function Invoke-CcrAutoUpdate([string]$Channel, [string]$SelfPath) {
-    if ($env:CCR_AUTO_UPDATE -eq '0' -or -not (Get-CcrStatePath)) { return $null }
+    if ($env:CCR_AUTO_UPDATE -eq '0' -or -not (Get-CcrStatePath) -or (Test-CcrInCheckout $SelfPath)) { return $null }
     $branch = $script:CcrChannels[$Channel]
     if (-not $branch) { return $null }
     $st = (Get-CcrState)[$Channel]
@@ -2253,7 +2263,7 @@ function Invoke-CcrAutoUpdate([string]$Channel, [string]$SelfPath) {
     $got = Receive-CcrScript -Ref $sha -TimeoutSec 10
     try {
         $had = Get-CcrFileVersion $target
-        if ($got.Version -eq $had) {   # e.g. a docs-only commit
+        if ((ConvertTo-CcrVersion $got.Version) -le (ConvertTo-CcrVersion $had)) {   # same (e.g. a docs-only commit) or older
             Set-CcrChannelState $Channel @{ sha = $sha }
             return $null
         }

@@ -30,7 +30,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.55"
+VERSION = "0.56"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -2172,9 +2172,21 @@ def set_channel_state(channel: str, **values):
     state_path().write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
 
 
+def version_tuple(v: str) -> tuple:
+    return tuple(int(x) if x.isdigit() else 0 for x in re.split(r"[.\-]", v or "0"))
+
+
+def in_checkout(path: str) -> bool:
+    """Is this copy a file of a git checkout (a .git next to it)? Then it is
+    a developer's working copy: never replaced by itself."""
+    return os.path.exists(os.path.join(os.path.dirname(path), ".git"))
+
+
 def auto_update(channel: str, me: str):
-    """(had, new) when a newer version was installed, else None."""
-    if os.environ.get("CCR_AUTO_UPDATE") == "0":
+    """(had, new) when a newer version was installed, else None. Never a
+    downgrade, and never inside a git checkout - an uncommitted edit would
+    be silently replaced by the pushed version."""
+    if os.environ.get("CCR_AUTO_UPDATE") == "0" or in_checkout(me):
         return None
     branch = CHANNELS.get(channel)
     if not branch:
@@ -2193,7 +2205,7 @@ def auto_update(channel: str, me: str):
     target = channel_path(channel, me)
     src, new_ver = fetch_script(sha, 10)
     had = file_version(target)
-    if new_ver == had:   # e.g. a docs-only commit
+    if version_tuple(new_ver) <= version_tuple(had):   # same (e.g. a docs-only commit) or older
         set_channel_state(channel, sha=sha)
         return None
     print(f"{YELLOW}ccr: auto-updating channel '{channel}' v{had} -> v{new_ver} (branch {branch} @ {sha[:7]})...{RESET}")
