@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.56'
+$script:CcrVersion = '0.57'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -285,6 +285,16 @@ function Show-CcrAccounts {
 }
 
 # Write ccr.json back. Only the keys ccr owns are touched.
+# A dir under the home folder written as "~\...": ccr.json then travels
+# between PCs (a synced script dir) as long as the dirs sit at the same
+# place under each home. Get-CcrRoots expands "~" back per machine.
+function ConvertTo-CcrPortablePath([string]$P) {
+    if ($P -and $HOME -and $P.StartsWith($HOME, [StringComparison]::OrdinalIgnoreCase) -and ($P.Length -eq $HOME.Length -or $P[$HOME.Length] -in '\', '/')) {
+        '~' + $P.Substring($HOME.Length)
+    }
+    else { $P }
+}
+
 function Save-CcrConfig([object]$Config) {
     if (-not $script:CcrConfigPath) { throw 'ccr: no config path (load the script from a file, or set $env:CCR_CONFIG)' }
     # A file that exists but does not parse is never overwritten: it may
@@ -292,6 +302,10 @@ function Save-CcrConfig([object]$Config) {
     if (Test-Path -LiteralPath $script:CcrConfigPath) {
         try { $null = Get-Content -LiteralPath $script:CcrConfigPath -Raw | ConvertFrom-Json }
         catch { throw "ccr: $($script:CcrConfigPath) exists but cannot be parsed ($_) - fix or remove it first; nothing overwritten" }
+    }
+    foreach ($key in 'claudeRoots', 'codexRoots') {
+        $map = $Config.PSObject.Properties[$key]
+        if ($map -and $map.Value) { foreach ($p in @($map.Value.PSObject.Properties)) { $p.Value = ConvertTo-CcrPortablePath ([string]$p.Value) } }
     }
     $Config | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $script:CcrConfigPath -Encoding utf8NoBOM
 }
@@ -2213,7 +2227,14 @@ function Update-CcrSelf {
 $script:CcrAutoUpdateHours = 1
 $script:CcrAutoChecked = $false   # this shell has checked at least once
 
-function Get-CcrStatePath { if ($script:CcrConfigPath) { Join-Path (Split-Path -Parent $script:CcrConfigPath) 'ccr.state.json' } }
+# Per machine, never in a synced dir: a shared state would tell a second PC
+# that the latest commit is installed while it still runs an old file.
+# $env:CCR_STATE overrides the location (tests).
+function Get-CcrStatePath {
+    if ($env:CCR_STATE) { return $env:CCR_STATE }
+    $base = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } elseif ($env:XDG_CACHE_HOME) { $env:XDG_CACHE_HOME } elseif ($HOME) { Join-Path $HOME '.cache' } else { return $null }
+    Join-Path (Join-Path $base 'ccr') 'ccr.state.json'
+}
 
 function Get-CcrState {
     $p = Get-CcrStatePath
@@ -2230,6 +2251,7 @@ function Set-CcrChannelState([string]$Channel, [hashtable]$Values) {
     $st = if ($state[$Channel] -is [System.Collections.IDictionary]) { $state[$Channel] } else { @{} }
     foreach ($k in $Values.Keys) { $st[$k] = $Values[$k] }
     $state[$Channel] = $st
+    New-Item -ItemType Directory -Path (Split-Path -Parent $p) -Force | Out-Null
     $state | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $p -Encoding utf8NoBOM
 }
 

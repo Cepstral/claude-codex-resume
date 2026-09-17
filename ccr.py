@@ -30,7 +30,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.56"
+VERSION = "0.57"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -282,6 +282,16 @@ def load_config():
         return None
 
 
+def portable_path(p: str) -> str:
+    """A dir under the home folder written as "~/...": ccr.json then travels
+    between PCs (a synced script dir) as long as the dirs sit at the same
+    place under each home. get_roots expands "~" back per machine."""
+    home = str(HOME)
+    if p and p.lower().startswith(home.lower()) and (len(p) == len(home) or p[len(home)] in "\\/"):
+        return "~" + p[len(home):]
+    return p
+
+
 def save_config(cfg: dict):
     """Write ccr.json back. Only the keys ccr owns are touched. A file that
     exists but does not parse is never overwritten: it may hold accounts
@@ -292,6 +302,9 @@ def save_config(cfg: dict):
         except Exception as e:
             raise RuntimeError(f"ccr: {CONFIG_PATH} exists but cannot be parsed ({e}) - fix or remove it first; "
                                "nothing overwritten")
+    for key in ("claudeRoots", "codexRoots"):
+        if isinstance(cfg.get(key), dict):
+            cfg[key] = {k: portable_path(str(v)) for k, v in cfg[key].items()}
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     CONFIG_PATH.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
 
@@ -2152,7 +2165,12 @@ AUTO_UPDATE_HOURS = 1
 
 
 def state_path() -> Path:
-    return CONFIG_PATH.parent / "ccr.state.json"
+    """Per machine, never in a synced dir: a shared state would tell a second
+    PC that the latest commit is installed while it still runs an old file.
+    CCR_STATE overrides the location (tests)."""
+    if os.environ.get("CCR_STATE"):
+        return Path(os.environ["CCR_STATE"])
+    return Path(os.environ.get("XDG_CACHE_HOME") or HOME / ".cache") / "ccr" / "ccr.state.json"
 
 
 def load_state() -> dict:

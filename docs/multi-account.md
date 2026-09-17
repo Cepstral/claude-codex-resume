@@ -101,7 +101,10 @@ $env:CLAUDE_CONFIG_DIR = "$HOME\.claude-work"; claude auth login; Remove-Item En
 $env:CODEX_HOME        = "$HOME\.codex-work";  codex login;      Remove-Item Env:CODEX_HOME
 ```
 
-`~` and `%VAR%` expand. `defaultRoot` is what `Ctrl+N` preselects. A tool with no entry keeps
+`~` and `%VAR%` expand, and ccr itself writes dirs under the home folder as `~\...`, so a `ccr.json`
+in a synced script dir works on every PC where the dirs sit at the same place under the home folder
+(a dir that does not exist on a PC is kept: it lists no sessions there until the tool is logged in
+inside it). `defaultRoot` is what `Ctrl+N` preselects. A tool with no entry keeps
 its single default dir (you can split only Claude, or only Codex). Copy `settings.json`, your
 global `CLAUDE.md`, or `config.toml` into the new dirs if you want the same behavior there —
 each dir is independent (see the table at the end); project trust is asked again per dir.
