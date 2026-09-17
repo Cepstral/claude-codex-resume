@@ -42,9 +42,12 @@ the account per row ↔ `Tab` mark + `Ctrl-O` (one target account for the
 marked rows); `+`/`X` on the account page ↔ rows picked with Enter;
 `S` ↔ `Ctrl-S`. The mapping table lives in `docs/multi-account.md`.
 
-Known asymmetries (2026-09-16): `ccr.py` has Codex desktop-app support
+Known asymmetries (2026-09-17): `ccr.py` has Codex desktop-app support
 (`codex app` rows, deeplinks, `--terminal`) and a `+ new folder` entry on
-Ctrl-N that the PowerShell script does not have yet.
+Ctrl-N that the PowerShell script does not have yet. The PowerShell picker
+rotates a cut title or path through its column on the highlighted row
+(marquee); fzf cannot animate a list row, so `ccr.py` relies on its preview
+pane, which shows the full title and folder of the highlighted row.
 
 ## Working rules
 

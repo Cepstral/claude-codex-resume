@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.50'
+$script:CcrVersion = '0.51'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -1598,7 +1598,7 @@ function Select-CcrSession {
             if ($top -gt [Math]::Max(0, $view.Count - $viewH)) { $top = [Math]::Max(0, $view.Count - $viewH) }
 
             # row = status(1) sp tool(6) sp [account(rootW) sp] age(6) 2sp title 2sp cwd
-            $cwdW = [Math]::Min(35, [Math]::Max(12, [int]($w * 0.35)))
+            $cwdW = [Math]::Min(45, [Math]::Max(12, [int]($w * 0.4)))
             $titleW = $w - 21 - $cwdW - $(if ($multiRoot) { $rootW + 1 } else { 0 })
             if ($titleW -lt 10) { $cwdW = [Math]::Max(8, $cwdW + $titleW - 10); $titleW = [Math]::Max(1, $w - 23 - $cwdW) }
 
@@ -1660,48 +1660,78 @@ function Select-CcrSession {
                 [void]$sb.Append("`e[2m").Append($hint).Append("`e[22m`e[K")
             }
 
+            # One cell of a row: cut with an ellipsis ($scroll = -1), or - on
+            # the highlighted row, while the picker waits for a key - rotated
+            # through its column one character per tick (marquee) when the
+            # text is longer than the column. Always padded to $width.
+            function Get-CcrCell([string]$text, [int]$width, [int]$scroll) {
+                if ($width -lt 1) { return '' }
+                if ($text.Length -le $width) { return $text.PadRight($width) }
+                if ($scroll -lt 0) { return $text.Substring(0, [Math]::Max(0, $width - 1)) + [char]0x2026 }
+                $loop = $text + '   '
+                ($loop + $loop).Substring($scroll % $loop.Length, $width)
+            }
+            function Test-CcrRowOverflow([object]$s) {
+                $room = $titleW - $(if ($s.Cleared -and $titleW -ge 20) { 10 } else { 0 })
+                ($s.Title.Length -gt $room) -or ((Format-CcrCwd $s.Cwd 100000).Length -gt $cwdW)
+            }
+            function Format-CcrPickerRow([object]$s, [int]$scroll) {
+                $key = "$($s.Tool)|$($s.SessionId)"
+                # Green dot = marked for opening. Running sessions show a
+                # red "run" in the age column (informational only).
+                # Green dot = open as is; a digit in the tool's colour = open
+                # under legend entry N (moving the conversation there first).
+                $mark = if ($acct.ContainsKey($key) -and $acct[$key] -ne "$($s.Root)") { "$(Get-CcrToolColor $s.Tool)`e[1m$(Get-CcrAcctNumber $s.Tool $acct[$key])`e[22;39m" }
+                elseif ($acct.ContainsKey($key) -or $sel.Contains($key)) { "`e[32m$([char]0x25CF)`e[39m" }
+                else { ' ' }
+                $toolColor = if ($s.Tool -eq 'claude') { "`e[38;5;208m" } else { "`e[36m" }
+                $age = if ($s.Running) { "`e[31m" + 'run'.PadLeft(6) + "`e[39m" } else { (Format-CcrAge $s.LastActivity).PadLeft(6) }
+                # "(cleared)" in yellow after the title when a /clear replaced
+                # this conversation; the title is shortened to make room.
+                $suffix = if ($s.Cleared -and $titleW -ge 20) { ' (cleared)' } else { '' }
+                $titleTxt = Get-CcrCell $s.Title ($titleW - $suffix.Length) $scroll
+                if ($suffix) { $titleTxt += " `e[33m(cleared)`e[39m" }
+                # Static: the "…\last\two" shortening; rotating: the whole path.
+                $cwdTxt = if ($scroll -ge 0) { Get-CcrCell (Format-CcrCwd $s.Cwd 100000) $cwdW $scroll } else { (Format-CcrCwd $s.Cwd $cwdW).PadRight($cwdW) }
+                # Account column (multi-root only): the config dir this claude
+                # session lives in; codex rows have none.
+                $rootTxt = if ($multiRoot) {
+                    $lbl = Format-CcrAcctLabel "$($s.Root)" ("$($s.Root)" -eq $defLabel[$s.Tool]); if ($lbl.Length -gt $rootW) { $lbl = $lbl.Substring(0, $rootW) }
+                    "`e[35m $($lbl.PadRight($rootW))`e[39m"
+                }
+                else { '' }
+                "$mark $toolColor$($s.Tool.PadRight(6))`e[39m$rootTxt$age  $titleTxt  `e[2m$cwdTxt`e[22m"
+            }
+
             if ($view.Count -eq 0) {
                 [void]$sb.Append("`n`e[2m  (no matches)`e[22m`e[K")
             }
             else {
                 $end = [Math]::Min($top + $viewH, $view.Count)
                 for ($i = $top; $i -lt $end; $i++) {
-                    $s = $view[$i]
-                    $key = "$($s.Tool)|$($s.SessionId)"
-                    # Green dot = marked for opening. Running sessions show a
-                    # red "run" in the age column (informational only).
-                    # Green dot = open as is; a digit in the tool's colour = open
-                    # under legend entry N (moving the conversation there first).
-                    $mark = if ($acct.ContainsKey($key) -and $acct[$key] -ne "$($s.Root)") { "$(Get-CcrToolColor $s.Tool)`e[1m$(Get-CcrAcctNumber $s.Tool $acct[$key])`e[22;39m" }
-                    elseif ($acct.ContainsKey($key) -or $sel.Contains($key)) { "`e[32m$([char]0x25CF)`e[39m" }
-                    else { ' ' }
-                    $toolColor = if ($s.Tool -eq 'claude') { "`e[38;5;208m" } else { "`e[36m" }
-                    $age = if ($s.Running) { "`e[31m" + 'run'.PadLeft(6) + "`e[39m" } else { (Format-CcrAge $s.LastActivity).PadLeft(6) }
-                    # "(cleared)" in yellow after the title when a /clear replaced
-                    # this conversation; the title is shortened to make room.
-                    $suffix = if ($s.Cleared -and $titleW -ge 20) { ' (cleared)' } else { '' }
-                    $titleTxt = $s.Title
-                    $room = $titleW - $suffix.Length
-                    if ($titleTxt.Length -gt $room) { $titleTxt = $titleTxt.Substring(0, [Math]::Max(0, $room - 1)) + [char]0x2026 }
-                    $titleTxt = if ($suffix) {
-                        "$titleTxt `e[33m(cleared)`e[39m" + (' ' * [Math]::Max(0, $titleW - $titleTxt.Length - $suffix.Length))
-                    }
-                    else { $titleTxt.PadRight($titleW) }
-                    $cwdTxt = (Format-CcrCwd $s.Cwd $cwdW).PadRight($cwdW)
-                    # Account column (multi-root only): the config dir this claude
-                    # session lives in; codex rows have none.
-                    $rootTxt = if ($multiRoot) {
-                        $lbl = Format-CcrAcctLabel "$($s.Root)" ("$($s.Root)" -eq $defLabel[$s.Tool]); if ($lbl.Length -gt $rootW) { $lbl = $lbl.Substring(0, $rootW) }
-                        "`e[35m $($lbl.PadRight($rootW))`e[39m"
-                    }
-                    else { '' }
-                    $row = "$mark $toolColor$($s.Tool.PadRight(6))`e[39m$rootTxt$age  $titleTxt  `e[2m$cwdTxt`e[22m"
+                    $row = Format-CcrPickerRow $view[$i] -1
                     if ($i -eq $cursor) { $row = "`e[7m$row`e[27m" }
                     [void]$sb.Append("`n").Append($row).Append("`e[K")
                 }
             }
             [void]$sb.Append("`e[J")
             [Console]::Write($sb.ToString())
+
+            # --- marquee on the highlighted row while waiting for a key ---
+            # A title or path cut to fit starts rotating through its column
+            # after a short pause, one character every 150 ms; the first key
+            # stops it and is handled as usual.
+            if ($view.Count -gt 0 -and (Test-CcrRowOverflow $view[$cursor])) {
+                $headerLines = 2 + $(if ($updNote) { 1 } else { 0 }) + $(if ($acctMode) { $entries.Count + 1 } else { 0 })
+                $rowLine = $headerLines + 1 + ($cursor - $top)
+                $tick = 0
+                while (-not [Console]::KeyAvailable) {
+                    Start-Sleep -Milliseconds 150
+                    $tick++
+                    if ($tick -lt 4) { continue }
+                    [Console]::Write("`e[$rowLine;1H`e[7m$(Format-CcrPickerRow $view[$cursor] ($tick - 4))`e[27m`e[K")
+                }
+            }
 
             # --- input ---
             $k = [Console]::ReadKey($true)
@@ -2017,6 +2047,10 @@ function Resume-CcSessions {
         consistent; running sessions are refused), Esc clears the filter then
         cancels, typing filters (spaces can't be typed into the filter -
         Space marks).
+
+        A title or folder cut to fit its column rotates through it on the
+        highlighted row while the picker waits (the fzf picker of ccr.py
+        shows the full text in its preview pane instead).
 
         A green dot = marked. Sessions running right now in some terminal show
         a red "run" in the age column (codex ones only when started via "codex

@@ -30,7 +30,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.50"
+VERSION = "0.51"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -1165,7 +1165,7 @@ def session_rows(sessions, index, ctx: Ctx):
         if ctx.multi_root:
             lbl = acct_label(s.root, s.root == ctx.def_label[s.tool])[:root_w]
             acct = f"{MAGENTA}{lbl:<{root_w}}{RESET} "
-        disp = f"{tool}{acct}{age}  {title}{tag}  {DIM}{fmt_cwd(s.cwd, 40)}{RESET}"
+        disp = f"{tool}{acct}{age}  {title}{tag}  {DIM}{fmt_cwd(s.cwd, 50)}{RESET}"
         extra = ((" cleared" if s.cleared else "") + (" run" if s.running else "")
                  + (" app" if app else ""))  # filter words
         how = (f"opens in: Codex app (codex://threads/{s.id})" if app
