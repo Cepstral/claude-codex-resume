@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.53'
+$script:CcrVersion = '0.54'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -1038,6 +1038,13 @@ function Format-CcrTokens([long]$N) {
     else { "$N" }
 }
 
+# The share of the window's tokens: "(52%)", "(<1%)" for a rounded 0.
+function Format-CcrShare([long]$N, [long]$Total) {
+    if (-not $Total -or -not $N) { return '(0%)' }
+    $pct = [int][Math]::Round(100 * $N / $Total)
+    if ($pct -eq 0) { '(<1%)' } else { "($pct%)" }
+}
+
 # Details page (Ctrl+J): the split of the tokens, the models, a 30-minute
 # timeline of the window, and - codex only - the rate-limit meter the
 # session saw at its last turn. Claude Code does not record its meter.
@@ -1099,10 +1106,10 @@ function Show-CcrUsagePage {
         foreach ($e in $all) {
             if ($shown -ge $room) { $lines.Add("  `e[2m... $($all.Count - $shown) more`e[22m"); break }
             $me = ($e.Session.Tool -eq $Session.Tool -and $e.Session.SessionId -eq $Session.SessionId)
-            $pct = if ($sum) { [int][Math]::Round(100 * $e.Usage.Total / $sum) } else { 0 }
+            $pct = (Format-CcrShare $e.Usage.Total $sum).Trim('(', ')')
             $tc = if ($e.Session.Tool -eq 'claude') { "`e[38;5;208m" } else { "`e[36m" }
             $acct = if ($e.Session.Root) { " `e[35m$($e.Session.Root)`e[39m" } else { '' }
-            $row = "  $(if ($me) { "`e[32m>`e[39m" } else { ' ' }) $("$pct%".PadLeft(4))  `e[33m$((Format-CcrTokens $e.Usage.Total).PadLeft(6))`e[39m  $tc$($e.Session.Tool.PadRight(6))`e[39m$acct  $($e.Session.Title)"
+            $row = "  $(if ($me) { "`e[32m>`e[39m" } else { ' ' }) $($pct.PadLeft(4))  `e[33m$((Format-CcrTokens $e.Usage.Total).PadLeft(6))`e[39m  $tc$($e.Session.Tool.PadRight(6))`e[39m$acct  $($e.Session.Title)"
             $lines.Add($row)
             $shown++
         }
@@ -1809,9 +1816,11 @@ function Select-CcrSession {
             elseif ($cursor -ge $top + $viewH) { $top = $cursor - $viewH + 1 }
             if ($top -gt [Math]::Max(0, $view.Count - $viewH)) { $top = [Math]::Max(0, $view.Count - $viewH) }
 
-            # row = status(1) sp tool(6) sp [account(rootW) sp] age(6) [sp usage(6)] 2sp title 2sp cwd
+            # row = status(1) sp tool(6) sp [account(rootW) sp] age(6) [sp usage(6) sp share(6)] 2sp title 2sp cwd
             $cwdW = [Math]::Min(45, [Math]::Max(12, [int]($w * 0.4)))
-            $titleW = $w - 21 - $cwdW - $(if ($multiRoot) { $rootW + 1 } else { 0 }) - $(if ($usageOn) { 7 } else { 0 })
+            $titleW = $w - 21 - $cwdW - $(if ($multiRoot) { $rootW + 1 } else { 0 }) - $(if ($usageOn) { 14 } else { 0 })
+            # The window's tokens across the listed sessions, for the share.
+            $usageSum = if ($usageOn) { [long](($usageOf.Values | Where-Object { $_ } | ForEach-Object { $_.Total } | Measure-Object -Sum).Sum) } else { 0L }
             if ($titleW -lt 10) { $cwdW = [Math]::Max(8, $cwdW + $titleW - 10); $titleW = [Math]::Max(1, $w - 23 - $cwdW) }
 
             # --- render one full frame ---
@@ -1898,11 +1907,12 @@ function Select-CcrSession {
                 else { ' ' }
                 $toolColor = if ($s.Tool -eq 'claude') { "`e[38;5;208m" } else { "`e[36m" }
                 $age = if ($s.Running) { "`e[31m" + 'run'.PadLeft(6) + "`e[39m" } else { (Format-CcrAge $s.LastActivity).PadLeft(6) }
-                # Usage column (Ctrl+K): total tokens in the window, blank
-                # when the session had no turn in it.
+                # Usage column (Ctrl+K): total tokens in the window and, in
+                # parentheses, the session's share of the window's tokens
+                # across the listed sessions; blank when it had no turn in it.
                 $usageTxt = if ($usageOn) {
                     $uu = $usageOf["$($s.Tool)|$($s.SessionId)"]
-                    if ($uu) { " `e[33m$((Format-CcrTokens $uu.Total).PadLeft(6))`e[39m" } else { ' ' * 7 }
+                    if ($uu) { " `e[33m$((Format-CcrTokens $uu.Total).PadLeft(6)) $((Format-CcrShare $uu.Total $usageSum).PadLeft(6))`e[39m" } else { ' ' * 14 }
                 }
                 else { '' }
                 # "(cleared)" in yellow after the title when a /clear replaced

@@ -30,7 +30,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.53"
+VERSION = "0.54"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -1150,6 +1150,7 @@ def session_rows(sessions, index, ctx: Ctx, usage: dict = None):
     rows = []
     root_w = min(14, max((len(acct_label(r.label, r.default)) for r in ctx.claude + ctx.codex), default=0)) \
         if ctx.multi_root else 0
+    usage_sum = sum(u.total for u in usage.values() if u) if usage else 0
     for i, s in enumerate(sessions):
         index[str(i)] = s
         color = TOOL_COLOR[s.tool]
@@ -1166,12 +1167,13 @@ def session_rows(sessions, index, ctx: Ctx, usage: dict = None):
         if ctx.multi_root:
             lbl = acct_label(s.root, s.root == ctx.def_label[s.tool])[:root_w]
             acct = f"{MAGENTA}{lbl:<{root_w}}{RESET} "
-        # Usage column (Ctrl-K): total tokens in the window, blank when the
-        # session had no turn in it.
+        # Usage column (Ctrl-K): total tokens in the window and, in
+        # parentheses, the session's share of the window's tokens across
+        # the listed sessions; blank when the session had no turn in it.
         use = ""
         if usage is not None:
             u = usage.get(s.key)
-            use = f" {YELLOW}{fmt_tokens(u.total):>6}{RESET}" if u else " " * 7
+            use = f" {YELLOW}{fmt_tokens(u.total):>6} {fmt_share(u.total, usage_sum):>6}{RESET}" if u else " " * 14
         disp = f"{tool}{acct}{age}{use}  {title}{tag}  {DIM}{fmt_cwd(s.cwd, 50)}{RESET}"
         extra = ((" cleared" if s.cleared else "") + (" run" if s.running else "")
                  + (" app" if app else ""))  # filter words
@@ -1510,6 +1512,14 @@ def fmt_tokens(n: int) -> str:
     return str(n)
 
 
+def fmt_share(n: int, total: int) -> str:
+    """The share of the window's tokens: "(52%)", "(<1%)" for a rounded 0."""
+    if not total or not n:
+        return "(0%)"
+    pct = round(100 * n / total)
+    return "(<1%)" if pct == 0 else f"({pct}%)"
+
+
 def usage_page(s: Session, u, hours: int, since: datetime, all_: list = None):
     """Details page (Ctrl-J): the split of the tokens, the models, a 30-minute
     timeline of the window, and - codex only - the rate-limit meter the
@@ -1560,10 +1570,9 @@ def usage_split(s: Session, all_: list):
           f" · {fmt_tokens(total)} tokens{RESET}")
     for x, ux in rows:
         me = x.tool == s.tool and x.id == s.id
-        pct = round(100 * ux.total / total) if total else 0
         tc = ORANGE if x.tool == "claude" else CYAN
         acct = f" {MAGENTA}{x.root}{RESET}" if x.root else ""
-        print(f"  {GREEN + '>' + RESET if me else ' '} {pct:>3}%  {YELLOW}{fmt_tokens(ux.total):>6}{RESET}  "
+        print(f"  {GREEN + '>' + RESET if me else ' '} {fmt_share(ux.total, total)[1:-1]:>4}  {YELLOW}{fmt_tokens(ux.total):>6}{RESET}  "
               f"{tc}{x.tool:<6}{RESET}{acct}  {x.title}")
 
 
