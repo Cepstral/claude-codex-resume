@@ -23,6 +23,12 @@ record it in the parity table in `docs/multi-account.md`. Known cases so far:
   the rollout; a move carries them over by appending to the destination's
   `session_index.jsonl` (the legacy index Codex still reads) — ccr never
   writes Codex's sqlite catalog. Claude titles are inside the transcript.
+- Token usage (Ctrl+K / Ctrl+J): both tools record per-turn token counts in
+  their transcripts (claude: `message.usage` per assistant line, deduplicated
+  by message id; codex: `token_count` events, `last_token_usage`). Codex also
+  records the rate-limit meter it saw (`rate_limits.primary/secondary`);
+  Claude Code does not write its meter anywhere, so the details page says so
+  for claude rows.
 
 ## PowerShell ↔ Python parity (hard rule)
 

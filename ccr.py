@@ -30,7 +30,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.51"
+VERSION = "0.52"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -1145,7 +1145,8 @@ class Ctx:
         return lines
 
 
-def session_rows(sessions, index, ctx: Ctx):
+def session_rows(sessions, index, ctx: Ctx, usage: dict = None):
+    """usage: "tool|id" -> Usage or None, when the Ctrl-K column is on."""
     rows = []
     root_w = min(14, max((len(acct_label(r.label, r.default)) for r in ctx.claude + ctx.codex), default=0)) \
         if ctx.multi_root else 0
@@ -1165,7 +1166,13 @@ def session_rows(sessions, index, ctx: Ctx):
         if ctx.multi_root:
             lbl = acct_label(s.root, s.root == ctx.def_label[s.tool])[:root_w]
             acct = f"{MAGENTA}{lbl:<{root_w}}{RESET} "
-        disp = f"{tool}{acct}{age}  {title}{tag}  {DIM}{fmt_cwd(s.cwd, 50)}{RESET}"
+        # Usage column (Ctrl-K): total tokens in the window, blank when the
+        # session had no turn in it.
+        use = ""
+        if usage is not None:
+            u = usage.get(s.key)
+            use = f" {YELLOW}{fmt_tokens(u.total):>6}{RESET}" if u else " " * 7
+        disp = f"{tool}{acct}{age}{use}  {title}{tag}  {DIM}{fmt_cwd(s.cwd, 50)}{RESET}"
         extra = ((" cleared" if s.cleared else "") + (" run" if s.running else "")
                  + (" app" if app else ""))  # filter words
         how = (f"opens in: Codex app (codex://threads/{s.id})" if app
@@ -1186,7 +1193,8 @@ def picker_hint(ctx: Ctx, upd_note: str = "") -> str:
     keys = [("↑↓", "move"), ("Tab", "mark"), ("Enter", "open")]
     if ctx.multi_root:
         keys.append(("Ctrl-O", "open under another account"))
-    keys += [("Ctrl-N", "new"), ("Ctrl-A", "accounts"), ("Del", "delete"), ("Esc", "cancel")]
+    keys += [("Ctrl-N", "new"), ("Ctrl-A", "accounts"), ("Ctrl-K", "usage"), ("Ctrl-J", "details"),
+             ("Del", "delete"), ("Esc", "cancel")]
     lines.append(hint(*keys))
     words = f"{DIM},{RESET} ".join(f"{CYAN}{w}{RESET}" for w in ("run", "cleared", "app"))
     filters = f"{DIM}type to filter — {RESET}{words}{DIM} match as words{RESET}"
@@ -1377,6 +1385,164 @@ def run_account_action(act: dict, dry: bool):
             disable_multi_account()
     except Exception as e:
         print(f"ccr: {act['action']} failed: {e}", file=sys.stderr)
+
+
+# ----------------------------------------------------------------------------
+# token usage (Ctrl-K column, Ctrl-J details)
+# ----------------------------------------------------------------------------
+# Per-session token consumption inside a time window, read from the files
+# the tools write anyway: claude appends a usage block to every assistant
+# turn (deduplicated by message id - content blocks repeat it), codex a
+# token_count event per turn with last_token_usage (that turn's delta) and
+# the rate-limit meter it saw. Full streaming reads, so only on demand.
+class Usage:
+    __slots__ = ("turns", "input", "cache_write", "cache_read", "output", "thinking", "total",
+                 "models", "buckets", "limit_5h", "limit_7d", "reset_5h")
+
+    def __init__(self):
+        self.turns = self.input = self.cache_write = self.cache_read = self.output = self.thinking = self.total = 0
+        self.models, self.buckets = {}, {}
+        self.limit_5h = self.limit_7d = self.reset_5h = None
+
+    def add(self, ts: datetime, model: str, inp: int, cw: int, cr: int, out: int, think: int):
+        self.turns += 1
+        self.input += inp
+        self.cache_write += cw
+        self.cache_read += cr
+        self.output += out
+        self.thinking += think
+        total = inp + cw + cr + out
+        self.total += total
+        model = model or "?"
+        self.models[model] = self.models.get(model, 0) + total
+        b = int(ts.timestamp()) // 1800 * 1800   # 30-minute buckets
+        self.buckets[b] = self.buckets.get(b, 0) + total
+
+
+def _num(text: str, key: str) -> int:
+    m = re.search('"' + key + r'":(\d+)', text)   # first occurrence = the top-level value
+    return int(m.group(1)) if m else 0
+
+
+def read_claude_usage(path: Path, since: datetime, u: Usage):
+    turns = {}   # message id -> last seen values (final usage of the message)
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if '"type":"assistant"' not in line or '"usage":{' not in line:
+                continue
+            m = re.search(r'"timestamp":"([^"]+)"', line)
+            ts = parse_ts(m.group(1)) if m else None
+            if not ts or ts < since:
+                continue
+            m = re.search(r'"id":"(msg_[^"]+)"', line)
+            mid = m.group(1) if m else f"line{len(turns)}"
+            m = re.search(r'"model":"([^"]+)"', line)
+            rest = line[line.index('"usage":{'):]
+            turns[mid] = (ts, m.group(1) if m else "", _num(rest, "input_tokens"), _num(rest, "cache_creation_input_tokens"),
+                          _num(rest, "cache_read_input_tokens"), _num(rest, "output_tokens"), _num(rest, "thinking_tokens"))
+    for t in turns.values():
+        u.add(*t)
+
+
+def read_codex_usage(path: Path, since: datetime, u: Usage):
+    model = ""
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if '"turn_context"' in line:
+                m = re.search(r'"model":"([^"]+)"', line)
+                if m:
+                    model = m.group(1)
+                continue
+            if '"token_count"' not in line:
+                continue
+            m = re.search(r'"timestamp":"([^"]+)"', line)
+            ts = parse_ts(m.group(1)) if m else None
+            if not ts or ts < since:
+                continue
+            i = line.find('"last_token_usage":{')
+            if i < 0:
+                continue
+            rest = line[i:]
+            # codex counts cached input inside input_tokens; split it out.
+            cached = _num(rest, "cached_input_tokens")
+            u.add(ts, model, _num(rest, "input_tokens") - cached, _num(rest, "cache_write_input_tokens"), cached,
+                  _num(rest, "output_tokens"), _num(rest, "reasoning_output_tokens"))
+            m = re.search(r'"primary":\{"used_percent":([0-9.]+),"window_minutes":\d+,"resets_at":(\d+)', line)
+            if m:
+                u.limit_5h, u.reset_5h = float(m.group(1)), int(m.group(2))
+            m = re.search(r'"secondary":\{"used_percent":([0-9.]+)', line)
+            if m:
+                u.limit_7d = float(m.group(1))
+
+
+def session_usage(s: Session, since: datetime):
+    """Usage of one session since `since`, or None when it had no turn in the
+    window. Only files written inside the window are read (claude: the
+    transcript and the subagent transcripts in its sidecar dir)."""
+    files = []
+    if s.source and Path(s.source).exists():
+        files.append(Path(s.source))
+    if s.tool == "claude" and s.source:
+        side = Path(s.source).parent / s.id
+        if side.is_dir():
+            files += [p for p in side.rglob("*.jsonl") if p.is_file()]
+    files = [p for p in files if mtime_utc(p) >= since]
+    if not files:
+        return None
+    u = Usage()
+    for p in files:
+        try:
+            (read_claude_usage if s.tool == "claude" else read_codex_usage)(p, since, u)
+        except Exception as e:
+            if os.environ.get("CCR_DEBUG"):
+                print(f"ccr: usage of {p} unreadable: {e}", file=sys.stderr)
+    return u if u.turns else None
+
+
+def fmt_tokens(n: int) -> str:
+    """1234 -> "1.2k", 845321 -> "845k", 1234567 -> "1.2M"."""
+    if n >= 1_000_000:
+        return f"{n / 1e6:.1f}".rstrip("0").rstrip(".") + "M"
+    if n >= 10_000:
+        return f"{n / 1e3:.0f}k"
+    if n >= 1_000:
+        return f"{n / 1e3:.1f}".rstrip("0").rstrip(".") + "k"
+    return str(n)
+
+
+def usage_page(s: Session, u, hours: int, since: datetime):
+    """Details page (Ctrl-J): the split of the tokens, the models, a 30-minute
+    timeline of the window, and - codex only - the rate-limit meter the
+    session saw at its last turn. Claude Code does not record its meter."""
+    print(f"\n{BOLD}Token usage{RESET}  {s.tool} · {s.title}")
+    print(f"{DIM}last {hours} h (since {since.astimezone():%Y-%m-%d %H:%M}){RESET}")
+    print(f"  folder:  {fmt_cwd(s.cwd, 70)}" + (f"   account: {s.root}" if s.root else ""))
+    if not u:
+        print(f"\n  {DIM}no turn in this window{RESET}")
+        return
+    models = ", ".join(f"{m} ({fmt_tokens(t)})" for m, t in sorted(u.models.items(), key=lambda kv: -kv[1]))
+    print(f"  turns:   {u.turns} · models: {models}\n")
+    print(f"  fresh input   {u.input:>12,}")
+    print(f"  cache write   {u.cache_write:>12,}")
+    print(f"  cache read    {u.cache_read:>12,}")
+    print(f"  output        {u.output:>12,}  {DIM}(thinking {u.thinking:,}){RESET}")
+    print(f"  {BOLD}total         {u.total:>12,}{RESET}\n")
+    print(f"  {DIM}timeline, 30-minute buckets (local time):{RESET}")
+    mx = max(u.buckets.values())
+    for b in sorted(u.buckets):
+        t = datetime.fromtimestamp(b, tz=timezone.utc).astimezone()
+        bar = "█" * max(1, round(30 * u.buckets[b] / mx))
+        print(f"  {t:%H:%M}  {YELLOW}{bar}{RESET} {fmt_tokens(u.buckets[b])}")
+    print()
+    if s.tool == "codex":
+        if u.limit_5h is not None:
+            reset = f" (resets {datetime.fromtimestamp(u.reset_5h, tz=timezone.utc).astimezone():%H:%M})" if u.reset_5h else ""
+            seven = f"{u.limit_7d:.0f}%" if u.limit_7d is not None else "?"
+            print(f"  rate limit seen at the last turn: 5 h {u.limit_5h:.0f}%{reset} · 7 d {seven}")
+        else:
+            print(f"  {DIM}rate limit: not recorded in this rollout{RESET}")
+    else:
+        print(f"  {DIM}rate limit: Claude Code does not record its meter in the transcript{RESET}")
 
 
 # ----------------------------------------------------------------------------
@@ -2025,6 +2191,8 @@ def main():
                     help="resume Codex desktop-app conversations with 'codex resume' in a terminal "
                          "instead of handing them back to the app")
     ap.add_argument("--dry-run", action="store_true", help="print what would be launched, launch nothing")
+    ap.add_argument("--usage-hours", type=int, default=5, metavar="H",
+                    help="window of the token-usage column (Ctrl-K) and details (Ctrl-J); 5 = Claude's usage window")
     acc = ap.add_argument_group("accounts (one data dir per account and tool, ccr.json)")
     acc.add_argument("--root", metavar="LABEL", default="",
                      help="list only this account's sessions (label from ccr.json); also the account -n defaults to")
@@ -2111,16 +2279,45 @@ def main():
                 print("ccr: cancelled.")
             return
 
+        # Token usage (Ctrl-K toggles the column, Ctrl-J opens the details):
+        # computed on demand and cached for the picker's lifetime.
+        usage_on, usage_of = False, {}
+        usage_since = datetime.now(timezone.utc) - timedelta(hours=a.usage_hours)
+
+        def usage_cached(s):
+            if s.key not in usage_of:
+                usage_of[s.key] = session_usage(s, usage_since)
+            return usage_of[s.key]
+
         restart = False
         while not restart:
             index = {}
-            rows = session_rows(sessions, index, ctx)
-            res = run_fzf(rows, picker_hint(ctx, upd_note), query=query, expect=["del", "ctrl-n", "ctrl-a", "ctrl-o"])
+            rows = session_rows(sessions, index, ctx, usage_of if usage_on else None)
+            res = run_fzf(rows, picker_hint(ctx, upd_note), query=query,
+                          expect=["del", "ctrl-n", "ctrl-a", "ctrl-o", "ctrl-k", "ctrl-j"])
             if res is None:
                 print("ccr: cancelled.")
                 return
             key, ids = res
             picked = [index[i] for i in ids if i in index]
+            if key == "ctrl-k":
+                # The usage column on/off. Turning it on reads the transcripts
+                # written inside the window (once per picker).
+                usage_on = not usage_on
+                if usage_on:
+                    todo = [s for s in sessions if s.key not in usage_of]
+                    if todo:
+                        print(f"{YELLOW}ccr: reading token usage of the last {a.usage_hours} h...{RESET}")
+                        for s in todo:
+                            usage_cached(s)
+                continue
+            if key == "ctrl-j":
+                # The usage details of the highlighted row.
+                if picked:
+                    print(f"{YELLOW}ccr: reading token usage of the last {a.usage_hours} h...{RESET}")
+                    usage_page(picked[0], usage_cached(picked[0]), a.usage_hours, usage_since)
+                    pause()
+                continue
             if key == "ctrl-n":
                 if not new_conversation(sessions, "", a.dry_run, ctx, a.terminal):
                     print("ccr: cancelled.")

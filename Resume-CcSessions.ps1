@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.51'
+$script:CcrVersion = '0.52'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -912,6 +912,179 @@ function Get-CcrCodexSession {
 }
 
 # =============================================================================
+#  token usage (Ctrl+K column, Ctrl+J details)
+# =============================================================================
+
+# Per-session token consumption inside a time window, read from the files
+# the tools write anyway: claude appends a usage block to every assistant
+# turn (deduplicated by message id - content blocks repeat it), codex a
+# token_count event per turn with last_token_usage (that turn's delta) and
+# the rate-limit meter it saw. Full streaming reads, so only on demand.
+function New-CcrUsage {
+    [pscustomobject]@{ Turns = 0; Input = 0; CacheWrite = 0; CacheRead = 0; Output = 0; Thinking = 0; Total = 0
+        Models = @{}; Buckets = @{}; Limit5h = $null; Limit7d = $null; Reset5h = $null }
+}
+
+function Add-CcrUsageTurn([object]$u, [datetime]$ts, [string]$model, [long]$in, [long]$cw, [long]$cr, [long]$out, [long]$think) {
+    $u.Turns++
+    $u.Input += $in; $u.CacheWrite += $cw; $u.CacheRead += $cr; $u.Output += $out; $u.Thinking += $think
+    $total = $in + $cw + $cr + $out
+    $u.Total += $total
+    if (-not $model) { $model = '?' }
+    $u.Models[$model] = [long]($u.Models[$model]) + $total
+    $b = [long]([DateTimeOffset]$ts.ToUniversalTime()).ToUnixTimeSeconds()
+    $b = $b - ($b % 1800)   # 30-minute buckets
+    $u.Buckets[$b] = [long]($u.Buckets[$b]) + $total
+}
+
+function ConvertTo-CcrUtc([string]$Iso) {
+    try { [datetime]::Parse($Iso, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal) } catch { $null }
+}
+
+function Read-CcrClaudeUsage([string]$Path, [datetime]$SinceUtc, [object]$u) {
+    $share = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
+    $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, $share)
+    $turns = [ordered]@{}   # message id -> last seen values (final usage of the message)
+    try {
+        $sr = [System.IO.StreamReader]::new($fs, [System.Text.Encoding]::UTF8, $true)
+        while ($null -ne ($line = $sr.ReadLine())) {
+            if (-not $line.Contains('"type":"assistant"') -or -not $line.Contains('"usage":{')) { continue }
+            $mTs = [regex]::Match($line, '"timestamp":"([^"]+)"')
+            $ts = if ($mTs.Success) { ConvertTo-CcrUtc $mTs.Groups[1].Value } else { $null }
+            if (-not $ts -or $ts -lt $SinceUtc) { continue }
+            $mId = [regex]::Match($line, '"id":"(msg_[^"]+)"')
+            $id = if ($mId.Success) { $mId.Groups[1].Value } else { "line$($turns.Count)" }
+            $mModel = [regex]::Match($line, '"model":"([^"]+)"')
+            $rest = $line.Substring($line.IndexOf('"usage":{'))
+            $n = @{}
+            foreach ($k in 'input_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens', 'output_tokens', 'thinking_tokens') {
+                $mm = [regex]::Match($rest, '"' + $k + '":(\d+)')   # first occurrence = the top-level value
+                $n[$k] = if ($mm.Success) { [long]$mm.Groups[1].Value } else { 0L }
+            }
+            $turns[$id] = @{ Ts = $ts; Model = $mModel.Groups[1].Value; N = $n }
+        }
+        $sr.Dispose()
+    }
+    finally { $fs.Dispose() }
+    foreach ($t in $turns.Values) {
+        Add-CcrUsageTurn $u $t.Ts $t.Model $t.N['input_tokens'] $t.N['cache_creation_input_tokens'] $t.N['cache_read_input_tokens'] $t.N['output_tokens'] $t.N['thinking_tokens']
+    }
+}
+
+function Read-CcrCodexUsage([string]$Path, [datetime]$SinceUtc, [object]$u) {
+    $share = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
+    $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, $share)
+    $model = ''
+    try {
+        $sr = [System.IO.StreamReader]::new($fs, [System.Text.Encoding]::UTF8, $true)
+        while ($null -ne ($line = $sr.ReadLine())) {
+            if ($line.Contains('"turn_context"')) {
+                $mm = [regex]::Match($line, '"model":"([^"]+)"')
+                if ($mm.Success) { $model = $mm.Groups[1].Value }
+                continue
+            }
+            if (-not $line.Contains('"token_count"')) { continue }
+            $mTs = [regex]::Match($line, '"timestamp":"([^"]+)"')
+            $ts = if ($mTs.Success) { ConvertTo-CcrUtc $mTs.Groups[1].Value } else { $null }
+            if (-not $ts -or $ts -lt $SinceUtc) { continue }
+            $iLast = $line.IndexOf('"last_token_usage":{')
+            if ($iLast -lt 0) { continue }
+            $rest = $line.Substring($iLast)
+            $n = @{}
+            foreach ($k in 'input_tokens', 'cached_input_tokens', 'cache_write_input_tokens', 'output_tokens', 'reasoning_output_tokens') {
+                $mm = [regex]::Match($rest, '"' + $k + '":(\d+)')
+                $n[$k] = if ($mm.Success) { [long]$mm.Groups[1].Value } else { 0L }
+            }
+            # codex counts cached input inside input_tokens; split it out.
+            Add-CcrUsageTurn $u $ts $model ($n['input_tokens'] - $n['cached_input_tokens']) $n['cache_write_input_tokens'] $n['cached_input_tokens'] $n['output_tokens'] $n['reasoning_output_tokens']
+            $mP = [regex]::Match($line, '"primary":\{"used_percent":([0-9.]+),"window_minutes":\d+,"resets_at":(\d+)')
+            if ($mP.Success) { $u.Limit5h = [double]::Parse($mP.Groups[1].Value, [cultureinfo]::InvariantCulture); $u.Reset5h = [long]$mP.Groups[2].Value }
+            $mS = [regex]::Match($line, '"secondary":\{"used_percent":([0-9.]+)')
+            if ($mS.Success) { $u.Limit7d = [double]::Parse($mS.Groups[1].Value, [cultureinfo]::InvariantCulture) }
+        }
+        $sr.Dispose()
+    }
+    finally { $fs.Dispose() }
+}
+
+# Usage of one session since $SinceUtc, or $null when it had no turn in the
+# window. Only files written inside the window are read (claude: the
+# transcript and the subagent transcripts in its sidecar dir).
+function Get-CcrSessionUsage {
+    param([Parameter(Mandatory)][object]$Session, [Parameter(Mandatory)][datetime]$SinceUtc)
+    $files = @()
+    if ($Session.Source -and (Test-Path -LiteralPath $Session.Source)) { $files += Get-Item -LiteralPath $Session.Source }
+    if ($Session.Tool -eq 'claude' -and $Session.Source) {
+        $side = Join-Path (Split-Path -Parent $Session.Source) $Session.SessionId
+        if (Test-Path -LiteralPath $side) { $files += @(Get-ChildItem -LiteralPath $side -Recurse -Filter *.jsonl -File -ErrorAction SilentlyContinue) }
+    }
+    $files = @($files | Where-Object { $_.LastWriteTimeUtc -ge $SinceUtc })
+    if ($files.Count -eq 0) { return $null }
+    $u = New-CcrUsage
+    foreach ($f in $files) {
+        try { if ($Session.Tool -eq 'claude') { Read-CcrClaudeUsage $f.FullName $SinceUtc $u } else { Read-CcrCodexUsage $f.FullName $SinceUtc $u } }
+        catch { Write-Verbose "ccr: usage of $($f.FullName) unreadable: $_" }
+    }
+    if ($u.Turns -eq 0) { return $null }
+    $u
+}
+
+# 1234 -> "1.2k", 845321 -> "845k", 1234567 -> "1.2M".
+function Format-CcrTokens([long]$N) {
+    $ic = [cultureinfo]::InvariantCulture
+    if ($N -ge 1000000) { ($N / 1e6).ToString('0.#', $ic) + 'M' }
+    elseif ($N -ge 10000) { ($N / 1e3).ToString('0', $ic) + 'k' }
+    elseif ($N -ge 1000) { ($N / 1e3).ToString('0.#', $ic) + 'k' }
+    else { "$N" }
+}
+
+# Details page (Ctrl+J): the split of the tokens, the models, a 30-minute
+# timeline of the window, and - codex only - the rate-limit meter the
+# session saw at its last turn. Claude Code does not record its meter.
+function Show-CcrUsagePage {
+    param([Parameter(Mandatory)][object]$Session, [object]$Usage, [int]$Hours, [datetime]$SinceUtc)
+    $ic = [cultureinfo]::InvariantCulture
+    $dot = [char]0x00B7
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $lines.Add("`e[1mToken usage`e[22m  $($Session.Tool) $dot $($Session.Title)")
+    $lines.Add("`e[2mlast $Hours h (since $($SinceUtc.ToLocalTime().ToString('yyyy-MM-dd HH:mm'))) $dot Esc back`e[22m")
+    $lines.Add("  folder:  $(Format-CcrCwd $Session.Cwd 70)$(if ($Session.Root) { "   account: $($Session.Root)" })")
+    if (-not $Usage) {
+        $lines.Add('')
+        $lines.Add("  `e[2mno turn in this window`e[22m")
+    }
+    else {
+        $models = ($Usage.Models.GetEnumerator() | Sort-Object Value -Descending | ForEach-Object { "$($_.Key) ($(Format-CcrTokens $_.Value))" }) -join ', '
+        $lines.Add("  turns:   $($Usage.Turns) $dot models: $models")
+        $lines.Add('')
+        $lines.Add("  fresh input   $($Usage.Input.ToString('N0', $ic).PadLeft(12))")
+        $lines.Add("  cache write   $($Usage.CacheWrite.ToString('N0', $ic).PadLeft(12))")
+        $lines.Add("  cache read    $($Usage.CacheRead.ToString('N0', $ic).PadLeft(12))")
+        $lines.Add("  output        $($Usage.Output.ToString('N0', $ic).PadLeft(12))  `e[2m(thinking $($Usage.Thinking.ToString('N0', $ic)))`e[22m")
+        $lines.Add("  `e[1mtotal         $($Usage.Total.ToString('N0', $ic).PadLeft(12))`e[22m")
+        $lines.Add('')
+        $lines.Add("  `e[2mtimeline, 30-minute buckets (local time):`e[22m")
+        $max = ($Usage.Buckets.Values | Measure-Object -Maximum).Maximum
+        foreach ($b in ($Usage.Buckets.Keys | Sort-Object)) {
+            $t = [DateTimeOffset]::FromUnixTimeSeconds([long]$b).ToLocalTime()
+            $bar = [string]([char]0x2588) * [Math]::Max(1, [int][Math]::Round(30 * $Usage.Buckets[$b] / $max))
+            $lines.Add("  $($t.ToString('HH:mm'))  `e[33m$bar`e[39m $(Format-CcrTokens $Usage.Buckets[$b])")
+        }
+        $lines.Add('')
+        if ($Session.Tool -eq 'codex') {
+            if ($null -ne $Usage.Limit5h) {
+                $reset = if ($Usage.Reset5h) { " (resets $([DateTimeOffset]::FromUnixTimeSeconds($Usage.Reset5h).ToLocalTime().ToString('HH:mm')))" } else { '' }
+                $lines.Add("  rate limit seen at the last turn: 5 h $($Usage.Limit5h.ToString('0', $ic))%$reset $dot 7 d $(if ($null -ne $Usage.Limit7d) { $Usage.Limit7d.ToString('0', $ic) + '%' } else { '?' })")
+            }
+            else { $lines.Add("  `e[2mrate limit: not recorded in this rollout`e[22m") }
+        }
+        else { $lines.Add("  `e[2mrate limit: Claude Code does not record its meter in the transcript`e[22m") }
+    }
+    Write-CcrScreen $lines
+    [void][Console]::ReadKey($true)
+}
+
+# =============================================================================
 #  deletion
 # =============================================================================
 
@@ -1522,7 +1695,9 @@ function Select-CcrSession {
         # listing (the lists above) but account management must still see
         # all of them, or the page shows one row and refuses Del/S/X on it.
         [object[]]$AllClaudeRoots = $null,
-        [object[]]$AllCodexRoots = $null
+        [object[]]$AllCodexRoots = $null,
+        # Window of the token-usage column (Ctrl+K) and details (Ctrl+J).
+        [int]$UsageHours = 5
     )
     if ($null -eq $AllClaudeRoots) { $AllClaudeRoots = $ClaudeRoots }
     if ($null -eq $AllCodexRoots) { $AllCodexRoots = $CodexRoots }
@@ -1562,6 +1737,16 @@ function Select-CcrSession {
     # run that installed it; cleared here so tabs ccr opens do not inherit it).
     $updNote = "$env:CCR_UPDATED_FROM"
     if ($updNote) { Remove-Item Env:CCR_UPDATED_FROM -ErrorAction SilentlyContinue }
+    # Token usage (Ctrl+K toggles the column, Ctrl+J opens the details):
+    # computed on demand and cached for the picker's lifetime.
+    $usageOn = $false
+    $usageSince = [datetime]::UtcNow.AddHours(-$UsageHours)
+    $usageOf = @{}   # "tool|id" -> usage object or $null (no turn in the window)
+    function Get-CcrUsageCached([object]$s) {
+        $k = "$($s.Tool)|$($s.SessionId)"
+        if (-not $usageOf.ContainsKey($k)) { $usageOf[$k] = Get-CcrSessionUsage -Session $s -SinceUtc $usageSince }
+        $usageOf[$k]
+    }
     function Get-CcrAcctAvail([object]$row) { @($entries | Where-Object { $_.Tool -eq $row.Tool } | ForEach-Object Label) }
     function Get-CcrAcctNumber([string]$tool, [string]$label) {
         $e = @($entries | Where-Object { $_.Tool -eq $tool -and $_.Label -eq $label })
@@ -1597,9 +1782,9 @@ function Select-CcrSession {
             elseif ($cursor -ge $top + $viewH) { $top = $cursor - $viewH + 1 }
             if ($top -gt [Math]::Max(0, $view.Count - $viewH)) { $top = [Math]::Max(0, $view.Count - $viewH) }
 
-            # row = status(1) sp tool(6) sp [account(rootW) sp] age(6) 2sp title 2sp cwd
+            # row = status(1) sp tool(6) sp [account(rootW) sp] age(6) [sp usage(6)] 2sp title 2sp cwd
             $cwdW = [Math]::Min(45, [Math]::Max(12, [int]($w * 0.4)))
-            $titleW = $w - 21 - $cwdW - $(if ($multiRoot) { $rootW + 1 } else { 0 })
+            $titleW = $w - 21 - $cwdW - $(if ($multiRoot) { $rootW + 1 } else { 0 }) - $(if ($usageOn) { 7 } else { 0 })
             if ($titleW -lt 10) { $cwdW = [Math]::Max(8, $cwdW + $titleW - 10); $titleW = [Math]::Max(1, $w - 23 - $cwdW) }
 
             # --- render one full frame ---
@@ -1650,12 +1835,12 @@ function Select-CcrSession {
                     $line += "  `e[2m$($e.Who.PadRight($whoW))`e[22m"
                     [void]$sb.Append($line).Append("`e[K`n")
                 }
-                $hint = "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space cycles the account (dot = as is) $([char]0x00B7) Enter open $([char]0x00B7) Ctrl+N new $([char]0x00B7) Ctrl+A accounts $([char]0x00B7) Del delete $([char]0x00B7) Esc cancel $([char]0x00B7) v$script:CcrVersion"
+                $hint = "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space cycles the account (dot = as is) $([char]0x00B7) Enter open $([char]0x00B7) Ctrl+N new $([char]0x00B7) Ctrl+A accounts $([char]0x00B7) Ctrl+K usage $([char]0x00B7) Ctrl+J details $([char]0x00B7) Del delete $([char]0x00B7) Esc cancel $([char]0x00B7) v$script:CcrVersion"
                 if ($hint.Length -gt $w - 1) { $hint = $hint.Substring(0, $w - 1) }
                 [void]$sb.Append("`e[2m").Append($hint).Append("`e[22m`e[K")
             }
             else {
-                $hint = "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space mark $([char]0x00B7) Enter open $([char]0x00B7) Ctrl+N new $([char]0x00B7) Del delete $([char]0x00B7) Ctrl+A accounts $([char]0x00B7) Esc cancel $([char]0x00B7) type to filter $([char]0x00B7) v$script:CcrVersion"
+                $hint = "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space mark $([char]0x00B7) Enter open $([char]0x00B7) Ctrl+N new $([char]0x00B7) Del delete $([char]0x00B7) Ctrl+A accounts $([char]0x00B7) Ctrl+K usage $([char]0x00B7) Ctrl+J details $([char]0x00B7) Esc cancel $([char]0x00B7) type to filter $([char]0x00B7) v$script:CcrVersion"
                 if ($hint.Length -gt $w - 1) { $hint = $hint.Substring(0, $w - 1) }
                 [void]$sb.Append("`e[2m").Append($hint).Append("`e[22m`e[K")
             }
@@ -1686,6 +1871,13 @@ function Select-CcrSession {
                 else { ' ' }
                 $toolColor = if ($s.Tool -eq 'claude') { "`e[38;5;208m" } else { "`e[36m" }
                 $age = if ($s.Running) { "`e[31m" + 'run'.PadLeft(6) + "`e[39m" } else { (Format-CcrAge $s.LastActivity).PadLeft(6) }
+                # Usage column (Ctrl+K): total tokens in the window, blank
+                # when the session had no turn in it.
+                $usageTxt = if ($usageOn) {
+                    $uu = $usageOf["$($s.Tool)|$($s.SessionId)"]
+                    if ($uu) { " `e[33m$((Format-CcrTokens $uu.Total).PadLeft(6))`e[39m" } else { ' ' * 7 }
+                }
+                else { '' }
                 # "(cleared)" in yellow after the title when a /clear replaced
                 # this conversation; the title is shortened to make room.
                 $suffix = if ($s.Cleared -and $titleW -ge 20) { ' (cleared)' } else { '' }
@@ -1700,7 +1892,7 @@ function Select-CcrSession {
                     "`e[35m $($lbl.PadRight($rootW))`e[39m"
                 }
                 else { '' }
-                "$mark $toolColor$($s.Tool.PadRight(6))`e[39m$rootTxt$age  $titleTxt  `e[2m$cwdTxt`e[22m"
+                "$mark $toolColor$($s.Tool.PadRight(6))`e[39m$rootTxt$age$usageTxt  $titleTxt  `e[2m$cwdTxt`e[22m"
             }
 
             if ($view.Count -eq 0) {
@@ -1765,6 +1957,28 @@ function Select-CcrSession {
                 Write-Host 'ccr: press any key to go back to the picker' -ForegroundColor DarkGray
                 [void][Console]::ReadKey($true)
                 return [pscustomobject]@{ Restart = $true; Filter = $filter }
+            }
+            if ($k.Key -eq [ConsoleKey]::K -and $ctrl) {
+                # Ctrl+K: the usage column on/off. Turning it on reads the
+                # transcripts written inside the window (once per picker).
+                $usageOn = -not $usageOn
+                if ($usageOn) {
+                    $todo = @($Sessions | Where-Object { -not $usageOf.ContainsKey("$($_.Tool)|$($_.SessionId)") })
+                    if ($todo.Count) {
+                        [Console]::Write("`e[H`e[33mccr: reading token usage of the last $UsageHours h...`e[39m`e[K")
+                        foreach ($s in $todo) { $null = Get-CcrUsageCached $s }
+                    }
+                }
+                continue
+            }
+            if ($k.Key -eq [ConsoleKey]::J -and $ctrl) {
+                # Ctrl+J: the usage details of the highlighted row.
+                if ($view.Count -gt 0) {
+                    $s = $view[$cursor]
+                    [Console]::Write("`e[H`e[33mccr: reading token usage of the last $UsageHours h...`e[39m`e[K")
+                    Show-CcrUsagePage -Session $s -Usage (Get-CcrUsageCached $s) -Hours $UsageHours -SinceUtc $usageSince
+                }
+                continue
             }
             if ($k.Key -eq [ConsoleKey]::N -and $ctrl) {
                 # Ctrl+N: pick a folder (and tool, and account) for a brand-new conversation.
@@ -2122,6 +2336,17 @@ function Resume-CcSessions {
         into that account's dir first when it differs (both claude and
         codex; running sessions are refused).
     .EXAMPLE
+        ccr   then Ctrl+K / Ctrl+J
+        Token usage. Ctrl+K adds a column with each session's total tokens
+        of the last 5 hours (-UsageHours changes the window), read from
+        the transcripts written in that window: claude's per-turn usage
+        blocks, codex's per-turn token_count events. Ctrl+J opens the
+        details of the highlighted row: fresh input / cache write / cache
+        read / output (thinking), the models, a 30-minute timeline, and
+        for codex the rate-limit meter the session saw at its last turn
+        (Claude Code does not record its meter). The order of the list
+        does not change.
+    .EXAMPLE
         ccr -Root work
         With several accounts configured, list only the "work" account's
         sessions. Without -Root every account is listed, with an account
@@ -2178,7 +2403,10 @@ function Resume-CcSessions {
         [switch]$DisableAccounts,
         # With -AddAccount: give the new dir the default account's settings
         # (claude: status line, codex: config.toml).
-        [Alias('CopyStatusline')][switch]$CopySettings
+        [Alias('CopyStatusline')][switch]$CopySettings,
+        # Window, in hours, of the token-usage column (Ctrl+K) and details
+        # (Ctrl+J) in the picker; 5 = the length of Claude's usage window.
+        [ValidateRange(1, 24 * 365)][int]$UsageHours = 5
     )
     $filterText = if ($Filter) { ($Filter -join ' ').Trim() } else { '' }
 
@@ -2226,6 +2454,7 @@ function Resume-CcSessions {
             if ($RemoveAccount) { $inv += " -RemoveAccount '$RemoveAccount'" }
             if ($DisableAccounts) { $inv += ' -DisableAccounts' }
             if ($Root) { $inv += " -Root '$($Root -replace "'", "''")'" }
+            if ($UsageHours -ne 5) { $inv += " -UsageHours $UsageHours" }
             if ($WhatIfPreference) { $inv += ' -WhatIf' }
             & ([scriptblock]::Create($inv))
             return
@@ -2306,7 +2535,7 @@ function Resume-CcSessions {
     }
     else {
         $canMultiOpen = $IsWindows -or [bool]$env:TMUX
-        $picked = Select-CcrSession -Sessions $sorted -InitialFilter $filterText -NoMultiOpen:(-not $canMultiOpen) -ClaudeRoots $claudeRoots -CodexRoots $codexRoots -AllClaudeRoots $allClaudeRoots -AllCodexRoots $allCodexRoots
+        $picked = Select-CcrSession -Sessions $sorted -InitialFilter $filterText -NoMultiOpen:(-not $canMultiOpen) -ClaudeRoots $claudeRoots -CodexRoots $codexRoots -AllClaudeRoots $allClaudeRoots -AllCodexRoots $allCodexRoots -UsageHours $UsageHours
     }
     if ($null -eq $picked) { Write-Host 'ccr: cancelled.'; return }
     if ($picked -isnot [System.Array] -and $picked.PSObject.Properties['Restart']) {
