@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.52'
+$script:CcrVersion = '0.53'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -1042,7 +1042,12 @@ function Format-CcrTokens([long]$N) {
 # timeline of the window, and - codex only - the rate-limit meter the
 # session saw at its last turn. Claude Code does not record its meter.
 function Show-CcrUsagePage {
-    param([Parameter(Mandatory)][object]$Session, [object]$Usage, [int]$Hours, [datetime]$SinceUtc)
+    param(
+        [Parameter(Mandatory)][object]$Session, [object]$Usage, [int]$Hours, [datetime]$SinceUtc,
+        # Every listed session with turns in the window, as @{ Session; Usage },
+        # for the split of the window session by session.
+        [object[]]$All = @()
+    )
     $ic = [cultureinfo]::InvariantCulture
     $dot = [char]0x00B7
     $lines = [System.Collections.Generic.List[string]]::new()
@@ -1079,6 +1084,28 @@ function Show-CcrUsagePage {
             else { $lines.Add("  `e[2mrate limit: not recorded in this rollout`e[22m") }
         }
         else { $lines.Add("  `e[2mrate limit: Claude Code does not record its meter in the transcript`e[22m") }
+    }
+    # The window split session by session: every listed session with turns
+    # in it, largest first, with its share; the highlighted one is marked.
+    $all = @($All | Where-Object { $_.Usage } | Sort-Object { $_.Usage.Total } -Descending)
+    if ($all.Count) {
+        $sum = ($all | ForEach-Object { $_.Usage.Total } | Measure-Object -Sum).Sum
+        $lines.Add('')
+        $lines.Add("  `e[1mthe window, session by session`e[22m  `e[2m$($all.Count) session$(if ($all.Count -ne 1) { 's' }) $dot $(Format-CcrTokens $sum) tokens`e[22m")
+        $h = 40
+        try { $h = [Console]::WindowHeight } catch { }
+        $room = [Math]::Max(3, $h - $lines.Count - 2)
+        $shown = 0
+        foreach ($e in $all) {
+            if ($shown -ge $room) { $lines.Add("  `e[2m... $($all.Count - $shown) more`e[22m"); break }
+            $me = ($e.Session.Tool -eq $Session.Tool -and $e.Session.SessionId -eq $Session.SessionId)
+            $pct = if ($sum) { [int][Math]::Round(100 * $e.Usage.Total / $sum) } else { 0 }
+            $tc = if ($e.Session.Tool -eq 'claude') { "`e[38;5;208m" } else { "`e[36m" }
+            $acct = if ($e.Session.Root) { " `e[35m$($e.Session.Root)`e[39m" } else { '' }
+            $row = "  $(if ($me) { "`e[32m>`e[39m" } else { ' ' }) $("$pct%".PadLeft(4))  `e[33m$((Format-CcrTokens $e.Usage.Total).PadLeft(6))`e[39m  $tc$($e.Session.Tool.PadRight(6))`e[39m$acct  $($e.Session.Title)"
+            $lines.Add($row)
+            $shown++
+        }
     }
     Write-CcrScreen $lines
     [void][Console]::ReadKey($true)
@@ -1972,11 +1999,13 @@ function Select-CcrSession {
                 continue
             }
             if ($k.Key -eq [ConsoleKey]::J -and $ctrl) {
-                # Ctrl+J: the usage details of the highlighted row.
+                # Ctrl+J: the usage details of the highlighted row, plus the
+                # window split session by session (every listed session).
                 if ($view.Count -gt 0) {
                     $s = $view[$cursor]
                     [Console]::Write("`e[H`e[33mccr: reading token usage of the last $UsageHours h...`e[39m`e[K")
-                    Show-CcrUsagePage -Session $s -Usage (Get-CcrUsageCached $s) -Hours $UsageHours -SinceUtc $usageSince
+                    $all = @(foreach ($x in $Sessions) { $ux = Get-CcrUsageCached $x; if ($ux) { @{ Session = $x; Usage = $ux } } })
+                    Show-CcrUsagePage -Session $s -Usage (Get-CcrUsageCached $s) -Hours $UsageHours -SinceUtc $usageSince -All $all
                 }
                 continue
             }
@@ -2344,8 +2373,10 @@ function Resume-CcSessions {
         details of the highlighted row: fresh input / cache write / cache
         read / output (thinking), the models, a 30-minute timeline, and
         for codex the rate-limit meter the session saw at its last turn
-        (Claude Code does not record its meter). The order of the list
-        does not change.
+        (Claude Code does not record its meter) - then the window split
+        session by session: every listed session with turns in it,
+        largest first, with its share. The order of the list does not
+        change.
     .EXAMPLE
         ccr -Root work
         With several accounts configured, list only the "work" account's
@@ -2408,6 +2439,33 @@ function Resume-CcSessions {
         # (Ctrl+J) in the picker; 5 = the length of Claude's usage window.
         [ValidateRange(1, 24 * 365)][int]$UsageHours = 5
     )
+    # --- GNU spellings (ccr --update, --root work, --dry-run ...) ------------
+    # The ones ccr.py uses on macOS; PowerShell would take them as filter
+    # words, so translate them and run again. One or two dashes and any
+    # case work on both platforms.
+    if ($Filter -and @($Filter | Where-Object { $_ -like '--*' }).Count) {
+        $map = @{ update = 'Update'; channel = 'Channel'; root = 'Root'; accounts = 'Accounts'; 'add-account' = 'AddAccount'
+            'remove-account' = 'RemoveAccount'; 'disable-accounts' = 'DisableAccounts'; 'copy-settings' = 'CopySettings'
+            'copy-statusline' = 'CopySettings'; tool = 'Tool'; top = 'Top'; new = 'New'; 'new-window' = 'NewWindow'
+            'dry-run' = 'WhatIf'; whatif = 'WhatIf'; 'usage-hours' = 'UsageHours' }
+        $takesValue = 'Channel', 'Root', 'AddAccount', 'RemoveAccount', 'Tool', 'Top', 'UsageHours'
+        $again = @{} + $PSBoundParameters
+        $again.Remove('Filter')
+        $rest = @()
+        for ($i = 0; $i -lt $Filter.Count; $i++) {
+            $tok = $Filter[$i]
+            $name, $val = if ($tok -like '--*=*') { $tok.Substring(2) -split '=', 2 } else { $tok.Substring(2), $null }
+            if ($tok -like '--*' -and $map.ContainsKey($name.ToLowerInvariant())) {
+                $p = $map[$name.ToLowerInvariant()]
+                if ($p -in $takesValue) { if ($null -eq $val) { $i++; $val = $Filter[$i] }; $again[$p] = $val }
+                else { $again[$p] = $true }
+            }
+            else { $rest += $tok }
+        }
+        if ($rest.Count) { $again['Filter'] = $rest }
+        Resume-CcSessions @again
+        return
+    }
     $filterText = if ($Filter) { ($Filter -join ' ').Trim() } else { '' }
 
     # --- release channels (before the self-heal, on purpose) -----------------

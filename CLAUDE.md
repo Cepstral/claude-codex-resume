@@ -40,6 +40,9 @@ express something the same way (fzf vs. the hand-drawn console picker), pick
 the nearest fzf equivalent and note it in the reply and in the README's
 macOS section; never leave a feature out silently.
 
+Flags accept both spellings on both sides: the PowerShell one (`-Update`,
+`-Root work`, `-WhatIf`, case-insensitive) and the GNU one (`--update`,
+`--root work`, `--dry-run`); a new flag gets both in the same change.
 Keys are the same on both sides wherever the terminal allows it, and when
 fzf cannot take a key the PowerShell picker adopts fzf's choice (the account
 page is Ctrl+A everywhere because fzf cannot tell Ctrl-M from Enter).
