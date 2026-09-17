@@ -108,6 +108,10 @@ each dir is independent (see the table at the end); project trust is asked again
 
 Without a `ccr.json`, nothing changes: ccr uses the default dirs as before.
 
+`ccr.json` also holds two keys unrelated to accounts: `"usageColumn": true` starts the picker with
+the token-usage column on (what `Ctrl+K` toggles), and `"usageHours": 24` sets its window (default 5).
+A `ccr.json` with only those keys does not turn multi-account mode on.
+
 ## What the picker shows
 
 An **account column** appears between the tool and the age (magenta), for both tools, the

@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.54'
+$script:CcrVersion = '0.55'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -1731,7 +1731,9 @@ function Select-CcrSession {
         [object[]]$AllClaudeRoots = $null,
         [object[]]$AllCodexRoots = $null,
         # Window of the token-usage column (Ctrl+K) and details (Ctrl+J).
-        [int]$UsageHours = 5
+        [int]$UsageHours = 5,
+        # Start with the usage column on (-Usage / ccr.json usageColumn).
+        [switch]$Usage
     )
     if ($null -eq $AllClaudeRoots) { $AllClaudeRoots = $ClaudeRoots }
     if ($null -eq $AllCodexRoots) { $AllCodexRoots = $CodexRoots }
@@ -1773,13 +1775,18 @@ function Select-CcrSession {
     if ($updNote) { Remove-Item Env:CCR_UPDATED_FROM -ErrorAction SilentlyContinue }
     # Token usage (Ctrl+K toggles the column, Ctrl+J opens the details):
     # computed on demand and cached for the picker's lifetime.
-    $usageOn = $false
+    $usageOn = [bool]$Usage
     $usageSince = [datetime]::UtcNow.AddHours(-$UsageHours)
     $usageOf = @{}   # "tool|id" -> usage object or $null (no turn in the window)
     function Get-CcrUsageCached([object]$s) {
         $k = "$($s.Tool)|$($s.SessionId)"
         if (-not $usageOf.ContainsKey($k)) { $usageOf[$k] = Get-CcrSessionUsage -Session $s -SinceUtc $usageSince }
         $usageOf[$k]
+    }
+    if ($usageOn) {
+        # Column on from the start: read the window before the first frame.
+        Write-Host "ccr: reading token usage of the last $UsageHours h..." -ForegroundColor Yellow
+        foreach ($s in $Sessions) { $null = Get-CcrUsageCached $s }
     }
     function Get-CcrAcctAvail([object]$row) { @($entries | Where-Object { $_.Tool -eq $row.Tool } | ForEach-Object Label) }
     function Get-CcrAcctNumber([string]$tool, [string]$label) {
@@ -2377,7 +2384,8 @@ function Resume-CcSessions {
     .EXAMPLE
         ccr   then Ctrl+K / Ctrl+J
         Token usage. Ctrl+K adds a column with each session's total tokens
-        of the last 5 hours (-UsageHours changes the window), read from
+        of the last 5 hours (-UsageHours changes the window; -Usage, or
+        "usageColumn": true in ccr.json, starts with the column on), read from
         the transcripts written in that window: claude's per-turn usage
         blocks, codex's per-turn token_count events. Ctrl+J opens the
         details of the highlighted row: fresh input / cache write / cache
@@ -2445,9 +2453,13 @@ function Resume-CcSessions {
         # With -AddAccount: give the new dir the default account's settings
         # (claude: status line, codex: config.toml).
         [Alias('CopyStatusline')][switch]$CopySettings,
+        # Start the picker with the token-usage column on (Ctrl+K toggles
+        # it); ccr.json "usageColumn": true makes that the default.
+        [switch]$Usage,
         # Window, in hours, of the token-usage column (Ctrl+K) and details
-        # (Ctrl+J) in the picker; 5 = the length of Claude's usage window.
-        [ValidateRange(1, 24 * 365)][int]$UsageHours = 5
+        # (Ctrl+J) in the picker; 0 = ccr.json "usageHours", else 5 = the
+        # length of Claude's usage window.
+        [ValidateRange(0, 24 * 365)][int]$UsageHours = 0
     )
     # --- GNU spellings (ccr --update, --root work, --dry-run ...) ------------
     # The ones ccr.py uses on macOS; PowerShell would take them as filter
@@ -2457,7 +2469,7 @@ function Resume-CcSessions {
         $map = @{ update = 'Update'; channel = 'Channel'; root = 'Root'; accounts = 'Accounts'; 'add-account' = 'AddAccount'
             'remove-account' = 'RemoveAccount'; 'disable-accounts' = 'DisableAccounts'; 'copy-settings' = 'CopySettings'
             'copy-statusline' = 'CopySettings'; tool = 'Tool'; top = 'Top'; new = 'New'; 'new-window' = 'NewWindow'
-            'dry-run' = 'WhatIf'; whatif = 'WhatIf'; 'usage-hours' = 'UsageHours' }
+            'dry-run' = 'WhatIf'; whatif = 'WhatIf'; 'usage-hours' = 'UsageHours'; usage = 'Usage' }
         $takesValue = 'Channel', 'Root', 'AddAccount', 'RemoveAccount', 'Tool', 'Top', 'UsageHours'
         $again = @{} + $PSBoundParameters
         $again.Remove('Filter')
@@ -2603,7 +2615,13 @@ function Resume-CcSessions {
     }
     else {
         $canMultiOpen = $IsWindows -or [bool]$env:TMUX
-        $picked = Select-CcrSession -Sessions $sorted -InitialFilter $filterText -NoMultiOpen:(-not $canMultiOpen) -ClaudeRoots $claudeRoots -CodexRoots $codexRoots -AllClaudeRoots $allClaudeRoots -AllCodexRoots $allCodexRoots -UsageHours $UsageHours
+        # Token-usage defaults from ccr.json ("usageColumn": true starts the
+        # picker with the column on, "usageHours": N sets the window); the
+        # parameters win over the file.
+        $cfgU = Get-CcrConfig
+        if (-not $UsageHours) { $UsageHours = if ($cfgU -and [int]$cfgU.usageHours -gt 0) { [int]$cfgU.usageHours } else { 5 } }
+        $usageDefault = [bool]$Usage -or [bool]($cfgU -and $cfgU.usageColumn)
+        $picked = Select-CcrSession -Sessions $sorted -InitialFilter $filterText -NoMultiOpen:(-not $canMultiOpen) -ClaudeRoots $claudeRoots -CodexRoots $codexRoots -AllClaudeRoots $allClaudeRoots -AllCodexRoots $allCodexRoots -UsageHours $UsageHours -Usage:$usageDefault
     }
     if ($null -eq $picked) { Write-Host 'ccr: cancelled.'; return }
     if ($picked -isnot [System.Array] -and $picked.PSObject.Properties['Restart']) {

@@ -30,7 +30,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.54"
+VERSION = "0.55"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -2213,7 +2213,7 @@ PS_FLAGS = {"update": "--update", "channel": "--channel", "root": "--root", "acc
             "addaccount": "--add-account", "removeaccount": "--remove-account", "disableaccounts": "--disable-accounts",
             "copysettings": "--copy-settings", "copystatusline": "--copy-settings", "tool": "--tool", "top": "--top",
             "new": "--new", "newwindow": "--new-window", "whatif": "--dry-run", "dryrun": "--dry-run",
-            "usagehours": "--usage-hours", "tabs": "--tabs", "terminal": "--terminal", "version": "--version",
+            "usagehours": "--usage-hours", "usage": "--usage", "tabs": "--tabs", "terminal": "--terminal", "version": "--version",
             "filter": None}
 
 
@@ -2251,8 +2251,12 @@ def main():
                     help="resume Codex desktop-app conversations with 'codex resume' in a terminal "
                          "instead of handing them back to the app")
     ap.add_argument("--dry-run", action="store_true", help="print what would be launched, launch nothing")
-    ap.add_argument("--usage-hours", type=int, default=5, metavar="H",
-                    help="window of the token-usage column (Ctrl-K) and details (Ctrl-J); 5 = Claude's usage window")
+    ap.add_argument("--usage", action="store_true",
+                    help="start with the token-usage column on (Ctrl-K toggles it); ccr.json \"usageColumn\": true "
+                         "makes that the default")
+    ap.add_argument("--usage-hours", type=int, default=None, metavar="H",
+                    help="window of the token-usage column (Ctrl-K) and details (Ctrl-J); default: ccr.json "
+                         "\"usageHours\", else 5 = Claude's usage window")
     acc = ap.add_argument_group("accounts (one data dir per account and tool, ccr.json)")
     acc.add_argument("--root", metavar="LABEL", default="",
                      help="list only this account's sessions (label from ccr.json); also the account -n defaults to")
@@ -2275,6 +2279,18 @@ def main():
     ap.add_argument("--version", action="version", version="ccr " + VERSION + " (python)")
     a = ap.parse_args(normalize_argv(sys.argv[1:]))
     query = " ".join(a.query).strip()
+    # Token-usage defaults from ccr.json: "usageColumn": true starts the
+    # picker with the column on, "usageHours": N sets the window. The
+    # flags win over the file.
+    cfg = load_config() or {}
+    usage_default = a.usage or bool(cfg.get("usageColumn"))
+    if a.usage_hours is None:
+        try:
+            a.usage_hours = int(cfg.get("usageHours") or 5)
+        except (TypeError, ValueError):
+            a.usage_hours = 5
+    if a.usage_hours < 1:
+        a.usage_hours = 5
 
     if a.update or a.channel:
         me = self_path()
@@ -2340,8 +2356,9 @@ def main():
             return
 
         # Token usage (Ctrl-K toggles the column, Ctrl-J opens the details):
-        # computed on demand and cached for the picker's lifetime.
-        usage_on, usage_of = False, {}
+        # computed on demand and cached for the picker's lifetime. The
+        # column starts on with --usage or ccr.json "usageColumn": true.
+        usage_on, usage_of = usage_default, {}
         usage_since = datetime.now(timezone.utc) - timedelta(hours=a.usage_hours)
 
         def usage_cached(s):
@@ -2349,6 +2366,16 @@ def main():
                 usage_of[s.key] = session_usage(s, usage_since)
             return usage_of[s.key]
 
+        def usage_fill():
+            """Read the transcripts written inside the window, once per picker."""
+            todo = [s for s in sessions if s.key not in usage_of]
+            if todo:
+                print(f"{YELLOW}ccr: reading token usage of the last {a.usage_hours} h...{RESET}")
+                for s in todo:
+                    usage_cached(s)
+
+        if usage_on:
+            usage_fill()
         restart = False
         while not restart:
             index = {}
@@ -2365,11 +2392,7 @@ def main():
                 # written inside the window (once per picker).
                 usage_on = not usage_on
                 if usage_on:
-                    todo = [s for s in sessions if s.key not in usage_of]
-                    if todo:
-                        print(f"{YELLOW}ccr: reading token usage of the last {a.usage_hours} h...{RESET}")
-                        for s in todo:
-                            usage_cached(s)
+                    usage_fill()
                 continue
             if key == "ctrl-j":
                 # The usage details of the highlighted row, plus the window
