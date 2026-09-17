@@ -30,7 +30,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.52"
+VERSION = "0.53"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -1510,10 +1510,12 @@ def fmt_tokens(n: int) -> str:
     return str(n)
 
 
-def usage_page(s: Session, u, hours: int, since: datetime):
+def usage_page(s: Session, u, hours: int, since: datetime, all_: list = None):
     """Details page (Ctrl-J): the split of the tokens, the models, a 30-minute
     timeline of the window, and - codex only - the rate-limit meter the
-    session saw at its last turn. Claude Code does not record its meter."""
+    session saw at its last turn. Claude Code does not record its meter.
+    all_: every listed session with turns in the window, as (Session, Usage),
+    for the split of the window session by session."""
     print(f"\n{BOLD}Token usage{RESET}  {s.tool} · {s.title}")
     print(f"{DIM}last {hours} h (since {since.astimezone():%Y-%m-%d %H:%M}){RESET}")
     print(f"  folder:  {fmt_cwd(s.cwd, 70)}" + (f"   account: {s.root}" if s.root else ""))
@@ -1543,6 +1545,26 @@ def usage_page(s: Session, u, hours: int, since: datetime):
             print(f"  {DIM}rate limit: not recorded in this rollout{RESET}")
     else:
         print(f"  {DIM}rate limit: Claude Code does not record its meter in the transcript{RESET}")
+    usage_split(s, all_ or [])
+
+
+def usage_split(s: Session, all_: list):
+    """The window split session by session: every listed session with turns
+    in it, largest first, with its share; the highlighted one is marked.
+    Which session ate the quota is the question this answers."""
+    rows = sorted([(x, ux) for x, ux in all_ if ux], key=lambda e: -e[1].total)
+    if not rows:
+        return
+    total = sum(ux.total for _, ux in rows)
+    print(f"\n  {BOLD}the window, session by session{RESET}  {DIM}{len(rows)} session{'s' if len(rows) != 1 else ''}"
+          f" · {fmt_tokens(total)} tokens{RESET}")
+    for x, ux in rows:
+        me = x.tool == s.tool and x.id == s.id
+        pct = round(100 * ux.total / total) if total else 0
+        tc = ORANGE if x.tool == "claude" else CYAN
+        acct = f" {MAGENTA}{x.root}{RESET}" if x.root else ""
+        print(f"  {GREEN + '>' + RESET if me else ' '} {pct:>3}%  {YELLOW}{fmt_tokens(ux.total):>6}{RESET}  "
+              f"{tc}{x.tool:<6}{RESET}{acct}  {x.title}")
 
 
 # ----------------------------------------------------------------------------
@@ -2174,6 +2196,35 @@ def auto_update(channel: str, me: str):
 # ----------------------------------------------------------------------------
 # main
 # ----------------------------------------------------------------------------
+# The PowerShell spellings (ccr -Update, -Root work, -WhatIf, -AddAccount x,
+# any case, one or two dashes) translated to the GNU ones argparse knows, so
+# a command line copied from either doc works on both platforms. Only known
+# names are touched; anything else stays a filter word or an argparse error.
+PS_FLAGS = {"update": "--update", "channel": "--channel", "root": "--root", "accounts": "--accounts",
+            "addaccount": "--add-account", "removeaccount": "--remove-account", "disableaccounts": "--disable-accounts",
+            "copysettings": "--copy-settings", "copystatusline": "--copy-settings", "tool": "--tool", "top": "--top",
+            "new": "--new", "newwindow": "--new-window", "whatif": "--dry-run", "dryrun": "--dry-run",
+            "usagehours": "--usage-hours", "tabs": "--tabs", "terminal": "--terminal", "version": "--version",
+            "filter": None}
+
+
+def normalize_argv(argv: list) -> list:
+    out = []
+    for tok in argv:
+        m = re.fullmatch(r"--?([A-Za-z][A-Za-z-]+)(?:[=:](.*))?", tok, re.S)
+        key = m.group(1).replace("-", "").lower() if m else None
+        if not m or key not in PS_FLAGS:
+            out.append(tok)
+            continue
+        flag = PS_FLAGS[key]
+        if flag is None:          # -Filter kit: the value is the query itself
+            if m.group(2) is not None:
+                out.append(m.group(2))
+            continue
+        out.append(flag if m.group(2) is None else f"{flag}={m.group(2)}")
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(prog="ccr",
                                  description="Resume Claude Code / Codex conversations as terminal tabs.")
@@ -2213,7 +2264,7 @@ def main():
     upd.add_argument("--channel", choices=["stable", "test"], default="",
                      help="install/refresh the side-by-side copy of that channel (test = ccrtest next to ccr)")
     ap.add_argument("--version", action="version", version="ccr " + VERSION + " (python)")
-    a = ap.parse_args()
+    a = ap.parse_args(normalize_argv(sys.argv[1:]))
     query = " ".join(a.query).strip()
 
     if a.update or a.channel:
@@ -2312,10 +2363,12 @@ def main():
                             usage_cached(s)
                 continue
             if key == "ctrl-j":
-                # The usage details of the highlighted row.
+                # The usage details of the highlighted row, plus the window
+                # split session by session (every listed session).
                 if picked:
                     print(f"{YELLOW}ccr: reading token usage of the last {a.usage_hours} h...{RESET}")
-                    usage_page(picked[0], usage_cached(picked[0]), a.usage_hours, usage_since)
+                    all_ = [(x, usage_cached(x)) for x in sessions]
+                    usage_page(picked[0], usage_cached(picked[0]), a.usage_hours, usage_since, all_)
                     pause()
                 continue
             if key == "ctrl-n":
