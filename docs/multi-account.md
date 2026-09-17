@@ -38,7 +38,7 @@ From then on `Ctrl+A` shows the account page:
 
 ```
 Accounts  C:\Users\me\OneDrive\.claude\pwsh\ccr.json
-↑↓ move · + add · Del remove · S copy settings from default (claude: statusline, codex: config.toml) · X turn off · Esc back
+↑↓ move · + add · L log in here · Del remove · S copy settings from default (claude: statusline, codex: config.toml) · X turn off · Esc back
   (default)  claude  ~\OneDrive\.claude   me@gmail.com
   (default)  codex   ~\.codex             me@gmail.com
   work       claude  ~\.claude-work       me@company.com
@@ -56,6 +56,9 @@ files (`.claude.json` / `auth.json`), so the page opens instantly. `Enter` and `
   to it; Claude resolves the script through `CLAUDE_CONFIG_DIR`, so it works unchanged there),
   for Codex `config.toml` (model, effort, features, per-project trust).
 - `S` does the same copy for an existing account (the highlighted row, its own tool).
+- `L` logs **this PC** in to the highlighted account. An account added on another PC through a
+  synced `ccr.json` shows `not on this PC` until then: ccr creates the dir here and runs that
+  tool's login inside it (`ccr -AddAccount <label>` for a label that already exists does the same).
 - `Del` removes the highlighted account: every session it holds **moves to the `default`
   account** of that tool and keeps working there; the dir and its login stay on disk, ccr just
   forgets them. Refused while one of its sessions is running.
@@ -239,7 +242,7 @@ Everything above exists in the Python version with the same `ccr.json` keys (fil
 | PowerShell                              | Python                                          |
 |-----------------------------------------|-------------------------------------------------|
 | `-Root work` · `-Accounts` · `-AddAccount work -CopySettings` · `-RemoveAccount work` · `-DisableAccounts` | `--root work` · `--accounts` · `--add-account work --copy-settings` · `--remove-account work` · `--disable-accounts` |
-| `Ctrl+A` account page: `+` add, `Del` remove, `S` copy settings, `X` off | `Ctrl-A` account page: `+` and `X` are rows you pick with Enter, `Del` removes, `Ctrl-S` copies settings |
+| `Ctrl+A` account page: `+` add, `L` log in here, `Del` remove, `S` copy settings, `X` off | `Ctrl-A` account page: `+` and `X` are rows you pick with Enter, `Ctrl-L` logs in here, `Del` removes, `Ctrl-S` copies settings |
 | `Space` cycles the account a row opens under (per row) | `Tab` marks rows as usual, `Ctrl-O` opens the marked rows under an entry chosen from a menu with the legend's numbering (one target for the whole selection) |
 | account column and legend in the picker | the same; the label is part of the fuzzy-searchable text |
 | `-WhatIf` lists the moves and the `$env:` prefixes | `--dry-run` lists the moves and the `CLAUDE_CONFIG_DIR='…'` / `CODEX_HOME='…'` prefixes |

@@ -30,7 +30,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.57"
+VERSION = "0.58"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -348,7 +348,7 @@ def login_identity(tool: str, path: str) -> str:
     default dir: run the tool's own status command with the dir selected.
     A status check that hangs on the network is cut after 60 s."""
     if not Path(path).is_dir():
-        return "(dir missing)"
+        return "not on this PC"
     try:
         if tool == "claude":
             r = subprocess.run(["claude", "auth", "status", "--json"], capture_output=True, text=True,
@@ -533,15 +533,17 @@ def add_account(label: str, tool: str = "all", copy: bool = False):
     cfg = enable_multi_account()
     for t in (("claude", "codex") if tool == "all" else (tool,)):
         m = cfg[t + "Roots"]
-        if label in m:
-            print(f"ccr: {t} account '{label}' already configured - skipping", file=sys.stderr)
-            continue
         def_path = default_root(t).path
-        d = os.path.join(os.path.dirname(def_path), f"{os.path.basename(def_path)}-{label}")
+        # An account already configured (e.g. added on another PC through a
+        # synced ccr.json) keeps its dir: created here when missing, the
+        # login run inside it; with a login already inside, nothing to do.
+        known = label in m
+        d = expand_path(str(m[label])) if known else os.path.join(os.path.dirname(def_path), f"{os.path.basename(def_path)}-{label}")
         reused = os.path.isdir(d)
         Path(d).mkdir(parents=True, exist_ok=True)
-        m[label] = d
-        save_config(cfg)   # record first, so an aborted login still leaves a usable entry
+        if not known:
+            m[label] = d
+            save_config(cfg)   # record first, so an aborted login still leaves a usable entry
         if t == "claude":
             # A fresh dir has no .claude.json, and the first interactive
             # claude there runs the first-start wizard (theme, login...)
@@ -568,10 +570,13 @@ def add_account(label: str, tool: str = "all", copy: bool = False):
         has_login = (Path(d) / (".credentials.json" if t == "claude" else "auth.json")).exists()
         if reused and has_login:
             already = quick_identity(t, d)
-            print(f"{YELLOW}ccr: {t} account '{label}' -> {d}  - existing dir, already logged in"
+            why = "already configured and logged in" if known else "existing dir, already logged in"
+            print(f"{YELLOW}ccr: {t} account '{label}' -> {d}  - {why}"
                   f"{' as ' + already if already else ''}; no login needed{RESET}")
             continue
-        print(f"{YELLOW}ccr: {t} account '{label}' -> {d}  - starting the {t} login flow in that dir{RESET}")
+        why = ("configured but not on this PC yet; " if known and not reused
+               else "configured but not logged in here; " if known else "")
+        print(f"{YELLOW}ccr: {t} account '{label}' -> {d}  - {why}starting the {t} login flow in that dir{RESET}")
         argv = ["claude", "auth", "login"] if t == "claude" else ["codex", "login"]
         try:
             subprocess.run(argv, env=tool_env(t, d))
@@ -1139,7 +1144,7 @@ class Ctx:
             qk = f"{t}|{r.label}"
             if qk not in self.quick:
                 self.quick[qk] = quick_identity(t, r.path)
-            cells[n] = (fmt_cwd(r.path, 28), self.quick[qk] or "not logged in")
+            cells[n] = (fmt_cwd(r.path, 28), self.quick[qk] or ("not on this PC" if not os.path.isdir(r.path) else "not logged in"))
         dir_w = max(len(c[0]) for c in cells.values())
         who_w = max(len(c[1]) for c in cells.values())
         with_dirs = 2 + 6 + 2 + n_w + 1 + lbl_w + 2 + dir_w + 2 + who_w <= width
@@ -1313,7 +1318,7 @@ def account_page(ctx: Ctx, dry: bool):
     who = {}
     for t, r in entries:
         q = quick_identity(t, r.path)
-        who[f"{t}|{r.label}"] = q or "not logged in"
+        who[f"{t}|{r.label}"] = q or ("not on this PC" if not os.path.isdir(r.path) else "not logged in")
     lbl_w = max(7, max(len(acct_label(r.label, r.default)) for _, r in entries))
     dir_w = min(40, max(len(fmt_cwd(r.path, 40)) for _, r in entries))
     for i, (t, r) in enumerate(entries):
@@ -1323,10 +1328,11 @@ def account_page(ctx: Ctx, dry: bool):
     rows.append(f"add\t{GREEN}+ add an account{RESET}  {DIM}tool, label, then that tool's login{RESET}\tadd")
     rows.append(f"off\t{RED}X turn multi-account mode off{RESET}  {DIM}every session goes to the '{DEFAULT_LABEL}' account{RESET}\toff")
     header = (f"{BOLD}Accounts{RESET}  {DIM}{CONFIG_PATH}{RESET}\n"
-              + hint(("Enter", "choose"), ("Del", "remove"), ("Ctrl-S", "copy settings from default"), ("Esc", "back"))
+              + hint(("Enter", "choose"), ("Ctrl-L", "log in here"), ("Del", "remove"), ("Ctrl-S", "copy settings from default"),
+                     ("Esc", "back"))
               + f"\n{DIM}A session always resumes under the account whose dir it lives in. "
               f"In the picker, Ctrl-O opens the marked rows under another account.{RESET}")
-    res = run_fzf(rows, header, multi=False, preview=False, prompt="accounts> ", expect=["del", "ctrl-s"])
+    res = run_fzf(rows, header, multi=False, preview=False, prompt="accounts> ", expect=["del", "ctrl-s", "ctrl-l"])
     if not res or not res[1]:
         return None
     key, picked = res[0], res[1][0]
@@ -1357,6 +1363,18 @@ def account_page(ctx: Ctx, dry: bool):
         print("  Refused while one of its sessions is running.\n")
         ans = ask(f"  {RED}[y]{RESET} remove    {DIM}anything else: cancel{RESET} > ")
         return {"action": "remove", "tool": t, "label": r.label} if ans and ans.strip().lower() == "y" else None
+    if key == "ctrl-l":
+        # Log in on this PC: an account added elsewhere (synced ccr.json)
+        # has no dir or no login here yet.
+        state = ("does not exist on this PC yet" if not os.path.isdir(r.path)
+                 else "is already logged in here" if quick_identity(t, r.path) else "exists here but holds no login")
+        cmd = "claude auth login" if t == "claude" else "codex login"
+        print(f"\n{BOLD}Log in on this PC{RESET}\n")
+        print(f"    {t} · {BOLD}{r.label}{RESET}  {fmt_cwd(r.path, 60)}\n")
+        print(f"  The dir {state}. ccr creates it if needed and runs '{cmd}' inside it,")
+        print("  so this PC gets its own credentials for the account (nothing else changes).\n")
+        ans = ask(f"  {GREEN}[y]{RESET} log in    {DIM}anything else: cancel{RESET} > ")
+        return {"action": "login", "tool": t, "label": r.label} if ans and ans.strip().lower() == "y" else None
     if key == "ctrl-s":
         if r.default:
             print(f"{YELLOW}ccr: '{r.label}' is the default account - it is the source, not a target{RESET}")
@@ -1394,6 +1412,8 @@ def run_account_action(act: dict, dry: bool):
             add_account(act["label"], act["tool"], act["copy"])
         elif act["action"] == "settings":
             copy_settings(act["tool"], act["from"], act["to"])
+        elif act["action"] == "login":
+            add_account(act["label"], act["tool"], False)
         elif act["action"] == "remove":
             remove_account(act["label"], act["tool"])
         elif act["action"] == "disable":

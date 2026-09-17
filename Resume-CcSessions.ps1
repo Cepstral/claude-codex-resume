@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.57'
+$script:CcrVersion = '0.58'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -209,7 +209,7 @@ function Get-CcrCodexRoots { Get-CcrRoots -Tool codex }
 # ccr: after 60 s the answer is '(no answer in 60s)'.
 function Get-CcrLoginIdentity {
     param([Parameter(Mandatory)][ValidateSet('claude', 'codex')][string]$Tool, [Parameter(Mandatory)][string]$RootPath)
-    if (-not (Test-Path -LiteralPath $RootPath)) { return '(dir missing)' }
+    if (-not (Test-Path -LiteralPath $RootPath)) { return 'not on this PC' }
     $job = Start-Job -ScriptBlock {
         param($Tool, $RootPath)
         if ($Tool -eq 'claude') {
@@ -421,13 +421,18 @@ function Add-CcrAccount {
     $tools = if ($Tool -eq 'all') { @('claude', 'codex') } else { @($Tool) }
     foreach ($t in $tools) {
         $map = if ($t -eq 'claude') { $cfg.claudeRoots } else { $cfg.codexRoots }
-        if ($map.PSObject.Properties[$Label]) { Write-Warning "ccr: $t account '$Label' already configured - skipping"; continue }
         $defPath = @(Get-CcrRoots -Tool $t | Where-Object Default)[0].Path
-        $dir = Join-Path (Split-Path -Parent $defPath) "$(Split-Path -Leaf $defPath)-$Label"
+        # An account already configured (e.g. added on another PC through a
+        # synced ccr.json) keeps its dir: created here when missing, the
+        # login run inside it; with a login already inside, nothing to do.
+        $known = $map.PSObject.Properties[$Label]
+        $dir = if ($known) { Expand-CcrPath ([string]$known.Value) } else { Join-Path (Split-Path -Parent $defPath) "$(Split-Path -Leaf $defPath)-$Label" }
         $reused = Test-Path -LiteralPath $dir
         New-Item -ItemType Directory -Path $dir -Force | Out-Null
-        $map | Add-Member -NotePropertyName $Label -NotePropertyValue $dir
-        Save-CcrConfig $cfg   # record first, so an aborted login still leaves a usable entry
+        if (-not $known) {
+            $map | Add-Member -NotePropertyName $Label -NotePropertyValue $dir
+            Save-CcrConfig $cfg   # record first, so an aborted login still leaves a usable entry
+        }
         if ($t -eq 'claude') {
             $from = @(Get-CcrRoots -Tool claude | Where-Object Default)[0].Path
             # A fresh dir has no .claude.json, and the first interactive
@@ -455,10 +460,12 @@ function Add-CcrAccount {
         $hasLogin = Test-Path -LiteralPath (Join-Path $dir $(if ($t -eq 'claude') { '.credentials.json' } else { 'auth.json' }))
         if ($reused -and $hasLogin) {
             $already = Get-CcrQuickIdentity -Tool $t -RootPath $dir
-            Write-Host "ccr: $t account '$Label' -> $dir  - existing dir, already logged in$(if ($already) { " as $already" }); no login needed" -ForegroundColor Yellow
+            $why = if ($known) { 'already configured and logged in' } else { 'existing dir, already logged in' }
+            Write-Host "ccr: $t account '$Label' -> $dir  - $why$(if ($already) { " as $already" }); no login needed" -ForegroundColor Yellow
             continue
         }
-        Write-Host "ccr: $t account '$Label' -> $dir  - starting the $t login flow in that dir" -ForegroundColor Yellow
+        $why = if ($known -and -not $reused) { 'configured but not on this PC yet' } elseif ($known) { 'configured but not logged in here' } else { '' }
+        Write-Host "ccr: $t account '$Label' -> $dir  - $(if ($why) { "$why; " })starting the $t login flow in that dir" -ForegroundColor Yellow
         $var = if ($t -eq 'claude') { 'CLAUDE_CONFIG_DIR' } else { 'CODEX_HOME' }
         $prev = [System.Environment]::GetEnvironmentVariable($var)
         [System.Environment]::SetEnvironmentVariable($var, $dir)
@@ -1409,7 +1416,7 @@ function Show-CcrAccountPage {
         $ik = "$($r.Tool)|$($r.Label)"
         if (-not $Identity.ContainsKey($ik)) {
             $q = Get-CcrQuickIdentity -Tool $r.Tool -RootPath $r.Path
-            $Identity[$ik] = if ($q) { $q } else { 'not logged in' }
+            $Identity[$ik] = if ($q) { $q } elseif (-not (Test-Path -LiteralPath $r.Path)) { 'not on this PC' } else { 'not logged in' }
         }
     }
     $cursor = 0
@@ -1419,7 +1426,7 @@ function Show-CcrAccountPage {
     while ($true) {
         $lines = [System.Collections.Generic.List[string]]::new()
         $lines.Add("`e[1mAccounts`e[22m  `e[2m$($script:CcrConfigPath)`e[22m")
-        $lines.Add("`e[2m$([char]0x2191)$([char]0x2193) move $dot + add $dot Del remove $dot S copy settings from default (claude: statusline, codex: config.toml) $dot X turn off $dot Esc back`e[22m")
+        $lines.Add("`e[2m$([char]0x2191)$([char]0x2193) move $dot + add $dot L log in here $dot Del remove $dot S copy settings from default (claude: statusline, codex: config.toml) $dot X turn off $dot Esc back`e[22m")
         for ($i = 0; $i -lt $rows.Count; $i++) {
             $r = $rows[$i]
             $toolColor = if ($r.Tool -eq 'claude') { "`e[38;5;208m" } else { "`e[36m" }
@@ -1457,6 +1464,26 @@ function Show-CcrAccountPage {
             }
             default {
                 if ($k.KeyChar -eq '+') { $r = Read-CcrNewAccount; if ($r) { return $r } }
+                elseif ($k.KeyChar -in 'l', 'L') {
+                    # Log in on this PC: an account added elsewhere (synced
+                    # ccr.json) has no dir or no login here yet.
+                    $r = $rows[$cursor]
+                    $state = if (-not (Test-Path -LiteralPath $r.Path)) { 'does not exist on this PC yet' }
+                    elseif (Get-CcrQuickIdentity -Tool $r.Tool -RootPath $r.Path) { 'is already logged in here' }
+                    else { 'exists here but holds no login' }
+                    $cmd = if ($r.Tool -eq 'claude') { 'claude auth login' } else { 'codex login' }
+                    Write-CcrScreen @(
+                        "`e[1mLog in on this PC`e[22m",
+                        '',
+                        "    $($r.Tool) $dot `e[1m$($r.Label)`e[22m  $(Format-CcrCwd $r.Path 60)",
+                        '',
+                        "  The dir $state. ccr creates it if needed and runs '$cmd' inside it,",
+                        "  so this PC gets its own credentials for the account (nothing else changes).",
+                        '',
+                        "  `e[32m[y]`e[39m log in    `e[2many other key: cancel`e[22m")
+                    $c = [Console]::ReadKey($true)
+                    if ($c.KeyChar -in 'y', 'Y') { return [pscustomobject]@{ Action = 'login'; Tool = $r.Tool; Label = $r.Label } }
+                }
                 elseif ($k.KeyChar -in 's', 'S') {
                     $r = $rows[$cursor]
                     if ($r.Default) { Show-CcrNotice "ccr: '$($r.Label)' is the default account - it is the source, not a target" '33'; continue }
@@ -1877,7 +1904,7 @@ function Select-CcrSession {
                     $qk = "$($e.Tool)|$($e.Label)"
                     if (-not $acctQuick.ContainsKey($qk)) { $acctQuick[$qk] = Get-CcrQuickIdentity -Tool $e.Tool -RootPath $e.Path }
                     $e.Dir = Format-CcrCwd $e.Path 28
-                    $e.Who = if ($acctQuick[$qk]) { $acctQuick[$qk] } else { 'not logged in' }
+                    $e.Who = if ($acctQuick[$qk]) { $acctQuick[$qk] } elseif (-not (Test-Path -LiteralPath $e.Path)) { 'not on this PC' } else { 'not logged in' }
                     if ($e.Dir.Length -gt $dirW) { $dirW = $e.Dir.Length }
                     if ($e.Who.Length -gt $whoW) { $whoW = $e.Who.Length }
                 }
@@ -2005,6 +2032,7 @@ function Select-CcrSession {
                         switch ($act.Action) {
                             'add' { Add-CcrAccount -Label $act.Label -Tool $act.Tool -CopySettings:([bool]$act.CopySettings) }
                             'settings' { Copy-CcrSettings $act.Tool $act.From $act.To }
+                            'login' { Add-CcrAccount -Label $act.Label -Tool $act.Tool }
                             'remove' { Remove-CcrAccount -Label $act.Label -Tool $act.Tool }
                             'disable' { Disable-CcrMultiAccount }
                         }
@@ -2404,7 +2432,10 @@ function Resume-CcSessions {
         account's settings - claude: status line, codex: config.toml),
         Del removes the highlighted one (its sessions go to the default
         account), S copies those settings from the default account to the
-        highlighted one, X turns multi-account mode off (every session
+        highlighted one, L logs this PC in to the highlighted account (an
+        account added on another PC through a synced ccr.json shows "not
+        on this PC" until then; ccr -AddAccount <label> does the same from
+        the command line), X turns multi-account mode off (every session
         goes to the default account).
         While multi-account mode is on, the picker's Space cycles the
         account a row opens under: its own (green dot = plain open), then
