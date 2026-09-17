@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.58'
+$script:CcrVersion = '0.59'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -264,6 +264,13 @@ function Get-CcrQuickIdentity {
         return "$(([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b)) | ConvertFrom-Json).email)"
     }
     catch { '' }
+}
+
+# The login shown next to a dir everywhere in the picker: the email from
+# the dir's own files, else why there is none.
+function Get-CcrWhoAt([string]$Tool, [string]$RootPath) {
+    $q = Get-CcrQuickIdentity -Tool $Tool -RootPath $RootPath
+    if ($q) { $q } elseif (-not (Test-Path -LiteralPath $RootPath)) { 'not on this PC' } else { 'not logged in' }
 }
 
 function Show-CcrAccounts {
@@ -1415,8 +1422,7 @@ function Show-CcrAccountPage {
     foreach ($r in $rows) {
         $ik = "$($r.Tool)|$($r.Label)"
         if (-not $Identity.ContainsKey($ik)) {
-            $q = Get-CcrQuickIdentity -Tool $r.Tool -RootPath $r.Path
-            $Identity[$ik] = if ($q) { $q } elseif (-not (Test-Path -LiteralPath $r.Path)) { 'not on this PC' } else { 'not logged in' }
+            $Identity[$ik] = Get-CcrWhoAt $r.Tool $r.Path
         }
     }
     $cursor = 0
@@ -1561,15 +1567,19 @@ function Read-CcrInput {
 # Account chooser for a NEW conversation when several config dirs are
 # configured for that tool. Returns the chosen root's label, or $null on Esc.
 function Select-CcrRoot {
-    param([Parameter(Mandatory)][object[]]$Roots)
+    param([Parameter(Mandatory)][object[]]$Roots, [Parameter(Mandatory)][ValidateSet('claude', 'codex')][string]$Tool)
     $cursor = [Math]::Max(0, [array]::IndexOf(@($Roots.Label), @($Roots | Where-Object Default | Select-Object -First 1).Label))
+    # Label, dir and who is logged in there, from the dir's own files.
+    $who = @{}
+    foreach ($r in $Roots) { $who[$r.Label] = Get-CcrWhoAt $Tool $r.Path }
+    $dirW = ($Roots | ForEach-Object { (Format-CcrCwd $_.Path 40).Length } | Measure-Object -Maximum).Maximum
     while ($true) {
         $sb = [System.Text.StringBuilder]::new()
         [void]$sb.Append("`e[H").Append('account for the new conversation').Append("`e[K`n")
         [void]$sb.Append("`e[2m$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Enter choose $([char]0x00B7) Esc back`e[22m`e[K")
         for ($i = 0; $i -lt $Roots.Count; $i++) {
             $r = $Roots[$i]
-            $row = "  `e[35m$((Format-CcrAcctLabel $r.Label $r.Default).PadRight(14))`e[39m `e[2m$(Format-CcrCwd $r.Path 60)`e[22m"
+            $row = "  `e[35m$((Format-CcrAcctLabel $r.Label $r.Default).PadRight(14))`e[39m $((Format-CcrCwd $r.Path 40).PadRight($dirW))  `e[2m$($who[$r.Label])`e[22m"
             if ($i -eq $cursor) { $row = "`e[7m$row`e[27m" }
             [void]$sb.Append("`n").Append($row).Append("`e[K")
         }
@@ -1716,7 +1726,7 @@ function Select-CcrPath {
                     # repaints the folder list.
                     $tool = Select-CcrTool
                     if ($tool -eq 'codex') {
-                        $rootLabel = if ($CodexRoots.Count -gt 1) { Select-CcrRoot -Roots $CodexRoots }
+                        $rootLabel = if ($CodexRoots.Count -gt 1) { Select-CcrRoot -Roots $CodexRoots -Tool codex }
                         elseif ($CodexRoots.Count -eq 1) { $CodexRoots[0].Label } else { $null }
                         if ($CodexRoots.Count -le 1 -or $null -ne $rootLabel) {
                             return [pscustomobject]@{ Path = $view[$cursor].Path; Tool = 'codex'; Name = ''; Root = $rootLabel }
@@ -1726,7 +1736,7 @@ function Select-CcrPath {
                         $name = Read-CcrInput -Prompt 'name> ' -Text $InitialName `
                             -Hint "session name for claude $([char]0x00B7) Enter confirm (empty = auto title) $([char]0x00B7) Esc back"
                         if ($null -ne $name) {
-                            $rootLabel = if ($ClaudeRoots.Count -gt 1) { Select-CcrRoot -Roots $ClaudeRoots }
+                            $rootLabel = if ($ClaudeRoots.Count -gt 1) { Select-CcrRoot -Roots $ClaudeRoots -Tool claude }
                             elseif ($ClaudeRoots.Count -eq 1) { $ClaudeRoots[0].Label } else { $null }
                             if ($ClaudeRoots.Count -le 1 -or $null -ne $rootLabel) {
                                 return [pscustomobject]@{ Path = $view[$cursor].Path; Tool = 'claude'; Name = $name.Trim(); Root = $rootLabel }
@@ -1902,9 +1912,9 @@ function Select-CcrSession {
                 $dirW = 0; $whoW = 0
                 foreach ($e in $entries) {
                     $qk = "$($e.Tool)|$($e.Label)"
-                    if (-not $acctQuick.ContainsKey($qk)) { $acctQuick[$qk] = Get-CcrQuickIdentity -Tool $e.Tool -RootPath $e.Path }
+                    if (-not $acctQuick.ContainsKey($qk)) { $acctQuick[$qk] = Get-CcrWhoAt $e.Tool $e.Path }
                     $e.Dir = Format-CcrCwd $e.Path 28
-                    $e.Who = if ($acctQuick[$qk]) { $acctQuick[$qk] } elseif (-not (Test-Path -LiteralPath $e.Path)) { 'not on this PC' } else { 'not logged in' }
+                    $e.Who = $acctQuick[$qk]
                     if ($e.Dir.Length -gt $dirW) { $dirW = $e.Dir.Length }
                     if ($e.Who.Length -gt $whoW) { $whoW = $e.Who.Length }
                 }

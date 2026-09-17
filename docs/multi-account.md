@@ -179,9 +179,12 @@ Claude, type the name → **choose the account**:
 ```
 account for the new conversation
 ↑↓ move · Enter choose · Esc back
-  default      ~\.claude  (default)
-  work         ~\.claude-work
+  (default)      ~\.claude       me@gmail.com
+  work           ~\.claude-work  me@company.com
 ```
+
+The login next to each dir comes from the dir's own files; an account added on another PC reads
+`not on this PC` there until you press `L` on the account page.
 
 Enter starts `claude --name "<name>"` (or `codex`) in the chosen dir; Esc steps back one level.
 The account question only appears for a tool that has several accounts configured.

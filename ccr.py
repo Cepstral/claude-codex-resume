@@ -30,7 +30,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.58"
+VERSION = "0.59"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -397,6 +397,12 @@ def quick_identity(tool: str, path: str) -> str:
         return str(json.loads(base64.urlsafe_b64decode(b)).get("email") or "")
     except Exception:
         return ""
+
+
+def who_at(tool: str, path: str) -> str:
+    """The login shown next to a dir everywhere in the picker: the email from
+    the dir's own files, else why there is none."""
+    return quick_identity(tool, path) or ("not on this PC" if not os.path.isdir(path) else "not logged in")
 
 
 def show_accounts():
@@ -1144,7 +1150,7 @@ class Ctx:
             qk = f"{t}|{r.label}"
             if qk not in self.quick:
                 self.quick[qk] = quick_identity(t, r.path)
-            cells[n] = (fmt_cwd(r.path, 28), self.quick[qk] or ("not on this PC" if not os.path.isdir(r.path) else "not logged in"))
+            cells[n] = (fmt_cwd(r.path, 28), self.quick[qk] or who_at(t, r.path))
         dir_w = max(len(c[0]) for c in cells.values())
         who_w = max(len(c[1]) for c in cells.values())
         with_dirs = 2 + 6 + 2 + n_w + 1 + lbl_w + 2 + dir_w + 2 + who_w <= width
@@ -1317,8 +1323,7 @@ def account_page(ctx: Ctx, dry: bool):
     # --- list page ---
     who = {}
     for t, r in entries:
-        q = quick_identity(t, r.path)
-        who[f"{t}|{r.label}"] = q or ("not on this PC" if not os.path.isdir(r.path) else "not logged in")
+        who[f"{t}|{r.label}"] = who_at(t, r.path)
     lbl_w = max(7, max(len(acct_label(r.label, r.default)) for _, r in entries))
     dir_w = min(40, max(len(fmt_cwd(r.path, 40)) for _, r in entries))
     for i, (t, r) in enumerate(entries):
@@ -2053,7 +2058,9 @@ def new_conversation(sessions: list, initial_name: str, dry: bool, ctx: Ctx, ter
     root = None
     if ctx.root_var(tool):
         if len(roots) > 1:
-            lbl = choose_account([(r.label, fmt_cwd(r.path, 60), r.default) for r in roots],
+            # Label, dir and who is logged in there, from the dir's own files.
+            dir_w = max(len(fmt_cwd(r.path, 40)) for r in roots)
+            lbl = choose_account([(r.label, f"{fmt_cwd(r.path, 40):<{dir_w}}  {who_at(tool, r.path)}", r.default) for r in roots],
                                  "step 3: account for the new conversation")
             if lbl is None:
                 return False
@@ -2506,7 +2513,7 @@ def main():
                 # launch and stays where it is).
                 tools = {s.tool for s in picked}
                 rows = [f"{n}\t{TOOL_COLOR[t]}{BOLD}{n}{RESET} {MAGENTA}{acct_label(r.label, r.default):<14}{RESET} "
-                        f"{TOOL_COLOR[t]}{t:<6}{RESET} {DIM}{fmt_cwd(r.path, 50)}{RESET}\t{r.path}"
+                        f"{TOOL_COLOR[t]}{t:<6}{RESET} {fmt_cwd(r.path, 40):<40}  {DIM}{who_at(t, r.path)}{RESET}\t{r.path}"
                         for n, t, r in ctx.entries if t in tools]
                 cnt = len(picked)
                 res = run_fzf(rows, hint(("Enter", "choose"), ("Esc", "back"),
