@@ -23,6 +23,12 @@ record it in the parity table in `docs/multi-account.md`. Known cases so far:
   the rollout; a move carries them over by appending to the destination's
   `session_index.jsonl` (the legacy index Codex still reads) — ccr never
   writes Codex's sqlite catalog. Claude titles are inside the transcript.
+- Running state: Claude registers each process in `<dir>/sessions/<pid>.json`
+  (`pidDomain` = platform:host, `kind`, `status`, `jobId`), so ccr can show
+  `@host` for a conversation open on another PC that shares the dir, `bg` for
+  a background session, and close one with `claude stop <jobId>`. Codex has
+  no registry, no background kind and no `stop`: its running flag is a
+  process scan, `@host` and `bg` never apply, and Ctrl+X ends the process.
 - Token usage (Ctrl+K / Ctrl+J): both tools record per-turn token counts in
   their transcripts (claude: `message.usage` per assistant line, deduplicated
   by message id; codex: `token_count` events, `last_token_usage`). Codex also

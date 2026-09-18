@@ -283,3 +283,7 @@ Every account feature exists for both tools. Where a concept has no counterpart,
 | Title after a move                        | travels with the transcript                              | the `/rename` name is appended to the new dir's `session_index.jsonl` (the legacy index Codex still honours; ccr never writes its sqlite catalog) — best effort |
 | Per-launch account selection              | `CLAUDE_CONFIG_DIR` set on the process                   | `CODEX_HOME` set on the process; the desktop app cannot be given one, it always runs as the default account |
 | Delete a conversation                     | transcript + sidecar removed                             | `codex delete <id>`                                              |
+| Running flag                              | registry `<dir>/sessions/<pid>.json`, pid alive on this host | process scan for `codex resume <id>` command lines              |
+| Open on another PC (`@host`)              | the registry's `pidDomain` host, when the dir is synced  | **not applicable** — Codex writes no per-process registry, and `~/.codex` is normally not synced |
+| Background session (`bg`)                 | registry `kind=bg` (`claude --bg`)                       | **not applicable** — Codex has no background kind                |
+| Close a running conversation (`Ctrl+X`)   | `claude stop <jobId>` for a background session, else the process | the process (Codex has no `stop` command); only sessions started as `codex resume <id>` expose a pid |

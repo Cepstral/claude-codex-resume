@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.59'
+$script:CcrVersion = '0.60'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -504,8 +504,8 @@ function Remove-CcrAccount {
         $dst = @($roots | Where-Object Default)[0]
         if ($dst.Label -eq $Label) { throw "ccr: '$Label' is the default $t account - it cannot be removed; turn multi-account mode off instead" }
         $sessions = @(if ($t -eq 'claude') { Get-CcrClaudeSession -Root $src[0] } else { Get-CcrCodexSession -Root $src[0] })
-        $running = @($sessions | Where-Object Running)
-        if ($running.Count) { throw "ccr: $($running.Count) $t session(s) of '$Label' are running - close them first" }
+        $running = @($sessions | Where-Object { $_.Running -or $_.RunningOn })
+        if ($running.Count) { throw "ccr: $($running.Count) $t session(s) of '$Label' are running (here or on another PC) - close them first" }
         [pscustomobject]@{ Tool = $t; Src = $src[0]; Dst = $dst; Sessions = $sessions }
     }
     if (-not $plan) { throw "ccr: no account '$Label' configured" }
@@ -542,18 +542,45 @@ function Disable-CcrMultiAccount {
     Write-Host 'ccr: multi-account mode is off - claude and codex are back to their single default dirs.' -ForegroundColor Green
 }
 
-# sessionId -> live claude process id (stale pid files filtered out).
+# A conversation open on another PC is shown for this many days after the
+# last update of its registry entry. Claude writes no heartbeat (the entry
+# only changes with the status), so the cap is generous; a crashed session
+# on the other PC ages out instead of lingering forever.
+$script:CcrRemoteRunDays = 7
+
+function Get-CcrHostName([string]$Name) { ("$Name" -split '\.')[0].ToLowerInvariant() }
+
+# sessionId -> who runs it, from claude's per-process registry
+# (<dir>\sessions\<pid>.json: pid, sessionId, kind, status, updatedAt and
+# pidDomain = "<platform>:<host>"). The dir may be synced between PCs, so an
+# entry is only probed as a local pid when its host is this machine (or
+# absent, older claude): a foreign pid can coincide with a local one.
+# Returns @{ Pid; Local; Host; Kind; Status; UpdatedUtc } per session id;
+# stale local entries and expired remote ones are left out.
 function Get-CcrClaudeRunningMap {
     param([string]$RootPath = (Get-CcrClaudeRoot))
     $map = @{}
     $dir = Join-Path $RootPath 'sessions'
     if (-not (Test-Path -LiteralPath $dir)) { return $map }
+    $me = Get-CcrHostName ([Environment]::MachineName)
+    $epoch = [datetime]::new(1970, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)
     foreach ($f in Get-ChildItem -LiteralPath $dir -Filter *.json -File -ErrorAction SilentlyContinue) {
         if ($f.BaseName -notmatch '^\d+$') { continue }
         try {
             $o = Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json
-            if ($o.sessionId -and (Get-Process -Id $o.pid -ErrorAction SilentlyContinue)) {
-                $map[$o.sessionId] = [int]$o.pid
+            if (-not $o.sessionId) { continue }
+            $domHost = if ("$($o.pidDomain)" -match ':') { Get-CcrHostName (("$($o.pidDomain)" -split ':', 2)[1]) } else { '' }
+            $updated = $f.LastWriteTimeUtc
+            foreach ($ms in $o.updatedAt, $o.statusUpdatedAt) {
+                if ($ms) { $t = $epoch.AddMilliseconds([double]$ms); if ($t -gt $updated) { $updated = $t } }
+            }
+            $info = [pscustomobject]@{ Pid = [int]$o.pid; Local = $true; Host = $domHost; Kind = "$($o.kind)"; Status = "$($o.status)"; UpdatedUtc = $updated; JobId = "$($o.jobId)" }
+            if (-not $domHost -or $domHost -eq $me) {
+                if (Get-Process -Id $o.pid -ErrorAction SilentlyContinue) { $map[$o.sessionId] = $info }
+            }
+            elseif (([datetime]::UtcNow - $updated).TotalDays -le $script:CcrRemoteRunDays) {
+                $info.Local = $false
+                if (-not $map.ContainsKey($o.sessionId)) { $map[$o.sessionId] = $info }   # a local entry wins
             }
         }
         catch { }
@@ -691,8 +718,15 @@ function Get-CcrClaudeSession {
                 Title          = $title
                 Cwd            = $cwd
                 LastActivity   = $last
-                Running        = $running.ContainsKey($id)
-                ProcessId      = $running[$id]
+                Running        = [bool]($running[$id] -and $running[$id].Local)
+                ProcessId      = $(if ($running[$id] -and $running[$id].Local) { $running[$id].Pid })
+                # Open on another PC (the registry entry of a synced dir): the
+                # host, '' otherwise. RunKind 'bg' = a claude background session.
+                RunningOn      = $(if ($running[$id] -and -not $running[$id].Local) { $running[$id].Host } else { '' })
+                RunKind        = $(if ($running[$id]) { $running[$id].Kind } else { '' })
+                RunStatus      = $(if ($running[$id]) { $running[$id].Status } else { '' })
+                RunUpdated     = $(if ($running[$id]) { $running[$id].UpdatedUtc })
+                RunJobId       = $(if ($running[$id]) { $running[$id].JobId } else { '' })
                 Source         = $file.FullName
                 Root           = $Root.Label
                 RootPath       = $Root.Path
@@ -931,6 +965,13 @@ function Get-CcrCodexSession {
             LastActivity = $file.LastWriteTimeUtc   # resume appends to the original file
             Running      = $running.ContainsKey($id)
             ProcessId    = $running[$id]
+            # Same fields as claude rows; codex writes no per-process registry,
+            # so "open on another PC" and the background kind never apply.
+            RunningOn    = ''
+            RunKind      = ''
+            RunStatus    = ''
+            RunUpdated   = $null
+            RunJobId     = ''
             Source       = $file.FullName
             Root         = $Root.Label
             RootPath     = $Root.Path
@@ -1181,6 +1222,84 @@ function Remove-CcrSessionData {
     $sidecar = Join-Path (Split-Path -Parent $Session.Source) $Session.SessionId
     if (Test-Path -LiteralPath $sidecar) { Remove-Item -LiteralPath $sidecar -Recurse -Force }
     $true
+}
+
+# Close a conversation that runs on this machine; the transcript is never
+# touched. A claude background session goes through claude's own
+# `claude stop <id>` (its account dir selected); anything else - and a stop
+# that did not work - by ending the process tree, politely first, then by
+# force after 3 s. Returns $true when the process is gone.
+function Stop-CcrSession {
+    param([Parameter(Mandatory)][object]$Session)
+    $procId = $Session.ProcessId
+    function Wait-CcrGone([int]$Id, [int]$Ms) {
+        for ($w = 0; $w -lt $Ms; $w += 200) { if (-not (Get-Process -Id $Id -ErrorAction SilentlyContinue)) { return $true }; Start-Sleep -Milliseconds 200 }
+        -not (Get-Process -Id $Id -ErrorAction SilentlyContinue)
+    }
+    if ($Session.Tool -eq 'claude' -and $Session.RunKind -eq 'bg') {
+        $prev = $env:CLAUDE_CONFIG_DIR
+        if ($Session.RootPath) { $env:CLAUDE_CONFIG_DIR = $Session.RootPath }
+        try {
+            # `claude stop` takes the short job id (what `claude --bg` prints and
+            # the registry keeps as jobId), not the session id: the first eight
+            # characters of it when the entry predates jobId.
+            $job = if ($Session.RunJobId) { $Session.RunJobId } else { "$($Session.SessionId)".Substring(0, [Math]::Min(8, "$($Session.SessionId)".Length)) }
+            $null = & claude stop $job 2>&1
+            if ($LASTEXITCODE -eq 0 -and (-not $procId -or (Wait-CcrGone $procId 3000))) { return $true }
+        }
+        catch { }
+        finally { $env:CLAUDE_CONFIG_DIR = $prev }
+    }
+    if (-not $procId) { return $false }
+    if ($IsWindows) { $null = & taskkill /PID $procId /T 2>&1 } else { $null = & kill -TERM $procId 2>&1 }
+    if (($LASTEXITCODE -eq 0) -and (Wait-CcrGone $procId 3000)) { return $true }
+    if ($IsWindows) { $null = & taskkill /PID $procId /T /F 2>&1 } else { $null = & kill -KILL $procId 2>&1 }
+    Wait-CcrGone $procId 3000
+}
+
+# Full-screen confirmation before closing a running conversation.
+function Show-CcrCloseConfirm {
+    param([Parameter(Mandatory)][object]$Session)
+    $dot = [char]0x00B7
+    $kind = if ($Session.RunKind -eq 'bg') { 'background session' } elseif ($Session.RunKind) { "$($Session.RunKind) session" } else { 'session' }
+    $how = if ($Session.Tool -eq 'claude' -and $Session.RunKind -eq 'bg') { "'claude stop' first, then the process" } else { 'ends the process (politely first, by force after 3 s)' }
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $lines.Add('')
+    $lines.Add("  `e[33mClose this running conversation?`e[39m")
+    $lines.Add('')
+    $lines.Add("    $($Session.Tool) $dot `e[1m$($Session.Title)`e[22m")
+    $lines.Add("    folder:  $($Session.Cwd)")
+    $lines.Add("    process: pid $($Session.ProcessId) $dot $kind$(if ($Session.RunStatus) { " $dot status $($Session.RunStatus)" })")
+    if ($Session.RunStatus -eq 'busy') { $lines.Add("    `e[31mit is working right now - closing interrupts that turn`e[39m") }
+    $lines.Add('')
+    $lines.Add("  `e[2m$how. The conversation is kept: ccr lists it by age again and it can be resumed.`e[22m")
+    $lines.Add('')
+    $lines.Add("  `e[33m[y]`e[39m close    `e[2many other key: cancel`e[22m")
+    Write-CcrScreen $lines
+    $k = [Console]::ReadKey($true)
+    ($k.KeyChar -eq 'y' -or $k.KeyChar -eq 'Y')
+}
+
+# Confirmation before opening conversations that are open on another PC.
+function Show-CcrElsewhereConfirm {
+    param([Parameter(Mandatory)][object[]]$Sessions)
+    $dot = [char]0x00B7
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $lines.Add('')
+    $lines.Add("  `e[33mOpen on another PC`e[39m")
+    $lines.Add('')
+    foreach ($s in $Sessions) {
+        $ago = if ($s.RunUpdated) { ", last update $(Format-CcrAge $s.RunUpdated) ago" } else { '' }
+        $lines.Add("    $($s.Tool) $dot `e[1m$($s.Title)`e[22m  `e[33m@$($s.RunningOn)`e[39m `e[2m($(if ($s.RunStatus) { $s.RunStatus } else { 'open' })$ago)`e[22m")
+    }
+    $lines.Add('')
+    $lines.Add("  Opening it here too makes two processes append to the same transcript.")
+    $lines.Add("  Close it on the other PC first, unless that entry is a leftover of a crash.")
+    $lines.Add('')
+    $lines.Add("  `e[33m[y]`e[39m open anyway    `e[2many other key: back to the list`e[22m")
+    Write-CcrScreen $lines
+    $k = [Console]::ReadKey($true)
+    ($k.KeyChar -eq 'y' -or $k.KeyChar -eq 'Y')
 }
 
 # Re-home a conversation: move its files into another account's data dir.
@@ -1860,7 +1979,7 @@ function Select-CcrSession {
             # --- refilter (recomputed every pass; cheap at <= 500 rows) ---
             $view = if ($filter) {
                 @($Sessions | Where-Object {
-                        ("$($_.Tool) $($_.Root) $($_.Title) $($_.Cwd)$(if ($_.Cleared) { ' cleared' })").IndexOf($filter, [StringComparison]::OrdinalIgnoreCase) -ge 0
+                        ("$($_.Tool) $($_.Root) $($_.Title) $($_.Cwd)$(if ($_.Cleared) { ' cleared' })$(if ($_.Running) { ' run' })$(if ($_.Running -and $_.RunKind -eq 'bg') { ' bg' })$(if ($_.RunningOn) { " elsewhere @$($_.RunningOn)" })").IndexOf($filter, [StringComparison]::OrdinalIgnoreCase) -ge 0
                     })
             }
             else { $Sessions }
@@ -1929,12 +2048,12 @@ function Select-CcrSession {
                     $line += "  `e[2m$($e.Who.PadRight($whoW))`e[22m"
                     [void]$sb.Append($line).Append("`e[K`n")
                 }
-                $hint = "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space cycles the account (dot = as is) $([char]0x00B7) Enter open $([char]0x00B7) Ctrl+N new $([char]0x00B7) Ctrl+A accounts $([char]0x00B7) Ctrl+K usage $([char]0x00B7) Ctrl+J details $([char]0x00B7) Del delete $([char]0x00B7) Esc cancel $([char]0x00B7) v$script:CcrVersion"
+                $hint = "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space cycles the account (dot = as is) $([char]0x00B7) Enter open $([char]0x00B7) Ctrl+N new $([char]0x00B7) Ctrl+A accounts $([char]0x00B7) Ctrl+K usage $([char]0x00B7) Ctrl+J details $([char]0x00B7) Ctrl+X close $([char]0x00B7) Del delete $([char]0x00B7) Esc cancel $([char]0x00B7) v$script:CcrVersion"
                 if ($hint.Length -gt $w - 1) { $hint = $hint.Substring(0, $w - 1) }
                 [void]$sb.Append("`e[2m").Append($hint).Append("`e[22m`e[K")
             }
             else {
-                $hint = "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space mark $([char]0x00B7) Enter open $([char]0x00B7) Ctrl+N new $([char]0x00B7) Del delete $([char]0x00B7) Ctrl+A accounts $([char]0x00B7) Ctrl+K usage $([char]0x00B7) Ctrl+J details $([char]0x00B7) Esc cancel $([char]0x00B7) type to filter $([char]0x00B7) v$script:CcrVersion"
+                $hint = "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space mark $([char]0x00B7) Enter open $([char]0x00B7) Ctrl+N new $([char]0x00B7) Del delete $([char]0x00B7) Ctrl+A accounts $([char]0x00B7) Ctrl+K usage $([char]0x00B7) Ctrl+J details $([char]0x00B7) Ctrl+X close $([char]0x00B7) Esc cancel $([char]0x00B7) type to filter $([char]0x00B7) v$script:CcrVersion"
                 if ($hint.Length -gt $w - 1) { $hint = $hint.Substring(0, $w - 1) }
                 [void]$sb.Append("`e[2m").Append($hint).Append("`e[22m`e[K")
             }
@@ -1964,7 +2083,11 @@ function Select-CcrSession {
                 elseif ($acct.ContainsKey($key) -or $sel.Contains($key)) { "`e[32m$([char]0x25CF)`e[39m" }
                 else { ' ' }
                 $toolColor = if ($s.Tool -eq 'claude') { "`e[38;5;208m" } else { "`e[36m" }
-                $age = if ($s.Running) { "`e[31m" + 'run'.PadLeft(6) + "`e[39m" } else { (Format-CcrAge $s.LastActivity).PadLeft(6) }
+                # Age column: red "run" = running here ("bg" = a claude
+                # background session), yellow "@host" = open on another PC.
+                $age = if ($s.Running) { "`e[31m" + $(if ($s.RunKind -eq 'bg') { 'bg' } else { 'run' }).PadLeft(6) + "`e[39m" }
+                elseif ($s.RunningOn) { $h = "@$($s.RunningOn)"; "`e[33m" + $h.Substring(0, [Math]::Min(6, $h.Length)).PadLeft(6) + "`e[39m" }
+                else { (Format-CcrAge $s.LastActivity).PadLeft(6) }
                 # Usage column (Ctrl+K): total tokens in the window and, in
                 # parentheses, the session's share of the window's tokens
                 # across the listed sessions; blank when it had no turn in it.
@@ -2054,6 +2177,24 @@ function Select-CcrSession {
                 [void][Console]::ReadKey($true)
                 return [pscustomobject]@{ Restart = $true; Filter = $filter }
             }
+            if ($k.Key -eq [ConsoleKey]::X -and $ctrl) {
+                # Ctrl+X: close the running conversation of the highlighted row
+                # (a stray background session, a forgotten tab). Kept on disk.
+                if ($view.Count -gt 0) {
+                    $s = $view[$cursor]
+                    if ($s.RunningOn) { Show-CcrNotice "ccr: '$($s.Title)' is open on $($s.RunningOn) - close it there." '33' }
+                    elseif (-not $s.Running) { Show-CcrNotice "ccr: '$($s.Title)' is not running - nothing to close." '33' }
+                    elseif (Show-CcrCloseConfirm -Session $s) {
+                        if ($WhatIfPreference) { Show-CcrNotice "WhatIf: would close '$($s.Title)' (pid $($s.ProcessId))." '33' }
+                        else {
+                            [Console]::Write("`e[H`e[33mccr: closing '$($s.Title)'...`e[39m`e[K")
+                            if (Stop-CcrSession -Session $s) { $s.Running = $false; $s.ProcessId = $null; $s.RunKind = '' }
+                            else { Show-CcrNotice "ccr: could not close '$($s.Title)' (pid $($s.ProcessId))." }
+                        }
+                    }
+                }
+                continue
+            }
             if ($k.Key -eq [ConsoleKey]::K -and $ctrl) {
                 # Ctrl+K: the usage column on/off. Turning it on reads the
                 # transcripts written inside the window (once per picker).
@@ -2122,14 +2263,20 @@ function Select-CcrSession {
                         if ($acct.ContainsKey($key)) { $s | Add-Member -NotePropertyName TargetRoot -NotePropertyValue $acct[$key] -Force; $marked += $s }
                         elseif ($sel.Contains($key)) { $s | Add-Member -NotePropertyName TargetRoot -NotePropertyValue $null -Force; $marked += $s }
                     }
-                    if ($marked.Count -gt 0) { return $marked }
-                    if ($view.Count -gt 0) { return @($view[$cursor]) }   # bare Enter: cursor row
+                    $toOpen = if ($marked.Count -gt 0) { $marked } elseif ($view.Count -gt 0) { @($view[$cursor]) } else { @() }   # bare Enter: cursor row
+                    # A conversation open on another PC: ask first - two
+                    # processes would append to the same transcript.
+                    $elsewhere = @($toOpen | Where-Object { $_.RunningOn })
+                    if ($toOpen.Count -gt 0 -and ($elsewhere.Count -eq 0 -or (Show-CcrElsewhereConfirm -Sessions $elsewhere))) { return $toOpen }
                 }
                 'Delete' {
                     if ($view.Count -gt 0) {
                         $victim = $view[$cursor]
                         if ($victim.Running) {
-                            Show-CcrNotice "ccr: '$($victim.Title)' is running right now - close that tab first."
+                            Show-CcrNotice "ccr: '$($victim.Title)' is running right now - close it first (Ctrl+X)."
+                        }
+                        elseif ($victim.RunningOn) {
+                            Show-CcrNotice "ccr: '$($victim.Title)' is open on $($victim.RunningOn) - close it there first."
                         }
                         elseif (Show-CcrDeleteConfirm -Session $victim) {
                             if ($WhatIfPreference) {
@@ -2454,6 +2601,17 @@ function Resume-CcSessions {
         opens each row under the chosen account, moving the conversation
         into that account's dir first when it differs (both claude and
         codex; running sessions are refused).
+    .EXAMPLE
+        ccr   then Ctrl+X
+        Close the running conversation of the highlighted row (a stray
+        background session, a forgotten tab). The age column shows red
+        "run" for a conversation running on this PC, red "bg" for a claude
+        background session, and yellow "@host" for one open on another PC
+        that shares the data dir (claude's registry records the host).
+        Ctrl+X confirms (pid, kind, status), then stops a background
+        session with `claude stop`, anything else by ending its process;
+        the conversation is kept. "@host" rows cannot be closed, deleted
+        or moved from here, and Enter asks before opening one.
     .EXAMPLE
         ccr   then Ctrl+K / Ctrl+J
         Token usage. Ctrl+K adds a column with each session's total tokens
@@ -2794,6 +2952,7 @@ function Resume-CcSessions {
             $moveTo = @($pool | Where-Object { $_.Label -eq $tgt } | Select-Object -First 1)[0]
             if (-not $moveTo) { Write-Warning "ccr: no $($s.Tool) dir for account '$tgt' - '$($s.Title)' stays under '$($s.Root)'" }
             elseif ($s.Running) { Write-Warning "ccr: '$($s.Title)' is running - close it before moving it to '$tgt'; skipped"; continue }
+            elseif ($s.RunningOn) { Write-Warning "ccr: '$($s.Title)' is open on $($s.RunningOn) - close it there before moving it to '$tgt'; skipped"; continue }
             else { $rootPath = $moveTo.Path }
         }
         $launch.Add([pscustomobject]@{ Tool = $s.Tool; Title = $s.Title; Cwd = $cwd; Command = $cmd; RootPath = $rootPath; Session = $s; MoveTo = $moveTo })

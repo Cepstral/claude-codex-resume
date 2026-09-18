@@ -18,6 +18,8 @@ import os
 import re
 import shlex
 import shutil
+import signal
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -30,7 +32,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.59"
+VERSION = "0.60"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -204,12 +206,17 @@ def fmt_cwd(path: str, maxlen: int) -> str:
 def pid_alive(pid: int) -> bool:
     if os.name == "nt":
         # os.kill(pid, 0) would TERMINATE the process on Windows.
+        # A handle alone is not proof: a process that has exited stays
+        # openable while anyone holds a handle to it. Ask for the exit code.
         k32 = ctypes.windll.kernel32
         h = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
-        if h:
+        if not h:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            return bool(k32.GetExitCodeProcess(h, ctypes.byref(code))) and code.value == 259  # STILL_ACTIVE
+        finally:
             k32.CloseHandle(h)
-            return True
-        return False
     try:
         os.kill(pid, 0)
         return True
@@ -236,7 +243,10 @@ def user_text(obj):
 class Session:
     __slots__ = ("tool", "id", "title", "cwd", "last", "running", "pid", "source",
                  "started_at", "started_by_clear", "head_bridge", "tail_bridge", "cleared",
-                 "origin", "root", "root_path", "target_root")
+                 "origin", "root", "root_path", "target_root",
+                 # claude registry: open on another PC (host, "" otherwise), and the
+                 # kind ("bg" = a background session) / status / last update of the run
+                 "running_on", "run_kind", "run_status", "run_updated", "run_job")
 
     def __init__(self, **kw):
         for k in self.__slots__:
@@ -244,6 +254,9 @@ class Session:
         self.cleared = bool(self.cleared)
         self.origin = self.origin or "cli"
         self.root = self.root or ""
+        self.running_on = self.running_on or ""
+        self.run_kind = self.run_kind or ""
+        self.run_status = self.run_status or ""
 
     @property
     def key(self):
@@ -612,9 +625,10 @@ def remove_account(label: str, tool: str = "all"):
             raise RuntimeError(f"ccr: '{label}' is the default {t} account - it cannot be removed; "
                                "turn multi-account mode off instead")
         sessions = claude_sessions(src[0]) if t == "claude" else codex_sessions(src[0])
-        running = [s for s in sessions if s.running]
+        running = [s for s in sessions if s.running or s.running_on]
         if running:
-            raise RuntimeError(f"ccr: {len(running)} {t} session(s) of '{label}' are running - close them first")
+            raise RuntimeError(f"ccr: {len(running)} {t} session(s) of '{label}' are running (here or on another PC) "
+                               "- close them first")
         plan.append((t, src[0], dst, sessions))
     if not plan:
         raise RuntimeError(f"ccr: no account '{label}' configured")
@@ -720,20 +734,53 @@ def add_codex_index_name(root_path: str, sid: str, name: str):
 # ----------------------------------------------------------------------------
 # claude enumerator
 # ----------------------------------------------------------------------------
+# A conversation open on another PC is shown for this many days after the
+# last update of its registry entry. Claude writes no heartbeat (the entry
+# only changes with the status), so the cap is generous; a crashed session
+# on the other PC ages out instead of lingering forever.
+REMOTE_RUN_DAYS = 7
+
+
+def host_name(name: str) -> str:
+    return str(name or "").split(".")[0].lower()
+
+
 def claude_running(root_path: str) -> dict:
-    """sessionId -> live claude pid (stale pid files filtered out)."""
+    """sessionId -> who runs it, from claude's per-process registry
+    (<dir>/sessions/<pid>.json: pid, sessionId, kind, status, updatedAt and
+    pidDomain = "<platform>:<host>"). The dir may be synced between PCs, so
+    an entry is only probed as a local pid when its host is this machine (or
+    absent, older claude): a foreign pid can coincide with a local one.
+    Returns {pid, local, host, kind, status, updated} per session id; stale
+    local entries and expired remote ones are left out."""
     m = {}
     d = Path(root_path) / "sessions"
     if not d.is_dir():
         return m
+    me = host_name(socket.gethostname())
     for f in d.glob("*.json"):
         if not f.stem.isdigit():
             continue
         try:
             o = json.loads(f.read_text(encoding="utf-8"))
             pid, sid = int(o.get("pid") or 0), o.get("sessionId")
-            if sid and pid and pid_alive(pid):
-                m[sid] = pid
+            if not sid or not pid:
+                continue
+            dom = str(o.get("pidDomain") or "")
+            dom_host = host_name(dom.split(":", 1)[1]) if ":" in dom else ""
+            updated = mtime_utc(f)
+            for ms in (o.get("updatedAt"), o.get("statusUpdatedAt")):
+                if ms:
+                    t = datetime.fromtimestamp(float(ms) / 1000, tz=timezone.utc)
+                    updated = max(updated, t)
+            info = {"pid": pid, "local": True, "host": dom_host, "kind": str(o.get("kind") or ""),
+                    "status": str(o.get("status") or ""), "updated": updated, "job": str(o.get("jobId") or "")}
+            if not dom_host or dom_host == me:
+                if pid_alive(pid):
+                    m[sid] = info
+            elif datetime.now(timezone.utc) - updated <= timedelta(days=REMOTE_RUN_DAYS):
+                info["local"] = False
+                m.setdefault(sid, info)   # a local entry wins
         except Exception:
             pass
     return m
@@ -850,8 +897,13 @@ def claude_one(f: Path, running: dict, history, root: Root):
     if fm:
         started = parse_ts(fm.group(1))
 
+    ri = running.get(sid) or {}
     return Session(tool="claude", id=sid, title=title, cwd=cwd, last=last,
-                   running=sid in running, pid=running.get(sid), source=str(f),
+                   running=bool(ri.get("local")), pid=ri.get("pid") if ri.get("local") else None,
+                   running_on="" if ri.get("local", True) else ri.get("host", ""),
+                   run_kind=ri.get("kind", ""), run_status=ri.get("status", ""), run_updated=ri.get("updated"),
+                   run_job=ri.get("job", ""),
+                   source=str(f),
                    started_at=started, started_by_clear=started_by_clear,
                    head_bridge=bh[0] if bh else None,
                    tail_bridge=bt[-1] if bt else (bh[-1] if bh else None),
@@ -1178,7 +1230,14 @@ def session_rows(sessions, index, ctx: Ctx, usage: dict = None):
     for i, s in enumerate(sessions):
         index[str(i)] = s
         color = TOOL_COLOR[s.tool]
-        age = f"{RED}{'run':>6}{RESET}" if s.running else f"{fmt_age(s.last):>6}"
+        # Age column: red "run" = running here ("bg" = a claude background
+        # session), yellow "@host" = open on another PC.
+        if s.running:
+            age = f"{RED}{'bg' if s.run_kind == 'bg' else 'run':>6}{RESET}"
+        elif s.running_on:
+            age = f"{YELLOW}{('@' + s.running_on)[:6]:>6}{RESET}"
+        else:
+            age = f"{fmt_age(s.last):>6}"
         title = s.title if len(s.title) <= 50 else s.title[:49] + "…"
         tag = f" {YELLOW}(cleared){RESET}" if s.cleared else ""
         # Tool column, padded on the plain text (the colors are zero-width).
@@ -1200,10 +1259,15 @@ def session_rows(sessions, index, ctx: Ctx, usage: dict = None):
             use = f" {YELLOW}{fmt_tokens(u.total):>6} {fmt_share(u.total, usage_sum):>6}{RESET}" if u else " " * 14
         disp = f"{tool}{acct}{age}{use}  {title}{tag}  {DIM}{fmt_cwd(s.cwd, 50)}{RESET}"
         extra = ((" cleared" if s.cleared else "") + (" run" if s.running else "")
+                 + (" bg" if s.running and s.run_kind == "bg" else "")
+                 + (f" elsewhere @{s.running_on}" if s.running_on else "")
                  + (" app" if app else ""))  # filter words
         how = (f"opens in: Codex app (codex://threads/{s.id})" if app
                else f"opens in: terminal ({resume_argv(s)[0]} …)")
         where = f"\\naccount: {s.root} ({fmt_cwd(s.root_path, 40)})" if ctx.multi_root else ""
+        if s.running_on:
+            where += (f"\\nopen on: {s.running_on} ({s.run_status or 'open'}"
+                      + (f", updated {fmt_age(s.run_updated)} ago" if s.run_updated else "") + ")")
         prev = (f"{s.tool} · {s.title}\\nfolder: {s.cwd}{where}\\n{how}\\nlast: "
                 f"{s.last.astimezone():%Y-%m-%d %H:%M}   id: {s.id}").replace("\t", " ")
         rows.append(f"{i}\t{disp}{DIM}{extra}{RESET}\t{prev}")
@@ -1220,7 +1284,7 @@ def picker_hint(ctx: Ctx, upd_note: str = "") -> str:
     if ctx.multi_root:
         keys.append(("Ctrl-O", "open under another account"))
     keys += [("Ctrl-N", "new"), ("Ctrl-A", "accounts"), ("Ctrl-K", "usage"), ("Ctrl-J", "details"),
-             ("Del", "delete"), ("Esc", "cancel")]
+             ("Ctrl-X", "close"), ("Del", "delete"), ("Esc", "cancel")]
     lines.append(hint(*keys))
     words = f"{DIM},{RESET} ".join(f"{CYAN}{w}{RESET}" for w in ("run", "cleared", "app"))
     filters = f"{DIM}type to filter — {RESET}{words}{DIM} match as words{RESET}"
@@ -1615,6 +1679,80 @@ def usage_split(s: Session, all_: list):
 
 
 # ----------------------------------------------------------------------------
+# close a running conversation (Ctrl-X), open-elsewhere confirmation
+# ----------------------------------------------------------------------------
+def _gone(pid: int, seconds: float) -> bool:
+    end = time.time() + seconds
+    while time.time() < end:
+        if not pid_alive(pid):
+            return True
+        time.sleep(0.2)
+    return not pid_alive(pid)
+
+
+def stop_session(s: Session) -> bool:
+    """Close a conversation that runs on this machine; the transcript is
+    never touched. A claude background session goes through claude's own
+    `claude stop <id>` (its account dir selected); anything else - and a stop
+    that did not work - by ending the process, politely first, then by force
+    after 3 s. True when the process is gone."""
+    pid = s.pid
+    if s.tool == "claude" and s.run_kind == "bg":
+        try:
+            # `claude stop` takes the short job id (what `claude --bg` prints and
+            # the registry keeps as jobId), not the session id: the first eight
+            # characters of it when the entry predates jobId.
+            env = tool_env("claude", s.root_path) if s.root_path else None
+            r = subprocess.run(["claude", "stop", s.run_job or str(s.id)[:8]], capture_output=True, env=env, timeout=30)
+            if r.returncode == 0 and (not pid or _gone(pid, 3)):
+                return True
+        except Exception:
+            pass
+    if not pid:
+        return False
+    try:
+        if os.name == "nt":
+            if subprocess.run(["taskkill", "/PID", str(pid), "/T"], capture_output=True).returncode == 0 and _gone(pid, 3):
+                return True
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True)
+        else:
+            os.kill(pid, signal.SIGTERM)
+            if _gone(pid, 3):
+                return True
+            os.kill(pid, signal.SIGKILL)
+    except (OSError, ProcessLookupError):
+        pass
+    return _gone(pid, 3)
+
+
+def confirm_close(s: Session) -> bool:
+    kind = "background session" if s.run_kind == "bg" else (f"{s.run_kind} session" if s.run_kind else "session")
+    how = ("'claude stop' first, then the process" if s.tool == "claude" and s.run_kind == "bg"
+           else "ends the process (politely first, by force after 3 s)")
+    print(f"\n{YELLOW}Close this running conversation?{RESET}\n")
+    print(f"    {s.tool} · {BOLD}{s.title}{RESET}")
+    print(f"    folder:  {s.cwd}")
+    print(f"    process: pid {s.pid} · {kind}" + (f" · status {s.run_status}" if s.run_status else ""))
+    if s.run_status == "busy":
+        print(f"    {RED}it is working right now - closing interrupts that turn{RESET}")
+    print(f"\n  {DIM}{how}. The conversation is kept: ccr lists it by age again and it can be resumed.{RESET}")
+    ans = ask(f"  {YELLOW}[y]{RESET} close    {DIM}anything else: cancel{RESET} > ")
+    return bool(ans) and ans.strip().lower() == "y"
+
+
+def confirm_elsewhere(sessions: list) -> bool:
+    """Before opening conversations that are open on another PC."""
+    print(f"\n{YELLOW}Open on another PC{RESET}\n")
+    for s in sessions:
+        ago = f", last update {fmt_age(s.run_updated)} ago" if s.run_updated else ""
+        print(f"    {s.tool} · {BOLD}{s.title}{RESET}  {YELLOW}@{s.running_on}{RESET} {DIM}({s.run_status or 'open'}{ago}){RESET}")
+    print("\n  Opening it here too makes two processes append to the same transcript.")
+    print("  Close it on the other PC first, unless that entry is a leftover of a crash.\n")
+    ans = ask(f"  {YELLOW}[y]{RESET} open anyway    {DIM}anything else: back to the list{RESET} > ")
+    return bool(ans) and ans.strip().lower() == "y"
+
+
+# ----------------------------------------------------------------------------
 # delete
 # ----------------------------------------------------------------------------
 def remove_session_data(s: Session) -> bool:
@@ -1845,6 +1983,10 @@ def launch(picked: list, new_window: bool, dry: bool, ctx: Ctx, terminal: bool =
                 print(f"ccr: no {s.tool} dir for account '{tgt}' - '{s.title}' stays under '{s.root}'", file=sys.stderr)
             elif s.running:
                 print(f"ccr: '{s.title}' is running - close it before moving it to '{tgt}'; skipped", file=sys.stderr)
+                continue
+            elif s.running_on:
+                print(f"ccr: '{s.title}' is open on {s.running_on} - close it there before moving it to '{tgt}'; skipped",
+                      file=sys.stderr)
                 continue
             else:
                 root_path = move_to.path
@@ -2438,7 +2580,7 @@ def main():
             index = {}
             rows = session_rows(sessions, index, ctx, usage_of if usage_on else None)
             res = run_fzf(rows, picker_hint(ctx, upd_note), query=query,
-                          expect=["del", "ctrl-n", "ctrl-a", "ctrl-o", "ctrl-k", "ctrl-j"])
+                          expect=["del", "ctrl-n", "ctrl-a", "ctrl-o", "ctrl-k", "ctrl-j", "ctrl-x"])
             if res is None:
                 print("ccr: cancelled.")
                 return
@@ -2475,12 +2617,37 @@ def main():
                     restart = True
                     upd_note = ""   # the banner is for the first listing only
                 continue
+            if key == "ctrl-x":
+                # Close the running conversation of the highlighted row (a stray
+                # background session, a forgotten tab). Kept on disk.
+                if picked:
+                    s = picked[0]
+                    if s.running_on:
+                        print(f"{YELLOW}ccr: '{s.title}' is open on {s.running_on} - close it there.{RESET}")
+                        pause("(Enter to continue)")
+                    elif not s.running:
+                        print(f"{YELLOW}ccr: '{s.title}' is not running - nothing to close.{RESET}")
+                        pause("(Enter to continue)")
+                    elif confirm_close(s):
+                        if a.dry_run:
+                            print(f"dry-run: would close '{s.title}' (pid {s.pid})")
+                            pause("(Enter to continue)")
+                        elif stop_session(s):
+                            s.running, s.pid, s.run_kind = False, None, ""
+                        else:
+                            print(f"ccr: could not close '{s.title}' (pid {s.pid}).", file=sys.stderr)
+                            pause("(Enter to continue)")
+                continue
             if key == "del":
                 if not picked:
                     continue
                 victim = picked[0]
                 if victim.running:
-                    print(f"ccr: '{victim.title}' is running right now - close that tab first.")
+                    print(f"ccr: '{victim.title}' is running right now - close it first (Ctrl-X).")
+                    pause("(Enter to continue)")
+                    continue
+                if victim.running_on:
+                    print(f"ccr: '{victim.title}' is open on {victim.running_on} - close it there first.")
                     pause("(Enter to continue)")
                     continue
                 if confirm_delete(victim):
@@ -2524,6 +2691,11 @@ def main():
                 lbl = next(r.label for n, t, r in ctx.entries if str(n) == res[1][0])
                 for s in picked:
                     s.target_root = lbl
+            # A conversation open on another PC: ask first - two processes
+            # would append to the same transcript.
+            elsewhere = [s for s in picked if s.running_on]
+            if elsewhere and not confirm_elsewhere(elsewhere):
+                continue
             launch(picked, a.new_window, a.dry_run, ctx, a.terminal, a.tabs)
             return
 

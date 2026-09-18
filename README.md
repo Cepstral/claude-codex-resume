@@ -100,11 +100,24 @@ ccr -WhatIf            # print the wt.exe command line, launch nothing
 | `Del` | **permanently delete** the highlighted conversation, after a full-screen confirmation showing title, folder, dates, size and the last prompt/reply. Claude: removes the transcript and its sidecar folder; Codex: goes through `codex delete` so the catalog stays consistent. Running sessions are refused. No undo. |
 | `Ctrl+K` | toggle a **token usage** column: each session's total tokens of the last 5 hours (`-UsageHours` changes the window) and, in parentheses, its share of those tokens across the listed sessions (`5.4M (90%)`). `ccr -Usage` starts with the column on, and `"usageColumn": true` / `"usageHours": 24` in `ccr.json` make that the default so nothing has to be typed. Read from the transcripts written in that window — Claude's per-turn usage blocks, Codex's per-turn `token_count` events. Sessions with no turn in the window stay blank; the order of the list does not change. Which sessions ate the quota is the question this answers. |
 | `Ctrl+J` | the **usage details** of the highlighted row: fresh input / cache write / cache read / output (thinking), the models used, a 30-minute timeline of the window, and — Codex only — the rate-limit meter the session saw at its last turn (5 h and 7 d). Claude Code does not record its meter, and the page says so. Below that, **the window split session by session**: every listed session with turns in it, largest first, with its share of the window's tokens. |
-| any character | filter (matches tool, title and path) |
+| `Ctrl+X` | **close** the running conversation of the highlighted row — a stray background session, a tab you forgot. After a confirmation (pid, kind, status, a warning when it is busy), a Claude background session is stopped with Claude's own `claude stop`, anything else by ending its process (politely first, by force after 3 s). The conversation itself is kept and can be resumed. Refused for a conversation open on another PC. |
+| any character | filter (matches tool, title and path; also the words `run`, `bg`, `cleared`, `elsewhere` and `@host`) |
 | `Backspace` | edit filter |
 | `Esc` | clear filter, then cancel |
 
+The age column doubles as the running flag: red **`run`** = running on this PC, red **`bg`** = a Claude background session (`claude --bg`) running here, yellow **`@host`** = open on another PC that shares the data dir. Enter on an `@host` row asks first, because two processes would append to the same transcript; Del and moving it to another account are refused until it is closed there.
+
 Selected sessions reopen with `claude --resume <id>` / `codex resume <id>`, each starting in the session's recorded working directory (Claude requires it; for Codex it keeps the agent's working root correct). The first selection resumes in the current tab; with a single selection `ccr` is simply "resume here". `-NewWindow` sends everything to a fresh window and leaves the current tab alone.
+
+## Several PCs on one OneDrive
+
+When the Claude data dirs live in a synced folder, ccr works across the PCs that share it, with two things to know.
+
+**The first listing on a new PC is slow, and OneDrive can fix that.** ccr reads a small head and tail of every listed transcript, but OneDrive's Files On-Demand downloads the *whole* file on any read, so the first run pulls every transcript. Tell OneDrive to keep those folders local: in Explorer, right-click each Claude data folder (`.claude`, `.claude-<label>`) → **Always keep on this device**; or from a terminal `attrib +P -U "<dir>" /S /D`. On macOS: Finder → right-click the folder → **Always Keep on This Device**. OneDrive then fetches everything once in the background and keeps new files local.
+
+**A conversation open on the other PC is labelled.** Claude registers every running process in `<dir>\sessions\<pid>.json`, host included, and that registry syncs too. ccr shows a yellow `@host` instead of the age, asks before opening such a conversation here, and refuses to delete or move it until it is closed there. A registry entry left behind by a crash on the other PC ages out after 7 days. Codex has no such registry, and its `~/.codex` is normally not synced.
+
+What travels with the synced script folder: the script, `ccr.json` (dirs under the home folder are written as `~\...`), and with it the accounts — an account added elsewhere reads `not on this PC` until you press `L` on the `Ctrl+A` page. What stays per machine: the auto-update record, and the Codex dirs.
 
 ## How it works
 
@@ -143,6 +156,7 @@ The installer puts `ccr` in `~/.local/bin` (tells you if that isn't on your PATH
 | `Ctrl-A` | the account page: turn multi-account mode on, add an account (`+`), log this machine in to one added elsewhere (`Ctrl-L`), remove one (`Del`), copy the default account's settings to one (`Ctrl-S`), turn the mode off (`X`). Same key and page as the PowerShell picker |
 | `Ctrl-N` | new conversation: folder → tool → name → account (when the tool has several). The folder list starts with **`here`** (the folder ccr runs in) and **`+ new folder`** (`Ctrl-O` jumps straight there) — type a path, `~` and relative paths welcome, and ccr offers to create it, so a brand-new project needs nothing prepared. The tool step offers **`codex app`** wherever the desktop app is installed. |
 | `Ctrl-K` · `Ctrl-J` | token usage: `Ctrl-K` toggles a column with each session's total tokens of the last 5 hours (`--usage-hours`) and its share in parentheses (`ccr --usage` starts with it on; `"usageColumn": true` / `"usageHours": 24` in `ccr.json` make that the default), `Ctrl-J` prints the details of the highlighted row (split, models, 30-minute timeline, Codex rate-limit meter) and the window split session by session with shares. Same data and wording as the PowerShell picker |
+| `Ctrl-X` | close the running conversation of the highlighted row after a confirmation: `claude stop` for a Claude background session, else the process (SIGTERM, SIGKILL after 3 s). The conversation is kept. Same key and rules as the PowerShell picker; the age column shows `run`, `bg` or `@host` the same way |
 | `Del` | delete the highlighted conversation after a confirmation |
 | `Esc` | cancel |
 
