@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.60'
+$script:CcrVersion = '0.61'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -1881,6 +1881,272 @@ function Select-CcrPath {
     }
 }
 
+# =============================================================================
+#  launch options: a model and an effort for the conversations being resumed
+# =============================================================================
+
+# Values go on command lines ccr writes for pwsh, sh and wt.exe: model ids and
+# effort levels only (letters, digits, . _ - : and a [1m] suffix).
+$script:CcrOptValueRe = '^[A-Za-z0-9._:\[\]-]{1,64}$'
+
+# Claude Code's effort levels (claude --help: --effort <level>).
+$script:CcrClaudeEfforts = @('low', 'medium', 'high', 'xhigh', 'max')
+
+# Codex levels for a model its cache does not describe.
+$script:CcrCodexEfforts = @('low', 'medium', 'high', 'xhigh')
+
+# What a tool is set to use when no flag is passed, read from the data dirs
+# the conversations will run under: claude settings.json (model,
+# effortLevel; PerModel when modelSettings sets efforts per model), codex
+# config.toml (top-level model, model_reasoning_effort). A value is '*' when
+# those dirs disagree and '' when none sets it.
+function Get-CcrConfiguredModel {
+    param([Parameter(Mandatory)][ValidateSet('claude', 'codex')][string]$Tool, [string[]]$RootPaths = @())
+    $models = [System.Collections.Generic.List[string]]::new()
+    $efforts = [System.Collections.Generic.List[string]]::new()
+    $perModel = $false
+    foreach ($p in @($RootPaths | Select-Object -Unique)) {
+        $m = ''; $e = ''
+        try {
+            if ($Tool -eq 'claude') {
+                $f = Join-Path $p 'settings.json'
+                if (Test-Path -LiteralPath $f) {
+                    $j = Get-Content -LiteralPath $f -Raw | ConvertFrom-Json
+                    $m = "$($j.model)"; $e = "$($j.effortLevel)"
+                    if ($j.modelSettings -and @($j.modelSettings.PSObject.Properties).Count) { $perModel = $true }
+                }
+            }
+            else {
+                $f = Join-Path $p 'config.toml'
+                if (Test-Path -LiteralPath $f) {
+                    foreach ($line in Get-Content -LiteralPath $f) {
+                        if ($line -match '^\s*\[') { break }   # top-level keys only
+                        if ($line -match '^\s*model\s*=\s*"([^"]*)"') { $m = $Matches[1] }
+                        elseif ($line -match '^\s*model_reasoning_effort\s*=\s*"([^"]*)"') { $e = $Matches[1] }
+                    }
+                }
+            }
+        }
+        catch { }
+        $models.Add($m); $efforts.Add($e)
+    }
+    $one = {
+        param($list)
+        $u = @($list | Select-Object -Unique)
+        if ($u.Count -eq 1) { $u[0] } elseif ($u.Count -gt 1) { '*' } else { '' }
+    }
+    [pscustomobject]@{ Model = (& $one $models); Effort = (& $one $efforts); PerModel = $perModel }
+}
+
+# The models offered for a tool, each @{ Value; Note; Efforts }. Codex: the
+# models its own /model menu lists (models_cache.json, visibility "list", in
+# its priority order), each with the effort levels it supports. Claude keeps
+# no such list on disk, so: the aliases `claude --model` resolves to the
+# latest version, the extra options Claude Code caches in .claude.json
+# (additionalModelOptionsCache), and the model settings.json names.
+function Get-CcrModelChoices {
+    param([Parameter(Mandatory)][ValidateSet('claude', 'codex')][string]$Tool, [string[]]$RootPaths = @())
+    $out = [System.Collections.Generic.List[object]]::new()
+    $seen = @{}
+    $add = {
+        param([string]$Value, [string]$Note, [string[]]$Efforts)
+        if (-not $Value -or $Value -notmatch $script:CcrOptValueRe -or $seen.ContainsKey($Value.ToLowerInvariant())) { return }
+        $seen[$Value.ToLowerInvariant()] = $true
+        $out.Add([pscustomobject]@{ Value = $Value; Note = $Note; Efforts = @($Efforts) })
+    }
+    $paths = @($RootPaths | Select-Object -Unique)
+    $cfg = Get-CcrConfiguredModel -Tool $Tool -RootPaths $paths
+    if ($Tool -eq 'claude') {
+        $aliases = @(
+            @('fable', 'latest Fable'), @('opus', 'latest Opus'), @('opus[1m]', 'latest Opus, 1M context'),
+            @('sonnet', 'latest Sonnet'), @('sonnet[1m]', 'latest Sonnet, 1M context'), @('haiku', 'latest Haiku'))
+        foreach ($a in $aliases) { & $add $a[0] $a[1] $script:CcrClaudeEfforts }
+        foreach ($p in $paths) {
+            try {
+                $j = Get-Content -LiteralPath (Join-Path $p '.claude.json') -Raw -ErrorAction Stop | ConvertFrom-Json
+                foreach ($o in @($j.additionalModelOptionsCache)) {
+                    if (-not $o.value) { continue }
+                    $note = (@("$($o.label)", "$($o.description)") | Where-Object { $_ }) -join " $([char]0x00B7) "
+                    & $add "$($o.value)" $note $script:CcrClaudeEfforts
+                }
+            }
+            catch { }
+        }
+        if ($cfg.Model -and $cfg.Model -ne '*') { & $add $cfg.Model 'the default in settings.json' $script:CcrClaudeEfforts }
+    }
+    else {
+        $models = @()
+        foreach ($p in $paths) {
+            try { $models += @((Get-Content -LiteralPath (Join-Path $p 'models_cache.json') -Raw -ErrorAction Stop | ConvertFrom-Json).models) }
+            catch { }
+        }
+        foreach ($mm in @($models | Where-Object { "$($_.visibility)" -eq 'list' } | Sort-Object { [int]$_.priority })) {
+            & $add "$($mm.slug)" "$($mm.display_name)" @($mm.supported_reasoning_levels | ForEach-Object { "$($_.effort)" } | Where-Object { $_ })
+        }
+        if ($cfg.Model -and $cfg.Model -ne '*') {
+            $known = @($models | Where-Object { "$($_.slug)" -eq $cfg.Model })[0]
+            $eff = if ($known) { @($known.supported_reasoning_levels | ForEach-Object { "$($_.effort)" } | Where-Object { $_ }) } else { $script:CcrCodexEfforts }
+            & $add $cfg.Model 'the default in config.toml' $eff
+        }
+    }
+    $out
+}
+
+# Effort levels for a model choice ('' = the configured model): the ones
+# that model supports when known, else the tool's whole list.
+function Get-CcrEffortChoices {
+    param([string]$Tool, [object[]]$Choices = @(), [string]$Model = '', [string]$ConfiguredModel = '')
+    $m = if ($Model) { $Model } elseif ($ConfiguredModel -and $ConfiguredModel -ne '*') { $ConfiguredModel } else { '' }
+    $hit = if ($m) { @($Choices | Where-Object { $_.Value -eq $m })[0] } else { $null }
+    if ($hit -and @($hit.Efforts).Count) { return @($hit.Efforts) }
+    if ($Tool -eq 'claude') { return $script:CcrClaudeEfforts }
+    $all = @($Choices | ForEach-Object { $_.Efforts } | Where-Object { $_ } | Select-Object -Unique)
+    if ($all.Count) { $all } else { $script:CcrCodexEfforts }
+}
+
+# The flags that hand a model / effort to a resumed session: claude
+# --model / --effort, codex -m / -c model_reasoning_effort=.
+function Get-CcrOverrideArgs {
+    param([string]$Tool, [string]$Model = '', [string]$Effort = '')
+    if ($Model -and $Model -match $script:CcrOptValueRe) {
+        if ($Tool -eq 'claude') { '--model'; $Model } else { '-m'; $Model }
+    }
+    if ($Effort -and $Effort -match $script:CcrOptValueRe) {
+        if ($Tool -eq 'claude') { '--effort'; $Effort } else { '-c'; "model_reasoning_effort=$Effort" }
+    }
+}
+
+# One command line from an argument list, quoted for the shell that reads
+# it: plain words stay bare, anything else is single-quoted (a model such as
+# opus[1m] would be a glob pattern to sh).
+function Join-CcrArgv {
+    param([string[]]$Argv, [ValidateSet('pwsh', 'sh')][string]$Shell = 'pwsh')
+    (@(foreach ($a in $Argv) {
+                if ($a -match '^[A-Za-z0-9._:/=-]+$') { $a }
+                elseif ($Shell -eq 'sh') { "'" + ($a -replace "'", "'\''") + "'" }
+                else { "'" + ($a -replace "'", "''") + "'" }
+            }) -join ' ')
+}
+
+# The model / effort a picked row resumes with ('' = no flag).
+function Set-CcrLaunchOption([object]$Session, [string]$Model, [string]$Effort) {
+    $Session | Add-Member -NotePropertyName LaunchModel -NotePropertyValue $Model -Force
+    $Session | Add-Member -NotePropertyName LaunchEffort -NotePropertyValue $Effort -Force
+}
+
+# The data dir a picked row will run under: its target account when the
+# picker re-homes it, else its own.
+function Get-CcrRunRootPath([object]$Session, [object[]]$Roots) {
+    $tgt = if ($Session.PSObject.Properties['TargetRoot']) { "$($Session.TargetRoot)" } else { '' }
+    if ($tgt -and $tgt -ne "$($Session.Root)") {
+        $r = @($Roots | Where-Object { $_.Label -eq $tgt })[0]
+        if ($r) { return $r.Path }
+    }
+    if ($Session.PSObject.Properties['RootPath'] -and $Session.RootPath) { return $Session.RootPath }
+    if ($Session.Tool -eq 'claude') { Get-CcrClaudeRoot } else { Get-CcrCodexRoot }
+}
+
+# The page behind Shift+Enter (and Ctrl+E) in the picker: a model and an
+# effort for the conversations about to be resumed, one section per tool
+# present in the selection. Everything starts at "no override" (no flag,
+# the tool's own setting). Returns @{ claude = @{ Model; Effort }; codex =
+# ... } for the tools in the selection, or $null on Esc. Runs inside the
+# picker's alternate screen buffer.
+function Show-CcrLaunchOptions {
+    param([Parameter(Mandatory)][object[]]$Sessions, [object[]]$ClaudeRoots = @(), [object[]]$CodexRoots = @())
+    $dot = [char]0x00B7
+    $sec = [ordered]@{}
+    foreach ($t in 'claude', 'codex') {
+        $rows = @($Sessions | Where-Object { $_.Tool -eq $t })
+        if ($rows.Count -eq 0) { continue }
+        $pool = if ($t -eq 'claude') { $ClaudeRoots } else { $CodexRoots }
+        $paths = @($rows | ForEach-Object { Get-CcrRunRootPath $_ $pool } | Select-Object -Unique)
+        $sec[$t] = [pscustomobject]@{
+            Count      = $rows.Count
+            Choices    = @(Get-CcrModelChoices -Tool $t -RootPaths $paths)
+            Configured = (Get-CcrConfiguredModel -Tool $t -RootPaths $paths)
+            Model      = ''
+            Effort     = ''
+        }
+    }
+    $fields = @(foreach ($t in $sec.Keys) { "$t|model"; "$t|effort" })
+    $cursor = 0
+    while ($true) {
+        $n = $Sessions.Count
+        $lines = [System.Collections.Generic.List[string]]::new()
+        $lines.Add("`e[1mResume with a model / effort`e[22m  `e[2m$n conversation$(if ($n -ne 1) { 's' })`e[22m")
+        $lines.Add("`e[2m$([char]0x2191)$([char]0x2193) field $dot $([char]0x2190)$([char]0x2192) value $dot Del no override $dot Enter resume $dot Esc back`e[22m")
+        foreach ($t in $sec.Keys) {
+            $x = $sec[$t]
+            $tc = if ($t -eq 'claude') { "`e[38;5;208m" } else { "`e[36m" }
+            $src = if ($t -eq 'claude') { 'settings' } else { 'config.toml' }
+            $lines.Add('')
+            $lines.Add("  $tc$t`e[39m  `e[2m$($x.Count) conversation$(if ($x.Count -ne 1) { 's' })`e[22m")
+            foreach ($kind in 'model', 'effort') {
+                $val = if ($kind -eq 'model') { $x.Model } else { $x.Effort }
+                $note = if ($val) {
+                    if ($kind -eq 'model') { "$(@($x.Choices | Where-Object { $_.Value -eq $val })[0].Note)" } else { '' }
+                }
+                else {
+                    $def = if ($kind -eq 'model') { $x.Configured.Model } else { $x.Configured.Effort }
+                    if ($kind -eq 'effort' -and $t -eq 'claude' -and $x.Configured.PerModel) { "$src`: per model" }
+                    elseif ($def -eq '*') { "$src`: differs per account" }
+                    elseif ($def) { "$src`: $def" }
+                    else { "$src`: not set" }
+                }
+                $shown = if ($val) { $val } else { '(no override)' }
+                $row = "    $($kind.PadRight(7)) $([char]0x2039) $($shown.PadRight(24)) $([char]0x203A)  `e[2m$note`e[22m"
+                if ($fields[$cursor] -eq "$t|$kind") { $row = "`e[7m$row`e[27m" }
+                $lines.Add($row)
+            }
+        }
+        $lines.Add('')
+        foreach ($t in $sec.Keys) {
+            $base = if ($t -eq 'claude') { 'claude --resume <id>' } else { 'codex resume <id>' }
+            $flags = @(Get-CcrOverrideArgs $t $sec[$t].Model $sec[$t].Effort)
+            $lines.Add("  `e[2m$base$(if ($flags.Count) { ' ' + (Join-CcrArgv $flags 'pwsh') })`e[22m")
+        }
+        Write-CcrScreen $lines
+        $k = [Console]::ReadKey($true)
+        if ($k.Key -eq [ConsoleKey]::C -and ($k.Modifiers -band [ConsoleModifiers]::Control)) { return $null }
+        $t, $kind = $fields[$cursor] -split '\|', 2
+        $x = $sec[$t]
+        $step = 0
+        switch ($k.Key) {
+            'UpArrow' { if ($cursor -gt 0) { $cursor-- } }
+            'DownArrow' { if ($cursor -lt $fields.Count - 1) { $cursor++ } }
+            'Tab' {
+                $d = if ($k.Modifiers -band [ConsoleModifiers]::Shift) { -1 } else { 1 }
+                $cursor = ($cursor + $d + $fields.Count) % $fields.Count
+            }
+            'LeftArrow' { $step = -1 }
+            'RightArrow' { $step = 1 }
+            'Delete' { if ($kind -eq 'model') { $x.Model = '' } else { $x.Effort = '' } }
+            'Backspace' { if ($kind -eq 'model') { $x.Model = '' } else { $x.Effort = '' } }
+            'Enter' {
+                $res = @{}
+                foreach ($tt in $sec.Keys) { $res[$tt] = [pscustomobject]@{ Model = $sec[$tt].Model; Effort = $sec[$tt].Effort } }
+                return $res
+            }
+            'Escape' { return $null }
+        }
+        if ($step) {
+            $vals = if ($kind -eq 'model') { @('') + @($x.Choices | ForEach-Object { $_.Value }) }
+            else { @('') + @(Get-CcrEffortChoices -Tool $t -Choices $x.Choices -Model $x.Model -ConfiguredModel $x.Configured.Model) }
+            $cur = if ($kind -eq 'model') { $x.Model } else { $x.Effort }
+            $i = [array]::IndexOf($vals, $cur)
+            $next = $vals[((($i + $step) % $vals.Count) + $vals.Count) % $vals.Count]
+            if ($kind -eq 'model') {
+                $x.Model = $next
+                # An effort the new model does not support goes back to no override.
+                $ok = @(Get-CcrEffortChoices -Tool $t -Choices $x.Choices -Model $x.Model -ConfiguredModel $x.Configured.Model)
+                if ($x.Effort -and $x.Effort -notin $ok) { $x.Effort = '' }
+            }
+            else { $x.Effort = $next }
+        }
+    }
+}
+
 # Interactive multi-select over the merged session list. Returns the chosen
 # sessions, or @() on cancel. Runs in the alternate screen buffer.
 function Select-CcrSession {
@@ -1957,6 +2223,23 @@ function Select-CcrSession {
         # Column on from the start: read the window before the first frame.
         Write-Host "ccr: reading token usage of the last $UsageHours h..." -ForegroundColor Yellow
         foreach ($s in $Sessions) { $null = Get-CcrUsageCached $s }
+    }
+    # The rows Enter and Shift+Enter open: the marked ones, each carrying
+    # the account it opens under (TargetRoot; $null = as is), or else the
+    # highlighted row.
+    function Get-CcrPickerSelection {
+        $marked = @()
+        foreach ($s in $Sessions) {
+            $key = "$($s.Tool)|$($s.SessionId)"
+            if ($acct.ContainsKey($key)) { $s | Add-Member -NotePropertyName TargetRoot -NotePropertyValue $acct[$key] -Force; $marked += $s }
+            elseif ($sel.Contains($key)) { $s | Add-Member -NotePropertyName TargetRoot -NotePropertyValue $null -Force; $marked += $s }
+        }
+        if ($marked.Count -gt 0) { return $marked }
+        if ($view.Count -gt 0) {
+            $row = $view[$cursor]
+            $row | Add-Member -NotePropertyName TargetRoot -NotePropertyValue $null -Force
+            return $row
+        }
     }
     function Get-CcrAcctAvail([object]$row) { @($entries | Where-Object { $_.Tool -eq $row.Tool } | ForEach-Object Label) }
     function Get-CcrAcctNumber([string]$tool, [string]$label) {
@@ -2048,12 +2331,12 @@ function Select-CcrSession {
                     $line += "  `e[2m$($e.Who.PadRight($whoW))`e[22m"
                     [void]$sb.Append($line).Append("`e[K`n")
                 }
-                $hint = "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space cycles the account (dot = as is) $([char]0x00B7) Enter open $([char]0x00B7) Ctrl+N new $([char]0x00B7) Ctrl+A accounts $([char]0x00B7) Ctrl+K usage $([char]0x00B7) Ctrl+J details $([char]0x00B7) Ctrl+X close $([char]0x00B7) Del delete $([char]0x00B7) Esc cancel $([char]0x00B7) v$script:CcrVersion"
+                $hint = "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space cycles the account (dot = as is) $([char]0x00B7) Enter open $([char]0x00B7) Shift+Enter model/effort $([char]0x00B7) Ctrl+N new $([char]0x00B7) Ctrl+A accounts $([char]0x00B7) Ctrl+K usage $([char]0x00B7) Ctrl+J details $([char]0x00B7) Ctrl+X close $([char]0x00B7) Del delete $([char]0x00B7) Esc cancel $([char]0x00B7) v$script:CcrVersion"
                 if ($hint.Length -gt $w - 1) { $hint = $hint.Substring(0, $w - 1) }
                 [void]$sb.Append("`e[2m").Append($hint).Append("`e[22m`e[K")
             }
             else {
-                $hint = "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space mark $([char]0x00B7) Enter open $([char]0x00B7) Ctrl+N new $([char]0x00B7) Del delete $([char]0x00B7) Ctrl+A accounts $([char]0x00B7) Ctrl+K usage $([char]0x00B7) Ctrl+J details $([char]0x00B7) Ctrl+X close $([char]0x00B7) Esc cancel $([char]0x00B7) type to filter $([char]0x00B7) v$script:CcrVersion"
+                $hint = "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space mark $([char]0x00B7) Enter open $([char]0x00B7) Shift+Enter model/effort $([char]0x00B7) Ctrl+N new $([char]0x00B7) Del delete $([char]0x00B7) Ctrl+A accounts $([char]0x00B7) Ctrl+K usage $([char]0x00B7) Ctrl+J details $([char]0x00B7) Ctrl+X close $([char]0x00B7) Esc cancel $([char]0x00B7) type to filter $([char]0x00B7) v$script:CcrVersion"
                 if ($hint.Length -gt $w - 1) { $hint = $hint.Substring(0, $w - 1) }
                 [void]$sb.Append("`e[2m").Append($hint).Append("`e[22m`e[K")
             }
@@ -2147,6 +2430,20 @@ function Select-CcrSession {
             $k = [Console]::ReadKey($true)
             if ($k.Key -eq [ConsoleKey]::C -and ($k.Modifiers -band [ConsoleModifiers]::Control)) { return $null }
             $ctrl = [bool]($k.Modifiers -band [ConsoleModifiers]::Control)
+            # Shift+Enter: the same rows as Enter, resumed with a model and an
+            # effort picked on a page (one section per tool in the
+            # selection). Ctrl+E does the same - it is the key of ccr.py,
+            # whose fzf picker cannot tell Shift+Enter from Enter.
+            if (($k.Key -eq [ConsoleKey]::Enter -and ($k.Modifiers -band [ConsoleModifiers]::Shift)) -or ($ctrl -and $k.Key -eq [ConsoleKey]::E)) {
+                $toOpen = @(Get-CcrPickerSelection)
+                if ($toOpen.Count -eq 0) { continue }
+                $elsewhere = @($toOpen | Where-Object { $_.RunningOn })
+                if ($elsewhere.Count -gt 0 -and -not (Show-CcrElsewhereConfirm -Sessions $elsewhere)) { continue }
+                $opts = Show-CcrLaunchOptions -Sessions $toOpen -ClaudeRoots $AllClaudeRoots -CodexRoots $AllCodexRoots
+                if ($null -eq $opts) { continue }
+                foreach ($s in $toOpen) { Set-CcrLaunchOption $s $opts[$s.Tool].Model $opts[$s.Tool].Effort }
+                return $toOpen
+            }
             # Ctrl+A: the account page (the same key as the fzf picker of
             # ccr.py, where Ctrl+M is indistinguishable from Enter).
             if ($ctrl -and $k.Key -eq [ConsoleKey]::A) {
@@ -2255,15 +2552,9 @@ function Select-CcrSession {
                     }
                 }
                 'Enter' {
-                    # Marked rows carry TargetRoot: an account label to open under
-                    # (re-homing first), or $null for "as is".
-                    $marked = @()
-                    foreach ($s in $Sessions) {
-                        $key = "$($s.Tool)|$($s.SessionId)"
-                        if ($acct.ContainsKey($key)) { $s | Add-Member -NotePropertyName TargetRoot -NotePropertyValue $acct[$key] -Force; $marked += $s }
-                        elseif ($sel.Contains($key)) { $s | Add-Member -NotePropertyName TargetRoot -NotePropertyValue $null -Force; $marked += $s }
-                    }
-                    $toOpen = if ($marked.Count -gt 0) { $marked } elseif ($view.Count -gt 0) { @($view[$cursor]) } else { @() }   # bare Enter: cursor row
+                    # Plain Enter: no model / effort flags (Shift+Enter above sets them).
+                    $toOpen = @(Get-CcrPickerSelection)
+                    foreach ($s in $toOpen) { Set-CcrLaunchOption $s '' '' }
                     # A conversation open on another PC: ask first - two
                     # processes would append to the same transcript.
                     $elsewhere = @($toOpen | Where-Object { $_.RunningOn })
@@ -2509,8 +2800,9 @@ function Resume-CcSessions {
         Lists past claude + codex sessions merged and sorted by last message
         date (matching each tool's own --resume/resume ordering), lets you mark
         several with Space, and resumes each selection ("claude --resume <id>"
-        / "codex resume <id>" in the session's recorded folder; no model or
-        effort overrides - a resumed session keeps its own settings).
+        / "codex resume <id>" in the session's recorded folder, with the
+        tools' own model and effort settings; Shift+Enter picks a model and
+        an effort for them first).
         The FIRST selection takes over the tab ccr runs in, so the launcher
         tab never sits idle; the remaining ones open as Windows Terminal tabs.
         With a single selection ccr simply resumes it right here. -NewWindow
@@ -2518,7 +2810,11 @@ function Resume-CcSessions {
 
         Picker keys: Up/Down/PgUp/PgDn/Home/End move, Space marks/unmarks,
         Enter opens the marked set (or the highlighted row if nothing is
-        marked), Del PERMANENTLY deletes the highlighted conversation after a
+        marked), Shift+Enter (or Ctrl+E) opens it with a model and an effort
+        chosen on a page - one section for the claude rows (--model,
+        --effort), one for the codex rows (-m, -c model_reasoning_effort),
+        each shown only when the selection has such rows, all starting at
+        "no override" - Del PERMANENTLY deletes the highlighted conversation after a
         full-screen confirmation (title, folder, dates, size, last prompt or
         reply; codex deletions go through 'codex delete' so its catalog stays
         consistent; running sessions are refused), Esc clears the filter then
@@ -2938,10 +3234,14 @@ function Resume-CcSessions {
             Write-Warning "ccr: 'codex $([char]0x00B7) $($s.Title)' - recorded folder missing ($cwd), starting in $HOME"
             $cwd = $HOME
         }
-        # No --effort / --model overrides: a resumed session keeps its own
-        # model and follows the user's saved effort default.
-        $cmd = if ($s.Tool -eq 'claude') { "claude --resume $($s.SessionId)" }
-        else { "codex resume $($s.SessionId)" }
+        # Model / effort flags only when the Shift+Enter page chose them;
+        # otherwise the tool's own settings apply.
+        $argv = @(if ($s.Tool -eq 'claude') { 'claude', '--resume', $s.SessionId } else { 'codex', 'resume', $s.SessionId })
+        $lm = if ($s.PSObject.Properties['LaunchModel']) { "$($s.LaunchModel)" } else { '' }
+        $le = if ($s.PSObject.Properties['LaunchEffort']) { "$($s.LaunchEffort)" } else { '' }
+        $argv += @(Get-CcrOverrideArgs $s.Tool $lm $le)
+        $cmd = Join-CcrArgv $argv 'pwsh'
+        $cmdSh = Join-CcrArgv $argv 'sh'
         $rootPath = if ($s.PSObject.Properties['RootPath']) { $s.RootPath } else { $null }
         # Account mode: a TargetRoot label different from the row's own account
         # means "move this conversation there, then open it there".
@@ -2955,7 +3255,7 @@ function Resume-CcSessions {
             elseif ($s.RunningOn) { Write-Warning "ccr: '$($s.Title)' is open on $($s.RunningOn) - close it there before moving it to '$tgt'; skipped"; continue }
             else { $rootPath = $moveTo.Path }
         }
-        $launch.Add([pscustomobject]@{ Tool = $s.Tool; Title = $s.Title; Cwd = $cwd; Command = $cmd; RootPath = $rootPath; Session = $s; MoveTo = $moveTo })
+        $launch.Add([pscustomobject]@{ Tool = $s.Tool; Title = $s.Title; Cwd = $cwd; Command = $cmd; CommandSh = $cmdSh; Argv = $argv; RootPath = $rootPath; Session = $s; MoveTo = $moveTo })
     }
     if ($launch.Count -eq 0) { Write-Warning 'ccr: nothing to open.'; return }
 
@@ -3018,8 +3318,9 @@ function Resume-CcSessions {
             if ($IsWindows) { wt.exe @wtArgs }
             else {
                 # tmux runs the command via sh -c; the window closes when the
-                # agent exits. Command text is fixed words + a validated uuid.
-                foreach ($s in $tabs) { & tmux new-window -c $s.Cwd ((Get-CcrRootPrefix $s.Tool $s.RootPath 'sh') + $s.Command) }
+                # agent exits. Command text: fixed words, a validated uuid and any
+                # model / effort picked with Shift+Enter, quoted for sh.
+                foreach ($s in $tabs) { & tmux new-window -c $s.Cwd ((Get-CcrRootPrefix $s.Tool $s.RootPath 'sh') + $s.CommandSh) }
             }
         }
         if ($inline) {
@@ -3027,12 +3328,11 @@ function Resume-CcSessions {
             # cd to the recorded folder and hand the tab over to the agent.
             Set-Location -LiteralPath $inline.Cwd
             try { $Host.UI.RawUI.WindowTitle = "$($inline.Tool) $([char]0x00B7) $($inline.Title)" } catch { }
-            # Split into words and SPLAT: claude resolves to the npm .ps1 shim,
+            # SPLAT the argument list: claude resolves to the npm .ps1 shim,
             # which would receive a plain array argument as one value and
             # forward it to node as a single joined string.
-            $parts = $inline.Command -split ' '   # fixed words + validated uuid, no quoting needed
-            $exe = $parts[0]
-            $exeArgs = $parts[1..($parts.Count - 1)]
+            $exe = $inline.Argv[0]
+            $exeArgs = @($inline.Argv | Select-Object -Skip 1)
             Invoke-CcrWithRoot $inline.Tool $inline.RootPath { & $exe @exeArgs }
         }
     }
@@ -3041,7 +3341,7 @@ function Resume-CcSessions {
         if ($inline) { "this tab: $(Get-CcrRootPrefix $inline.Tool $inline.RootPath 'pwsh')$($inline.Command)   (cd $($inline.Cwd))" }
         if ($tabs.Count -gt 0) {
             if ($IsWindows) { "wt.exe $($wtArgs -join ' ')" }
-            else { foreach ($s in $tabs) { "tmux new-window -c $($s.Cwd) '$((Get-CcrRootPrefix $s.Tool $s.RootPath 'sh') + $s.Command)'" } }
+            else { foreach ($s in $tabs) { "tmux new-window -c $($s.Cwd) $((Get-CcrRootPrefix $s.Tool $s.RootPath 'sh') + $s.CommandSh)" } }
         }
     }
 }

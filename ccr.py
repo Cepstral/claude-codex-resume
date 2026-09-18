@@ -7,7 +7,7 @@ as the picker and real terminal tabs (iTerm2, Terminal.app) or tmux windows
 as the launch backend. Python 3.9+, stdlib only; fzf for UI.
 
 Keys in the picker (fzf conventions): type to fuzzy-filter, Tab marks,
-Enter opens, Ctrl-N new conversation, Ctrl-A accounts, Ctrl-O open the
+Enter opens, Ctrl-E opens with a model / effort, Ctrl-N new conversation, Ctrl-A accounts, Ctrl-O open the
 marked rows under another account, Del deletes, Esc cancels.
 """
 import argparse
@@ -32,7 +32,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.60"
+VERSION = "0.61"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -246,7 +246,9 @@ class Session:
                  "origin", "root", "root_path", "target_root",
                  # claude registry: open on another PC (host, "" otherwise), and the
                  # kind ("bg" = a background session) / status / last update of the run
-                 "running_on", "run_kind", "run_status", "run_updated", "run_job")
+                 "running_on", "run_kind", "run_status", "run_updated", "run_job",
+                 # model / effort chosen with Ctrl-E ('' = no flag)
+                 "model_override", "effort_override")
 
     def __init__(self, **kw):
         for k in self.__slots__:
@@ -257,6 +259,8 @@ class Session:
         self.running_on = self.running_on or ""
         self.run_kind = self.run_kind or ""
         self.run_status = self.run_status or ""
+        self.model_override = self.model_override or ""
+        self.effort_override = self.effort_override or ""
 
     @property
     def key(self):
@@ -1280,7 +1284,7 @@ def picker_hint(ctx: Ctx, upd_note: str = "") -> str:
         f, t = upd_note.split(">", 1)
         lines.append(f"{BOLD}{GREEN}ccr updated v{f} -> v{t}{RESET}")
     lines += ctx.legend() if ctx.multi_root else []
-    keys = [("↑↓", "move"), ("Tab", "mark"), ("Enter", "open")]
+    keys = [("↑↓", "move"), ("Tab", "mark"), ("Enter", "open"), ("Ctrl-E", "model/effort")]
     if ctx.multi_root:
         keys.append(("Ctrl-O", "open under another account"))
     keys += [("Ctrl-N", "new"), ("Ctrl-A", "accounts"), ("Ctrl-K", "usage"), ("Ctrl-J", "details"),
@@ -1902,8 +1906,202 @@ def exec_inline(cwd: str, argv: list, title: str, dry: bool, env_prefix: str = "
         sys.exit(f"ccr: cannot start {argv[0]}: {e}")
 
 
+# ----------------------------------------------------------------------------
+# launch options: a model and an effort for the conversations being resumed
+# (Ctrl-E here; Shift+Enter in the PowerShell picker, which fzf cannot see)
+# ----------------------------------------------------------------------------
+# Values go on command lines ccr writes: model ids and effort levels only
+# (letters, digits, . _ - : and a [1m] suffix).
+OPT_VALUE_RE = re.compile(r"^[A-Za-z0-9._:\[\]-]{1,64}$")
+# Claude Code's effort levels (claude --help: --effort <level>).
+CLAUDE_EFFORTS = ["low", "medium", "high", "xhigh", "max"]
+# Codex levels for a model its cache does not describe.
+CODEX_EFFORTS = ["low", "medium", "high", "xhigh"]
+CLAUDE_ALIASES = [("fable", "latest Fable"), ("opus", "latest Opus"), ("opus[1m]", "latest Opus, 1M context"),
+                  ("sonnet", "latest Sonnet"), ("sonnet[1m]", "latest Sonnet, 1M context"), ("haiku", "latest Haiku")]
+
+
+def _json_at(path):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def configured_model(tool: str, root_paths: list) -> dict:
+    """What a tool is set to use when no flag is passed, read from the data
+    dirs the conversations will run under: claude settings.json (model,
+    effortLevel; per_model when modelSettings sets efforts per model), codex
+    config.toml (top-level model, model_reasoning_effort). A value is '*'
+    when those dirs disagree and '' when none sets it."""
+    models, efforts, per_model = [], [], False
+    for p in dict.fromkeys(root_paths):
+        m = e = ""
+        if tool == "claude":
+            j = _json_at(Path(p) / "settings.json")
+            if isinstance(j, dict):
+                m, e = str(j.get("model") or ""), str(j.get("effortLevel") or "")
+                per_model = per_model or bool(j.get("modelSettings"))
+        else:
+            try:
+                for line in (Path(p) / "config.toml").read_text(encoding="utf-8").splitlines():
+                    if re.match(r"\s*\[", line):
+                        break   # top-level keys only
+                    mm = re.match(r'\s*model\s*=\s*"([^"]*)"', line)
+                    if mm:
+                        m = mm.group(1)
+                        continue
+                    mm = re.match(r'\s*model_reasoning_effort\s*=\s*"([^"]*)"', line)
+                    if mm:
+                        e = mm.group(1)
+            except OSError:
+                pass
+        models.append(m)
+        efforts.append(e)
+
+    def one(xs):
+        u = list(dict.fromkeys(xs))
+        return u[0] if len(u) == 1 else ("*" if u else "")
+    return {"model": one(models), "effort": one(efforts), "per_model": per_model}
+
+
+def model_choices(tool: str, root_paths: list) -> list:
+    """The models offered for a tool, as (value, note, efforts). Codex: the
+    models its own /model menu lists (models_cache.json, visibility "list",
+    in its priority order), each with the effort levels it supports. Claude
+    keeps no such list on disk, so: the aliases `claude --model` resolves to
+    the latest version, the extra options Claude Code caches in .claude.json
+    (additionalModelOptionsCache), and the model settings.json names."""
+    out, seen = [], set()
+
+    def add(value, note, efforts):
+        value = str(value or "")
+        if value and OPT_VALUE_RE.match(value) and value.lower() not in seen:
+            seen.add(value.lower())
+            out.append((value, note, list(efforts)))
+
+    def prio(m):
+        try:
+            return int(m.get("priority") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def levels(m):
+        return [str(x["effort"]) for x in (m.get("supported_reasoning_levels") or [])
+                if isinstance(x, dict) and x.get("effort")]
+
+    paths = list(dict.fromkeys(root_paths))
+    cfg = configured_model(tool, paths)
+    if tool == "claude":
+        for v, note in CLAUDE_ALIASES:
+            add(v, note, CLAUDE_EFFORTS)
+        for p in paths:
+            j = _json_at(Path(p) / ".claude.json")
+            opts = j.get("additionalModelOptionsCache") if isinstance(j, dict) else None
+            for o in ([opts] if isinstance(opts, dict) else opts if isinstance(opts, list) else []):
+                if isinstance(o, dict) and o.get("value"):
+                    note = " · ".join(x for x in (str(o.get("label") or ""), str(o.get("description") or "")) if x)
+                    add(o["value"], note, CLAUDE_EFFORTS)
+        if cfg["model"] and cfg["model"] != "*":
+            add(cfg["model"], "the default in settings.json", CLAUDE_EFFORTS)
+    else:
+        models = []
+        for p in paths:
+            j = _json_at(Path(p) / "models_cache.json")
+            if isinstance(j, dict) and isinstance(j.get("models"), list):
+                models += [m for m in j["models"] if isinstance(m, dict)]
+        for m in sorted((m for m in models if m.get("visibility") == "list"), key=prio):
+            add(m.get("slug"), str(m.get("display_name") or ""), levels(m))
+        if cfg["model"] and cfg["model"] != "*":
+            known = next((m for m in models if m.get("slug") == cfg["model"]), None)
+            add(cfg["model"], "the default in config.toml", levels(known) if known else CODEX_EFFORTS)
+    return out
+
+
+def effort_choices(tool: str, choices: list, model: str, configured: str) -> list:
+    """Effort levels for a model choice ('' = the configured model): the ones
+    that model supports when known, else the tool's whole list."""
+    m = model or (configured if configured != "*" else "")
+    hit = next((c for c in choices if m and c[0].lower() == m.lower()), None)
+    if hit and hit[2]:
+        return list(hit[2])
+    if tool == "claude":
+        return list(CLAUDE_EFFORTS)
+    return list(dict.fromkeys(e for c in choices for e in c[2])) or list(CODEX_EFFORTS)
+
+
+def override_args(tool: str, model: str, effort: str) -> list:
+    """The flags that hand a model / effort to a resumed session: claude
+    --model / --effort, codex -m / -c model_reasoning_effort=."""
+    a = []
+    if model and OPT_VALUE_RE.match(model):
+        a += ["--model", model] if tool == "claude" else ["-m", model]
+    if effort and OPT_VALUE_RE.match(effort):
+        a += ["--effort", effort] if tool == "claude" else ["-c", f"model_reasoning_effort={effort}"]
+    return a
+
+
+def run_root_path(ctx, s) -> str:
+    """The data dir a picked row will run under: its target account when the
+    picker re-homes it, else its own."""
+    if s.target_root and s.target_root != s.root:
+        r = next((r for r in ctx.roots(s.tool, all_=True) if r.label == s.target_root), None)
+        if r:
+            return r.path
+    if s.root_path:
+        return s.root_path
+    return str(claude_root() if s.tool == "claude" else codex_root())
+
+
+def launch_options(picked: list, ctx):
+    """Ctrl-E: a model and an effort for the rows about to be resumed - the
+    PowerShell picker's Shift+Enter page, as fzf menus: model, then effort,
+    for each tool in the selection. Both start at "no override" (no flag,
+    the tool's own setting). Returns {tool: (model, effort)}, or None when
+    backed out."""
+    out = {}
+    for tool in ("claude", "codex"):
+        rows_t = [x for x in picked if x.tool == tool]
+        if not rows_t:
+            continue
+        paths = list(dict.fromkeys(run_root_path(ctx, x) for x in rows_t))
+        cfg = configured_model(tool, paths)
+        choices = model_choices(tool, paths)
+        src = "settings" if tool == "claude" else "config.toml"
+        n = len(rows_t)
+        title = (f"{BOLD}Resume with a model / effort{RESET}  {TOOL_COLOR[tool]}{tool}{RESET} "
+                 f"{DIM}· {n} conversation{'' if n == 1 else 's'}{RESET}")
+
+        def default_note(val):
+            if val == "*":
+                return f"{src}: differs per account"
+            return f"{src}: {val}" if val else f"{src}: not set"
+
+        rows = [f"0\t{'(no override)':<26}{DIM}{default_note(cfg['model'])}{RESET}"]
+        rows += [f"{i}\t{v:<26}{DIM}{note}{RESET}" for i, (v, note, _) in enumerate(choices, 1)]
+        res = run_fzf(rows, title + "\n" + hint(("Enter", "choose"), ("Esc", "back to the list"), tail="model"),
+                      multi=False, preview=False, prompt=f"{tool} model> ")
+        if not res or not res[1]:
+            return None
+        i = int(res[1][0])
+        model = choices[i - 1][0] if i else ""
+        levels = effort_choices(tool, choices, model, cfg["model"])
+        eff_note = f"{src}: per model" if tool == "claude" and cfg["per_model"] else default_note(cfg["effort"])
+        rows = [f"0\t{'(no override)':<26}{DIM}{eff_note}{RESET}"]
+        rows += [f"{i}\t{lv}" for i, lv in enumerate(levels, 1)]
+        res = run_fzf(rows, title + "\n" + hint(("Enter", "choose"), ("Esc", "back to the list"),
+                                               tail=f"effort{f' for {model}' if model else ''}"),
+                      multi=False, preview=False, prompt=f"{tool} effort> ")
+        if not res or not res[1]:
+            return None
+        i = int(res[1][0])
+        out[tool] = (model, levels[i - 1] if i else "")
+    return out
+
+
 def resume_argv(s: Session) -> list:
-    return ["claude", "--resume", s.id] if s.tool == "claude" else ["codex", "resume", s.id]
+    argv = ["claude", "--resume", s.id] if s.tool == "claude" else ["codex", "resume", s.id]
+    return argv + override_args(s.tool, s.model_override, s.effort_override)
 
 
 def root_prefix(ctx: Ctx, tool: str, root_path: str) -> str:
@@ -1960,6 +2158,9 @@ def launch(picked: list, new_window: bool, dry: bool, ctx: Ctx, terminal: bool =
                 if s.target_root and s.target_root != s.root:
                     print(f"ccr: 'codex app · {s.title}' opens in the Codex app, which always runs as the "
                           f"default account - not moved to '{s.target_root}'", file=sys.stderr)
+                if s.model_override or s.effort_override:
+                    print(f"ccr: 'codex app · {s.title}' opens in the Codex app, which takes no model or effort "
+                          f"from ccr - pick them there, or resume it in a terminal with --terminal", file=sys.stderr)
                 app_list.append(s)
                 continue
             print(f"ccr: no URL handler here - resuming 'codex app · {s.title}' in a terminal instead",
@@ -2580,7 +2781,7 @@ def main():
             index = {}
             rows = session_rows(sessions, index, ctx, usage_of if usage_on else None)
             res = run_fzf(rows, picker_hint(ctx, upd_note), query=query,
-                          expect=["del", "ctrl-n", "ctrl-a", "ctrl-o", "ctrl-k", "ctrl-j", "ctrl-x"])
+                          expect=["del", "ctrl-n", "ctrl-a", "ctrl-o", "ctrl-k", "ctrl-j", "ctrl-x", "ctrl-e"])
             if res is None:
                 print("ccr: cancelled.")
                 return
@@ -2663,6 +2864,22 @@ def main():
                             sessions = [s for s in sessions if s.key != victim.key]
                 query = ""
                 continue
+            if key == "ctrl-e":
+                # The rows Enter would open, resumed with a model and an effort
+                # picked per tool (Shift+Enter in the PowerShell picker; fzf
+                # cannot tell Shift+Enter from Enter).
+                if not picked:
+                    continue
+                elsewhere = [x for x in picked if x.running_on]
+                if elsewhere and not confirm_elsewhere(elsewhere):
+                    continue
+                opts = launch_options(picked, ctx)
+                if opts is None:
+                    continue
+                for x in picked:
+                    x.model_override, x.effort_override = opts.get(x.tool, ("", ""))
+                launch(picked, a.new_window, a.dry_run, ctx, a.terminal, a.tabs)
+                return
             if not picked:
                 print("ccr: cancelled.")
                 return

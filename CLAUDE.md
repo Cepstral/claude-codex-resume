@@ -35,6 +35,12 @@ record it in the parity table in `docs/multi-account.md`. Known cases so far:
   records the rate-limit meter it saw (`rate_limits.primary/secondary`);
   Claude Code does not write its meter anywhere, so the details page says so
   for claude rows.
+- Model / effort at resume (Shift+Enter page): claude `--model` / `--effort`,
+  codex `-m` / `-c model_reasoning_effort=`. Codex lists its models and the
+  levels each supports in `models_cache.json`; Claude keeps no model list on
+  disk, so its list is the `claude --model` aliases + `.claude.json`
+  `additionalModelOptionsCache` + the settings.json model. Codex app threads
+  (ccr.py) take no model from outside: ccr warns and hands them to the app.
 
 ## PowerShell ↔ Python parity (hard rule)
 
@@ -55,7 +61,12 @@ page is Ctrl+A everywhere because fzf cannot tell Ctrl-M from Enter).
 Remaining differences, because Space types into fzf's filter: Space cycling
 the account per row ↔ `Tab` mark + `Ctrl-O` (one target account for the
 marked rows); `+`/`X` on the account page ↔ rows picked with Enter;
-`S` ↔ `Ctrl-S`. The mapping table lives in `docs/multi-account.md`.
+`S` ↔ `Ctrl-S`; the Shift+Enter model/effort page ↔ `Ctrl-E` with fzf
+menus in sequence (model, then effort, per tool) — fzf has no shift-enter,
+and alt-enter is Windows Terminal's fullscreen key, so the PowerShell picker
+takes Ctrl+E as well. In ccr.py a row cannot change account and get a model
+in one step (Ctrl-O and Ctrl-E each launch); on Windows Space + Shift+Enter
+combine. The mapping table lives in `docs/multi-account.md`.
 
 Known asymmetries (2026-09-17): `ccr.py` has Codex desktop-app support
 (`codex app` rows, deeplinks, `--terminal`) and a `+ new folder` entry on
