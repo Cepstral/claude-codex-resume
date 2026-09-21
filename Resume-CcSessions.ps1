@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.61'
+$script:CcrVersion = '0.62'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -3308,7 +3308,16 @@ function Resume-CcSessions {
             if ($cwd -match '^[A-Za-z]:$') { $cwd += '\' }   # bare "D:" is drive-relative
             $title = "$($s.Tool) $([char]0x00B7) $($s.Title)" -replace '["\;]', ' '
             if ($title.Length -gt 40) { $title = $title.Substring(0, 39) + [char]0x2026 }
-            $wtArgs += @('new-tab', '-d', $cwd, '--title', $title, 'pwsh.exe', '-NoExit', '-Command', ((Get-CcrRootPrefix $s.Tool $s.RootPath 'pwsh') + $s.Command))
+            # wt.exe splits its whole command line on ';' - inside a quoted
+            # argument too - so every ';' of the command a tab runs (the
+            # account's env assignment carries one) must reach it as '\;',
+            # or wt takes the rest for a subcommand of its own and fails
+            # with "Impossibile trovare il file specificato". Other
+            # backslashes, single quotes and [brackets] pass through as they
+            # are (verified against wt 1.x); the title is stripped of ';'
+            # further up.
+            $tabCmd = ((Get-CcrRootPrefix $s.Tool $s.RootPath 'pwsh') + $s.Command) -replace ';', '\;'
+            $wtArgs += @('new-tab', '-d', $cwd, '--title', $title, 'pwsh.exe', '-NoExit', '-Command', $tabCmd)
             $first = $false
         }
     }

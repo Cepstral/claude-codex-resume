@@ -87,6 +87,16 @@ pane, which shows the full title and folder of the highlighted row.
   working copy to the pushed (older) version and silently discarded
   uncommitted edits. When testing from the checkout anyway, set
   `CCR_AUTO_UPDATE=0` and prefer `--dry-run` / `-WhatIf`.
+- Windows Terminal splits its whole command line on `;`, inside a quoted
+  `-Command` argument too, so every `;` in the command a tab runs has to
+  reach `wt.exe` as `\;`. The account env prefix carries one, and without
+  the escape wt took the rest for a subcommand and failed to start a program
+  named " claude --resume <id>" (0x80070002), i.e. the second and later
+  selections never opened while multi-account was on (fixed 2026-09-21,
+  v0.62). Verified the same day: `\;` arrives at the shell as a plain `;`,
+  and backslashes, single quotes and [brackets] in that argument are left
+  alone. Tab titles are stripped of `;` for the same reason. Windows only:
+  ccr.py hands tabs a shell string through osascript / tmux.
 - Account dirs are created next to the tool's default dir (never a fixed
   `~\.claude-<label>`), and reused without a new login when they already hold one.
 - No absolute machine paths, no personal data in the repo or docs.
