@@ -120,7 +120,7 @@ When the Claude data dirs live in a synced folder, ccr works across the PCs that
 
 **A conversation open on the other PC is labelled.** Claude registers every running process in `<dir>\sessions\<pid>.json`, host included, and that registry syncs too. ccr shows a yellow `@host` instead of the age, asks before opening such a conversation here, and refuses to delete or move it until it is closed there. A registry entry left behind by a crash on the other PC ages out after 7 days. Codex has no such registry, and its `~/.codex` is normally not synced.
 
-What travels with the synced script folder: the script, `ccr.json` (dirs under the home folder are written as `~\...`), and with it the accounts — an account added elsewhere reads `not on this PC` until you press `L` on the `Ctrl+A` page. What stays per machine: the auto-update record, and the Codex dirs.
+What travels with the synced script folder: the script, `ccr.json` (dirs under the home folder are written as `~\...`), and with it the accounts — an account added elsewhere reads `not on this PC` until you press `L` on the `Ctrl+A` page. Until then ccr starts nothing under it: a new conversation or a move to that account stops with `not on this PC - <dir> does not exist` and the command that fixes it, `ccr -AddAccount <label> -Tool <tool>` (Codex refuses a `CODEX_HOME` that does not exist, and Claude would start from an empty dir). What stays per machine: the auto-update record, and the Codex dirs.
 
 ## How it works
 

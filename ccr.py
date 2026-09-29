@@ -32,7 +32,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.64"
+VERSION = "0.65"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -2051,6 +2051,19 @@ def install_plan(st: dict) -> dict:
     return plan
 
 
+def account_missing(tool: str, root) -> str:
+    """'' when the account's dir exists on this PC, else the error with the
+    command that fixes it: codex refuses a CODEX_HOME that does not exist,
+    and claude would start from an empty dir. An account added on another
+    PC has none here until this PC logs in (ccr.json may be synced, the
+    codex dirs are not)."""
+    if not root or not root.path or Path(root.path).is_dir():
+        return ""
+    fix = ("claude auth login" if tool == "claude" else "codex login") if root.default \
+        else f"ccr --add-account {root.label} --tool {tool}   (or Ctrl-A in the picker, then Ctrl-L on its row)"
+    return f"ccr: {tool} account '{root.label}' is not on this PC - {root.path} does not exist. Fix: {fix}"
+
+
 def run_install(tool: str, dry: bool) -> bool:
     """Install or update one tool. The installer runs as a child process with
     the tool's data dir set to the default account's (codex keeps its package
@@ -2411,6 +2424,9 @@ def launch(picked: list, new_window: bool, dry: bool, ctx: Ctx, terminal: bool =
                 print(f"ccr: '{s.title}' is open on {s.running_on} - close it there before moving it to '{tgt}'; skipped",
                       file=sys.stderr)
                 continue
+            elif account_missing(s.tool, move_to):
+                print(f"{account_missing(s.tool, move_to)}   '{s.title}' skipped, not moved.", file=sys.stderr)
+                continue
             else:
                 root_path = move_to.path
         launch_list.append({"s": s, "cwd": cwd, "argv": resume_argv(s), "root_path": root_path, "move_to": move_to})
@@ -2632,6 +2648,14 @@ def new_conversation(sessions: list, initial_name: str, dry: bool, ctx: Ctx, ter
             root = next(r for r in roots if r.label == lbl)
         else:
             root = roots[0] if roots else default_root(tool)
+    if not tool_path(tool):
+        print(f"ccr: {tool} is not installed on this PC. Fix: ccr --install {tool}   (or Ctrl-T in the picker)",
+              file=sys.stderr)
+        return False
+    miss = account_missing(tool, root) if ctx.root_var(tool) else ""
+    if miss:
+        print(miss, file=sys.stderr)
+        return False
     argv = ["claude", "--name", name] if (tool == "claude" and name) else [tool]
     rp = root.path if root else ""
     exec_inline(folder, argv, f"{tool} · {name or 'new'}", dry, root_prefix(ctx, tool, rp), root_env(ctx, tool, rp))

@@ -59,6 +59,9 @@ files (`.claude.json` / `auth.json`), so the page opens instantly. `Enter` and `
 - `L` logs **this PC** in to the highlighted account. An account added on another PC through a
   synced `ccr.json` shows `not on this PC` until then: ccr creates the dir here and runs that
   tool's login inside it (`ccr -AddAccount <label>` for a label that already exists does the same).
+  Until then ccr starts nothing under that account: a new conversation or a move to it stops
+  with `not on this PC - <dir> does not exist` and the fix, `ccr -AddAccount <label> -Tool <tool>`
+  (Codex refuses a `CODEX_HOME` that does not exist; Claude would start from an empty dir).
 - `Del` removes the highlighted account: every session it holds **moves to the `default`
   account** of that tool and keeps working there; the dir and its login stay on disk, ccr just
   forgets them. Refused while one of its sessions is running.

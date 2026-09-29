@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.64'
+$script:CcrVersion = '0.65'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -2013,6 +2013,18 @@ function Get-CcrInstallPlan {
     $plan
 }
 
+# An account's dir must exist on this PC before a tool is started with it:
+# codex refuses a CODEX_HOME that does not exist, and claude would start
+# from an empty dir. An account added on another PC has none here until
+# this PC logs in (ccr.json is synced, the codex dirs are not). Returns ''
+# when the dir is there, else the error with the command that fixes it.
+function Get-CcrAccountMissing([string]$Tool, [object]$Root) {
+    if (-not $Root -or -not $Root.Path -or (Test-Path -LiteralPath $Root.Path -PathType Container)) { return '' }
+    $fix = if ($Root.Default) { if ($Tool -eq 'claude') { 'claude auth login' } else { 'codex login' } }
+    else { "ccr -AddAccount $($Root.Label) -Tool $Tool   (or Ctrl+A in the picker, then L on its row)" }
+    "ccr: $Tool account '$($Root.Label)' is not on this PC - $($Root.Path) does not exist. Fix: $fix"
+}
+
 # Install or update one tool, on the main screen. Installers run in a child
 # process - both call `exit` and Set-StrictMode, which would end or change
 # this shell - with the tool's data dir set to the default account's, since
@@ -3494,6 +3506,13 @@ function Resume-CcSessions {
             Write-Warning "ccr: folder no longer exists: $dir"
             return
         }
+        if (-not (Get-Command $newTool -CommandType Application, ExternalScript -ErrorAction SilentlyContinue)) { Update-CcrSessionPath }
+        if (-not (Get-Command $newTool -CommandType Application, ExternalScript -ErrorAction SilentlyContinue)) {
+            Write-Warning "ccr: $newTool is not installed on this PC. Fix: ccr -Install $newTool   (or Ctrl+I in the picker)"
+            return
+        }
+        $miss = Get-CcrAccountMissing $newTool $newRoot
+        if ($miss) { Write-Warning $miss; return }
         $what = "start a new $newTool session here$(if ($newRoot) { " (account: $($newRoot.Label))" })"
         if ($PSCmdlet.ShouldProcess($dir, $what)) {
             Set-Location -LiteralPath $dir
@@ -3561,6 +3580,7 @@ function Resume-CcSessions {
             if (-not $moveTo) { Write-Warning "ccr: no $($s.Tool) dir for account '$tgt' - '$($s.Title)' stays under '$($s.Root)'" }
             elseif ($s.Running) { Write-Warning "ccr: '$($s.Title)' is running - close it before moving it to '$tgt'; skipped"; continue }
             elseif ($s.RunningOn) { Write-Warning "ccr: '$($s.Title)' is open on $($s.RunningOn) - close it there before moving it to '$tgt'; skipped"; continue }
+            elseif (Get-CcrAccountMissing $s.Tool $moveTo) { Write-Warning "$(Get-CcrAccountMissing $s.Tool $moveTo)   '$($s.Title)' skipped, not moved."; continue }
             else { $rootPath = $moveTo.Path }
         }
         $launch.Add([pscustomobject]@{ Tool = $s.Tool; Title = $s.Title; Cwd = $cwd; Command = $cmd; CommandSh = $cmdSh; Argv = $argv; RootPath = $rootPath; Session = $s; MoveTo = $moveTo })

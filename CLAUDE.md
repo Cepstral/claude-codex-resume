@@ -123,6 +123,12 @@ pane, which shows the full title and folder of the highlighted row.
   and backslashes, single quotes and [brackets] in that argument are left
   alone. Tab titles are stripped of `;` for the same reason. Windows only:
   ccr.py hands tabs a shell string through osascript / tmux.
+- Nothing is started under an account whose dir does not exist on this PC
+  (codex refuses a missing CODEX_HOME, claude would start from an empty
+  dir): a new conversation or a move there stops with the error and the
+  command that fixes it - `ccr -AddAccount <label> -Tool <tool>`, or the
+  tool's own login for the default account. An account added on another PC
+  is the usual case: ccr.json syncs, the codex dirs do not (2026-09-29).
 - Account dirs are created next to the tool's default dir (never a fixed
   `~\.claude-<label>`), and reused without a new login when they already hold one.
 - No absolute machine paths, no personal data in the repo or docs.
