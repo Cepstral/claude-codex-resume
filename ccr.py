@@ -32,7 +32,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.63"
+VERSION = "0.64"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -2015,7 +2015,8 @@ def install_plan(st: dict) -> dict:
                 target = "stable"
         if os.name == "nt":
             script = f"& ([scriptblock]::Create((irm {url}))) {target}" if target else f"irm {url} | iex"
-            plan["argv"] = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script]
+            plan["argv"] = [str(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "WindowsPowerShell" / "v1.0"
+                                 / "powershell.exe"), "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script]
         else:
             script = (f"curl -fsSL {url} | bash" + (f" -s {target}" if target else "")) if tool == "claude" \
                 else f"curl -fsSL {url} | sh"
@@ -2065,8 +2066,14 @@ def run_install(tool: str, dry: bool) -> bool:
     argv = list(plan["argv"])
     exe = shutil.which(argv[0]) or argv[0]   # npm.cmd / powershell.exe on Windows
     print(f"{YELLOW}ccr: {plan['verb']} {tool} - running: {plan['text']}{RESET}")
+    env = tool_env(tool, plan["data_dir"])
+    if os.name == "nt" and plan["kind"] == "installer":
+        # System32 first, as in a stock shell: codex's installer calls a bare
+        # `tar`, and the GNU tar of Git for Windows reads "C:\..." as a
+        # remote host and fails.
+        env["PATH"] = str(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32") + os.pathsep + env.get("PATH", "")
     try:
-        code = subprocess.run([exe] + argv[1:], env=tool_env(tool, plan["data_dir"])).returncode
+        code = subprocess.run([exe] + argv[1:], env=env).returncode
     except OSError as e:
         print(f"ccr: cannot run {argv[0]}: {e}", file=sys.stderr)
         return False

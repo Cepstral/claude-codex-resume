@@ -105,6 +105,10 @@ pane, which shows the full title and folder of the highlighted row.
   shell. ccr runs them in a child `powershell -NoProfile -ExecutionPolicy
   Bypass -Command` (Windows) or `sh -c` (elsewhere), then appends the new
   registry PATH entries to its own session so the tool works at once.
+  The child also gets System32 first on its PATH and powershell.exe by full
+  path: codex's installer calls a bare `tar`, and Git for Windows' GNU tar
+  (first on the PATH when ccr runs from Git Bash) reads the C: of an archive
+  path as a remote host - "Cannot connect to C: resolve failed" (2026-09-29).
 - `ForEach-Object <Member>` (the member-name form) goes through ShouldProcess:
   under `-WhatIf` it prints "What if: ... property ..." and returns nothing.
   Always write `ForEach-Object { $_.Member }` - a launch check and the

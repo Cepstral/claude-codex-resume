@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.63'
+$script:CcrVersion = '0.64'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -2033,16 +2033,25 @@ function Invoke-CcrInstall {
     $prev = [Environment]::GetEnvironmentVariable($var)
     [Environment]::SetEnvironmentVariable($var, $plan.DataDir)
     $code = 1
+    # Windows installers see System32 first on their PATH, as in a stock
+    # shell: codex's calls a bare `tar`, and the GNU tar of Git for Windows
+    # (first on the PATH when ccr runs from Git Bash) reads "C:\..." as a
+    # remote host and fails.
+    $prevPath = $env:Path
     try {
         if ($plan.Kind -eq 'installer') {
-            if ($IsWindows) { & powershell.exe -NoProfile -ExecutionPolicy Bypass -Command $plan.Script }
+            if ($IsWindows) {
+                $sys32 = Join-Path $env:SystemRoot 'System32'
+                $env:Path = "$sys32;$env:Path"
+                & (Join-Path $sys32 'WindowsPowerShell\v1.0\powershell.exe') -NoProfile -ExecutionPolicy Bypass -Command $plan.Script
+            }
             else { & sh -c $plan.Script }
         }
         else { $exe = $plan.Argv[0]; $rest = @($plan.Argv | Select-Object -Skip 1); & $exe @rest }
         $code = $LASTEXITCODE
     }
     catch { Write-Warning "ccr: $($plan.Verb) $Tool failed: $_" }
-    finally { [Environment]::SetEnvironmentVariable($var, $prev) }
+    finally { $env:Path = $prevPath; [Environment]::SetEnvironmentVariable($var, $prev) }
     Update-CcrSessionPath
     $after = Get-CcrToolInstall -Tool $Tool
     if ($after.Path) {
