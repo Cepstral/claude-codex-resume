@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.62'
+$script:CcrVersion = '0.63'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -534,7 +534,7 @@ function Disable-CcrMultiAccount {
             throw "ccr: the default $t account lives in $($dst.Path), but $t itself uses $plain - the sessions would disappear from ccr. Make them the same dir first."
         }
     }
-    $labels = @(@(Get-CcrClaudeRoots) + @(Get-CcrCodexRoots) | Where-Object { $_.Label -and -not $_.Default } | ForEach-Object Label | Select-Object -Unique)
+    $labels = @(@(Get-CcrClaudeRoots) + @(Get-CcrCodexRoots) | Where-Object { $_.Label -and -not $_.Default } | ForEach-Object { $_.Label } | Select-Object -Unique)
     foreach ($lbl in $labels) { Remove-CcrAccount -Label $lbl }
     $cfg = Get-CcrConfig
     foreach ($key in 'claudeRoots', 'codexRoots', 'defaultRoot') { if ($cfg.PSObject.Properties[$key]) { $cfg.PSObject.Properties.Remove($key) } }
@@ -1478,7 +1478,7 @@ function Show-CcrAccountPage {
         # tool, then label -> @{ Action = 'add'; Tool; Label } or $null
         $tool = Select-CcrTool -Title 'tool for the new account' -ClaudeNote 'fresh dir + claude auth login' -CodexNote 'fresh dir + codex login'
         if (-not $tool) { return $null }
-        $taken = @(@(if ($tool -eq 'claude') { $ClaudeRoots } else { $CodexRoots }) | ForEach-Object Label | Where-Object { $_ })
+        $taken = @(@(if ($tool -eq 'claude') { $ClaudeRoots } else { $CodexRoots }) | ForEach-Object { $_.Label } | Where-Object { $_ })
         while ($true) {
             $label = Read-CcrInput -Prompt "label for the new $tool account (e.g. work)> " -Hint $labelHint
             if ($null -eq $label) { return $null }
@@ -1882,6 +1882,237 @@ function Select-CcrPath {
 }
 
 # =============================================================================
+#  installing the tools: Ctrl+I (or Ctrl+T) in the picker, -Install <tool>
+# =============================================================================
+
+# The vendors' published installers, fetched from their official URLs at the
+# moment of the install and run as published: ccr keeps no copy of them.
+# Both check what they download (claude: the SHA256 listed in a signed
+# manifest; codex: the release's SHA256 sums), need no admin rights and no
+# Node.js, and put their tool on the user PATH.
+$script:CcrInstallerUrl = @{
+    claude = @{ Windows = 'https://claude.ai/install.ps1'; Unix = 'https://claude.ai/install.sh' }
+    codex  = @{ Windows = 'https://chatgpt.com/codex/install.ps1'; Unix = 'https://chatgpt.com/codex/install.sh' }
+}
+
+# Append to this shell's PATH the entries the registry has and it lacks. An
+# installer writes the user PATH for new processes only, so without this the
+# tool it has just installed stays "not recognized" in this shell.
+function Update-CcrSessionPath {
+    if (-not $IsWindows) { return }
+    $have = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($e in "$env:Path" -split ';') { if ($e) { [void]$have.Add($e.TrimEnd('\')) } }
+    $add = [System.Collections.Generic.List[string]]::new()
+    foreach ($scope in 'User', 'Machine') {
+        foreach ($e in "$([Environment]::GetEnvironmentVariable('Path', $scope))" -split ';') {
+            if (-not $e) { continue }
+            $x = [Environment]::ExpandEnvironmentVariables($e).TrimEnd('\')
+            if ($have.Add($x)) { $add.Add($x) }
+        }
+    }
+    if ($add.Count) { $env:Path = (@("$env:Path".TrimEnd(';')) + @($add)) -join ';' }
+}
+
+# A path with its links followed (npm and Homebrew install links).
+function Resolve-CcrLinkPath([string]$Path) {
+    try { $t = [System.IO.File]::ResolveLinkTarget($Path, $true); if ($t) { return $t.FullName } } catch { }
+    $Path
+}
+
+# Where a tool comes from on this machine: path, version, and how it was
+# installed - 'native' (claude's own installer, ~\.local\bin), 'standalone'
+# (codex's own installer), 'npm', 'winget', 'brew', 'other', or '' when it
+# is not installed.
+function Get-CcrToolInstall {
+    param([Parameter(Mandatory)][ValidateSet('claude', 'codex')][string]$Tool)
+    $cmd = @(Get-Command $Tool -CommandType Application, ExternalScript -ErrorAction SilentlyContinue)[0]
+    if (-not $cmd) { return [pscustomobject]@{ Tool = $Tool; Path = ''; Real = ''; Version = ''; Method = '' } }
+    $path = $cmd.Source
+    $real = Resolve-CcrLinkPath $path
+    $ver = ''
+    try {
+        $out = & $path --version 2>$null | Select-Object -First 1
+        if ("$out" -match '\d+\.\d+\.\d+[^\s)]*') { $ver = $Matches[0] }
+    }
+    catch { }
+    $p = $real.Replace('\', '/').ToLowerInvariant()
+    $home2 = "$HOME".Replace('\', '/').ToLowerInvariant()
+    $local = "$([Environment]::GetFolderPath('LocalApplicationData'))".Replace('\', '/').ToLowerInvariant()
+    $roam = "$([Environment]::GetFolderPath('ApplicationData'))".Replace('\', '/').ToLowerInvariant()
+    $method = if ($Tool -eq 'claude' -and ($p -eq "$home2/.local/bin/claude.exe" -or $p -eq "$home2/.local/bin/claude" -or $p.Contains('/.local/share/claude/versions/'))) { 'native' }
+    elseif ($Tool -eq 'codex' -and (($local -and $p.StartsWith("$local/programs/openai/codex/")) -or $p.Contains('/packages/standalone/'))) { 'standalone' }
+    elseif (($roam -and $p.StartsWith("$roam/npm/")) -or $p.Contains('/node_modules/')) { 'npm' }
+    elseif ($p.Contains('/microsoft/winget/')) { 'winget' }
+    elseif ($p.Contains('/caskroom/')) { 'brew' }
+    else { 'other' }
+    [pscustomobject]@{ Tool = $Tool; Path = $path; Real = $real; Version = $ver; Method = $method }
+}
+
+# What installing or updating a tool means here. A missing tool gets its
+# vendor's published installer; an installed one is updated the way it was
+# installed (claude: `claude update`; codex has no update command, so its
+# installer again, which updates in place; npm / winget / brew their own
+# upgrade); one installed another way is left alone. Returns @{ Verb;
+# Kind ('installer' | 'command' | 'none'); Text (what the page and -WhatIf
+# show); Script / Argv; DataDir; Note }.
+function Get-CcrInstallPlan {
+    param([Parameter(Mandatory)][object]$State)
+    $t = $State.Tool
+    $dataDir = @(Get-CcrRoots -Tool $t | Where-Object Default)[0].Path
+    $plan = [pscustomobject]@{ Tool = $t; Verb = ''; Kind = 'none'; Text = ''; Script = ''; Argv = @(); DataDir = $dataDir; Note = '' }
+    if (-not $State.Method -or ($t -eq 'codex' -and $State.Method -eq 'standalone')) {
+        $url = $script:CcrInstallerUrl[$t][$(if ($IsWindows) { 'Windows' } else { 'Unix' })]
+        # Claude's installer makes the channel it installs from the one it
+        # auto-updates from, and settings.json is shared across PCs here:
+        # keep "stable" when that is the chosen channel.
+        $target = ''
+        if ($t -eq 'claude') {
+            try {
+                $sj = Get-Content -LiteralPath (Join-Path $dataDir 'settings.json') -Raw -ErrorAction Stop | ConvertFrom-Json
+                if ("$($sj.autoUpdatesChannel)" -eq 'stable') { $target = 'stable' }
+            }
+            catch { }
+        }
+        $plan.Kind = 'installer'
+        $plan.Verb = if ($State.Method) { 'update' } else { 'install' }
+        $plan.Script = if ($IsWindows) {
+            if ($target) { "& ([scriptblock]::Create((irm $url))) $target" } else { "irm $url | iex" }
+        }
+        elseif ($t -eq 'claude') { "curl -fsSL $url | bash$(if ($target) { " -s $target" })" }
+        else { "curl -fsSL $url | sh" }
+        $plan.Text = $plan.Script
+        $plan.Note = if ($t -eq 'claude') {
+            "Claude's published installer: it checks the download against a signed manifest and puts claude on your PATH ($(if ($target) { 'stable' } else { 'latest' }) channel, as in settings.json)."
+        }
+        else {
+            "Codex's published installer: it checks the download against the release's SHA256 sums, keeps its package in the default account's data dir ($(Format-CcrCwd $dataDir 40)) and puts codex on your PATH$(if ($State.Method) { '; run again it updates in place' })."
+        }
+        return $plan
+    }
+    $plan.Verb = 'update'
+    $plan.Kind = 'command'
+    switch ($State.Method) {
+        'native' { $plan.Argv = @($State.Path, 'update'); $plan.Text = 'claude update'; $plan.Note = 'Claude updates itself in place, on the channel set in settings.json.' }
+        'npm' {
+            $pkg = if ($t -eq 'claude') { '@anthropic-ai/claude-code' } else { '@openai/codex' }
+            $plan.Argv = @('npm', 'install', '-g', "$pkg@latest"); $plan.Text = $plan.Argv -join ' '
+            $plan.Note = "Installed with npm, so updated with npm (the vendor's documented command)."
+        }
+        'winget' {
+            if ($t -eq 'claude') { $plan.Argv = @('winget', 'upgrade', 'Anthropic.ClaudeCode'); $plan.Text = $plan.Argv -join ' '; $plan.Note = 'Installed with WinGet, so updated with WinGet.' }
+        }
+        'brew' {
+            $cask = if ("$($State.Real)" -match '[\\/][Cc]askroom[\\/]([^\\/]+)[\\/]') { $Matches[1] } elseif ($t -eq 'claude') { 'claude-code' } else { 'codex' }
+            $plan.Argv = @('brew', 'upgrade', '--cask', $cask); $plan.Text = $plan.Argv -join ' '; $plan.Note = 'Installed with Homebrew, so updated with Homebrew.'
+        }
+    }
+    if (-not $plan.Argv.Count) {
+        $plan.Verb = 'leave'; $plan.Kind = 'none'
+        $plan.Note = "$t is installed at $(Format-CcrCwd $State.Path 60) by a method ccr does not manage - update it the way you installed it."
+    }
+    $plan
+}
+
+# Install or update one tool, on the main screen. Installers run in a child
+# process - both call `exit` and Set-StrictMode, which would end or change
+# this shell - with the tool's data dir set to the default account's, since
+# codex keeps its package there.
+function Invoke-CcrInstall {
+    [CmdletBinding(SupportsShouldProcess)]
+    param([Parameter(Mandatory)][ValidateSet('claude', 'codex')][string]$Tool)
+    Update-CcrSessionPath
+    $before = Get-CcrToolInstall -Tool $Tool
+    $plan = Get-CcrInstallPlan -State $before
+    if ($plan.Kind -eq 'none') { Write-Warning "ccr: $($plan.Note)"; return $false }
+    $shown = if ($plan.Kind -eq 'installer' -and $IsWindows) { "powershell -NoProfile -ExecutionPolicy Bypass -Command `"$($plan.Script)`"" }
+    elseif ($plan.Kind -eq 'installer') { "sh -c '$($plan.Script)'" } else { $plan.Text }
+    $was = if ($before.Method) { "$Tool $($before.Version) ($($before.Method))" } else { "$Tool (not installed)" }
+    if (-not $PSCmdlet.ShouldProcess($was, $shown)) { return $true }
+    Write-Host "ccr: $($plan.Verb) $Tool - running: $shown" -ForegroundColor Yellow
+    $var = if ($Tool -eq 'claude') { 'CLAUDE_CONFIG_DIR' } else { 'CODEX_HOME' }
+    $prev = [Environment]::GetEnvironmentVariable($var)
+    [Environment]::SetEnvironmentVariable($var, $plan.DataDir)
+    $code = 1
+    try {
+        if ($plan.Kind -eq 'installer') {
+            if ($IsWindows) { & powershell.exe -NoProfile -ExecutionPolicy Bypass -Command $plan.Script }
+            else { & sh -c $plan.Script }
+        }
+        else { $exe = $plan.Argv[0]; $rest = @($plan.Argv | Select-Object -Skip 1); & $exe @rest }
+        $code = $LASTEXITCODE
+    }
+    catch { Write-Warning "ccr: $($plan.Verb) $Tool failed: $_" }
+    finally { [Environment]::SetEnvironmentVariable($var, $prev) }
+    Update-CcrSessionPath
+    $after = Get-CcrToolInstall -Tool $Tool
+    if ($after.Path) {
+        $delta = if ($before.Version -and $after.Version -and $before.Version -ne $after.Version) { " (was $($before.Version))" } else { '' }
+        Write-Host "ccr: $Tool $($after.Version) is ready$delta - $(Format-CcrCwd $after.Path 60)" -ForegroundColor Green
+        return ($code -eq 0 -or $null -eq $code)
+    }
+    Write-Warning "ccr: $Tool is still not found after the installer (exit code $code) - open a new terminal, or see the vendor's instructions."
+    $false
+}
+
+# The install page (Ctrl+I / Ctrl+T in the picker): claude and codex, their
+# state on this PC and what Enter runs. Returns @{ Tool } after the
+# confirmation screen, or $null on Esc. Runs inside the alt buffer.
+function Show-CcrInstallPage {
+    $dot = [char]0x00B7
+    Write-CcrScreen @("`e[1mInstall / update`e[22m", '', "  `e[2mlooking at claude and codex on this PC...`e[22m")
+    Update-CcrSessionPath
+    $rows = @(foreach ($t in 'claude', 'codex') {
+            $st = Get-CcrToolInstall -Tool $t
+            [pscustomobject]@{ State = $st; Plan = (Get-CcrInstallPlan -State $st) }
+        })
+    $cursor = 0
+    while ($true) {
+        $lines = [System.Collections.Generic.List[string]]::new()
+        $lines.Add("`e[1mInstall / update`e[22m  `e[2mthe vendors' published installers, fetched now and run as published`e[22m")
+        $lines.Add("`e[2m$([char]0x2191)$([char]0x2193) move $dot Enter install / update $dot Esc back`e[22m")
+        for ($i = 0; $i -lt $rows.Count; $i++) {
+            $st = $rows[$i].State; $pl = $rows[$i].Plan
+            $tc = if ($st.Tool -eq 'claude') { "`e[38;5;208m" } else { "`e[36m" }
+            $stateTxt = if ($st.Method) { "$($st.Version)  $($st.Method)" } else { 'not installed' }
+            $stateCol = if ($st.Method) { $stateTxt.PadRight(26) } else { "`e[33m$($stateTxt.PadRight(26))`e[39m" }
+            $what = switch ($pl.Verb) { 'install' { 'Enter installs it' } 'update' { 'Enter updates it' } default { 'ccr leaves it alone' } }
+            $row = "  $tc$($st.Tool.PadRight(7))`e[39m $stateCol  `e[2m$what`e[22m"
+            if ($i -eq $cursor) { $row = "`e[7m$row`e[27m" }
+            $lines.Add($row)
+        }
+        $cur = $rows[$cursor]
+        $lines.Add('')
+        $lines.Add("    where   $(if ($cur.State.Path) { Format-CcrCwd $cur.State.Path 70 } else { 'not on the PATH of this PC' })")
+        if ($cur.Plan.Kind -ne 'none') { $lines.Add("    runs    `e[1m$($cur.Plan.Text)`e[22m") }
+        $lines.Add("    `e[2m$($cur.Plan.Note)`e[22m")
+        Write-CcrScreen $lines
+        $k = [Console]::ReadKey($true)
+        if ($k.Key -eq [ConsoleKey]::C -and ($k.Modifiers -band [ConsoleModifiers]::Control)) { return $null }
+        switch ($k.Key) {
+            'UpArrow' { if ($cursor -gt 0) { $cursor-- } }
+            'DownArrow' { if ($cursor -lt $rows.Count - 1) { $cursor++ } }
+            'Escape' { return $null }
+            'Enter' {
+                if ($cur.Plan.Kind -eq 'none') { Show-CcrNotice "ccr: $($cur.Plan.Note)" '33'; continue }
+                $t = $cur.State.Tool
+                $src = $script:CcrInstallerUrl[$t][$(if ($IsWindows) { 'Windows' } else { 'Unix' })]
+                Write-CcrScreen @(
+                    "`e[1m$((Get-Culture).TextInfo.ToTitleCase($cur.Plan.Verb)) $t`e[22m",
+                    '',
+                    "    runs    `e[1m$($cur.Plan.Text)`e[22m",
+                    $(if ($cur.Plan.Kind -eq 'installer') { "    from    $src  `e[2m(downloaded now, run as published)`e[22m" } else { '' }),
+                    '',
+                    "  `e[2m$($cur.Plan.Note)`e[22m",
+                    '',
+                    "  `e[32m[y]`e[39m run    `e[2many other key: cancel`e[22m")
+                $c = [Console]::ReadKey($true)
+                if ($c.KeyChar -in 'y', 'Y') { return [pscustomobject]@{ Tool = $t } }
+            }
+        }
+    }
+}
+
+# =============================================================================
 #  launch options: a model and an effort for the conversations being resumed
 # =============================================================================
 
@@ -2147,6 +2378,21 @@ function Show-CcrLaunchOptions {
     }
 }
 
+# The picker's key legend, broken at its separators into as many lines as
+# the window needs: cut at the window's edge, it hid the keys at its end.
+function Split-CcrHint([string]$Hint, [int]$Width) {
+    $sep = " $([char]0x00B7) "
+    $out = [System.Collections.Generic.List[string]]::new()
+    $line = ''
+    foreach ($item in $Hint -split [regex]::Escape($sep)) {
+        $cand = if ($line) { $line + $sep + $item } else { $item }
+        if ($cand.Length -le $Width -or -not $line) { $line = $cand }
+        else { $out.Add($line); $line = $item }
+    }
+    if ($line) { $out.Add($line) }
+    @($out | ForEach-Object { if ($_.Length -gt $Width) { $_.Substring(0, [Math]::Max(1, $Width)) } else { $_ } })
+}
+
 # Interactive multi-select over the merged session list. Returns the chosen
 # sessions, or @() on cancel. Runs in the alternate screen buffer.
 function Select-CcrSession {
@@ -2241,7 +2487,7 @@ function Select-CcrSession {
             return $row
         }
     }
-    function Get-CcrAcctAvail([object]$row) { @($entries | Where-Object { $_.Tool -eq $row.Tool } | ForEach-Object Label) }
+    function Get-CcrAcctAvail([object]$row) { @($entries | Where-Object { $_.Tool -eq $row.Tool } | ForEach-Object { $_.Label }) }
     function Get-CcrAcctNumber([string]$tool, [string]$label) {
         $e = @($entries | Where-Object { $_.Tool -eq $tool -and $_.Label -eq $label })
         if ($e.Count) { "$($e[0].N)" } else { '?' }
@@ -2270,7 +2516,11 @@ function Select-CcrSession {
             # --- layout ---
             $w = [Console]::WindowWidth
             $h = [Console]::WindowHeight
-            $viewH = [Math]::Max(1, $h - 2 - $(if ($acctMode) { $entries.Count + 1 } else { 0 }) - $(if ($updNote) { 1 } else { 0 }))
+            # The key legend wraps onto as many lines as the window needs.
+            $hint = if ($acctMode) { "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space cycles the account (dot = as is) $([char]0x00B7) Enter open $([char]0x00B7) Shift+Enter model/effort $([char]0x00B7) Ctrl+N new $([char]0x00B7) Ctrl+A accounts $([char]0x00B7) Ctrl+K usage $([char]0x00B7) Ctrl+J details $([char]0x00B7) Ctrl+X close $([char]0x00B7) Ctrl+I install $([char]0x00B7) Del delete $([char]0x00B7) Esc cancel $([char]0x00B7) v$script:CcrVersion" }
+            else { "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space mark $([char]0x00B7) Enter open $([char]0x00B7) Shift+Enter model/effort $([char]0x00B7) Ctrl+N new $([char]0x00B7) Del delete $([char]0x00B7) Ctrl+A accounts $([char]0x00B7) Ctrl+K usage $([char]0x00B7) Ctrl+J details $([char]0x00B7) Ctrl+X close $([char]0x00B7) Ctrl+I install $([char]0x00B7) Esc cancel $([char]0x00B7) type to filter $([char]0x00B7) v$script:CcrVersion" }
+            $hintLines = @(Split-CcrHint $hint ($w - 1))
+            $viewH = [Math]::Max(1, $h - 1 - $hintLines.Count - $(if ($acctMode) { $entries.Count + 1 } else { 0 }) - $(if ($updNote) { 1 } else { 0 }))
             if ($cursor -gt $view.Count - 1) { $cursor = [Math]::Max(0, $view.Count - 1) }
             if ($cursor -lt $top) { $top = $cursor }
             elseif ($cursor -ge $top + $viewH) { $top = $cursor - $viewH + 1 }
@@ -2331,15 +2581,8 @@ function Select-CcrSession {
                     $line += "  `e[2m$($e.Who.PadRight($whoW))`e[22m"
                     [void]$sb.Append($line).Append("`e[K`n")
                 }
-                $hint = "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space cycles the account (dot = as is) $([char]0x00B7) Enter open $([char]0x00B7) Shift+Enter model/effort $([char]0x00B7) Ctrl+N new $([char]0x00B7) Ctrl+A accounts $([char]0x00B7) Ctrl+K usage $([char]0x00B7) Ctrl+J details $([char]0x00B7) Ctrl+X close $([char]0x00B7) Del delete $([char]0x00B7) Esc cancel $([char]0x00B7) v$script:CcrVersion"
-                if ($hint.Length -gt $w - 1) { $hint = $hint.Substring(0, $w - 1) }
-                [void]$sb.Append("`e[2m").Append($hint).Append("`e[22m`e[K")
             }
-            else {
-                $hint = "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space mark $([char]0x00B7) Enter open $([char]0x00B7) Shift+Enter model/effort $([char]0x00B7) Ctrl+N new $([char]0x00B7) Del delete $([char]0x00B7) Ctrl+A accounts $([char]0x00B7) Ctrl+K usage $([char]0x00B7) Ctrl+J details $([char]0x00B7) Ctrl+X close $([char]0x00B7) Esc cancel $([char]0x00B7) type to filter $([char]0x00B7) v$script:CcrVersion"
-                if ($hint.Length -gt $w - 1) { $hint = $hint.Substring(0, $w - 1) }
-                [void]$sb.Append("`e[2m").Append($hint).Append("`e[22m`e[K")
-            }
+            [void]$sb.Append("`e[2m").Append($hintLines -join "`e[K`n").Append("`e[22m`e[K")
 
             # One cell of a row: cut with an ellipsis ($scroll = -1), or - on
             # the highlighted row, while the picker waits for a key - rotated
@@ -2415,7 +2658,7 @@ function Select-CcrSession {
             # after a short pause, one character every 150 ms; the first key
             # stops it and is handled as usual.
             if ($view.Count -gt 0 -and (Test-CcrRowOverflow $view[$cursor])) {
-                $headerLines = 2 + $(if ($updNote) { 1 } else { 0 }) + $(if ($acctMode) { $entries.Count + 1 } else { 0 })
+                $headerLines = 1 + $hintLines.Count + $(if ($updNote) { 1 } else { 0 }) + $(if ($acctMode) { $entries.Count + 1 } else { 0 })
                 $rowLine = $headerLines + 1 + ($cursor - $top)
                 $tick = 0
                 while (-not [Console]::KeyAvailable) {
@@ -2443,6 +2686,21 @@ function Select-CcrSession {
                 if ($null -eq $opts) { continue }
                 foreach ($s in $toOpen) { Set-CcrLaunchOption $s $opts[$s.Tool].Model $opts[$s.Tool].Effort }
                 return $toOpen
+            }
+            # Ctrl+I (or Ctrl+T): install or update claude / codex. Ctrl+T is
+            # the key of ccr.py, whose fzf picker sees Ctrl+I as Tab.
+            if ($ctrl -and $k.Key -in [ConsoleKey]::I, [ConsoleKey]::T) {
+                $inst = Show-CcrInstallPage
+                if ($null -eq $inst) { continue }
+                # The installer draws on the main screen and may ask questions.
+                [Console]::Write("`e[?25h`e[?1049l")
+                [Console]::TreatControlCAsInput = $prevCtrlC
+                try { $null = Invoke-CcrInstall -Tool $inst.Tool -WhatIf:$WhatIfPreference }
+                catch { Write-Warning "ccr: installing $($inst.Tool) failed: $_" }
+                Write-Host ''
+                Write-Host 'ccr: press any key to go back to the picker' -ForegroundColor DarkGray
+                [void][Console]::ReadKey($true)
+                return [pscustomobject]@{ Restart = $true; Filter = $filter }
             }
             # Ctrl+A: the account page (the same key as the fzf picker of
             # ccr.py, where Ctrl+M is indistinguishable from Enter).
@@ -2939,6 +3197,16 @@ function Resume-CcSessions {
         "ccr updated vX -> vY" for that run.
         $env:CCR_AUTO_UPDATE = '0' turns the check off.
     .EXAMPLE
+        ccr -Install codex
+        Install codex on this PC - or update it when it is there - with the
+        vendor's published installer, downloaded from its official URL now
+        and run as published (irm https://chatgpt.com/codex/install.ps1 |
+        iex; claude: https://claude.ai/install.ps1). An installed tool is
+        updated the way it was installed (claude update, npm, winget), one
+        installed another way is left alone. -Install all does both, -WhatIf
+        prints the command. Ctrl+I in the picker (or Ctrl+T, the key of the
+        macOS picker) opens the same as a page.
+    .EXAMPLE
         ccr -Channel test   then   ccrtest
         Install the test channel (the repo's test branch) as a side-by-side
         copy, Resume-CcSessions.test.ps1 next to this file, and run it as
@@ -2965,6 +3233,9 @@ function Resume-CcSessions {
         # -Channel stable the stable one.
         [ValidateSet('stable', 'test')][string]$Channel = '',
         [switch]$Update,
+        # Install or update claude / codex with the vendors' published
+        # installers (the same as Ctrl+I in the picker); all = both.
+        [ValidateSet('claude', 'codex', 'all')][string]$Install = '',
         # Multi-account: restrict the list to one configured account (label
         # from ccr.json). Also the account Ctrl+N/-n defaults to.
         [string]$Root = '',
@@ -2996,8 +3267,8 @@ function Resume-CcSessions {
         $map = @{ update = 'Update'; channel = 'Channel'; root = 'Root'; accounts = 'Accounts'; 'add-account' = 'AddAccount'
             'remove-account' = 'RemoveAccount'; 'disable-accounts' = 'DisableAccounts'; 'copy-settings' = 'CopySettings'
             'copy-statusline' = 'CopySettings'; tool = 'Tool'; top = 'Top'; new = 'New'; 'new-window' = 'NewWindow'
-            'dry-run' = 'WhatIf'; whatif = 'WhatIf'; 'usage-hours' = 'UsageHours'; usage = 'Usage' }
-        $takesValue = 'Channel', 'Root', 'AddAccount', 'RemoveAccount', 'Tool', 'Top', 'UsageHours'
+            'dry-run' = 'WhatIf'; whatif = 'WhatIf'; 'usage-hours' = 'UsageHours'; usage = 'Usage'; install = 'Install' }
+        $takesValue = 'Channel', 'Root', 'AddAccount', 'RemoveAccount', 'Tool', 'Top', 'UsageHours', 'Install'
         $again = @{} + $PSBoundParameters
         $again.Remove('Filter')
         $rest = @()
@@ -3062,12 +3333,23 @@ function Resume-CcSessions {
             if ($DisableAccounts) { $inv += ' -DisableAccounts' }
             if ($Root) { $inv += " -Root '$($Root -replace "'", "''")'" }
             if ($UsageHours -ne 5) { $inv += " -UsageHours $UsageHours" }
+            if ($Install) { $inv += " -Install $Install" }
             if ($WhatIfPreference) { $inv += ' -WhatIf' }
             & ([scriptblock]::Create($inv))
             return
         }
     }
     catch { }
+
+    # --- installing the tools (-Install; Ctrl+I in the picker) ---------------
+    if ($Install) {
+        $ok = $true
+        foreach ($t in @(if ($Install -eq 'all') { 'claude', 'codex' } else { $Install })) {
+            if (-not (Invoke-CcrInstall -Tool $t -WhatIf:$WhatIfPreference)) { $ok = $false }
+        }
+        if (-not $ok) { $global:LASTEXITCODE = 1 }
+        return
+    }
 
     # --- account management (multi-account) --------------------------------
     if ($Accounts) { Show-CcrAccounts; return }
@@ -3115,7 +3397,11 @@ function Resume-CcSessions {
     $sessions = [System.Collections.Generic.List[object]]::new()
     if ($Tool -in 'claude', 'all') { foreach ($r in $claudeRoots) { foreach ($s in Get-CcrClaudeSession -Root $r) { $sessions.Add($s) } } }
     if ($Tool -in 'codex', 'all') { foreach ($r in $codexRoots) { foreach ($s in Get-CcrCodexSession -Root $r) { $sessions.Add($s) } } }
-    if ($sessions.Count -eq 0) { Write-Warning 'ccr: no sessions found.'; return }
+    if ($sessions.Count -eq 0) {
+        $absent = @('claude', 'codex' | Where-Object { -not (Get-Command $_ -CommandType Application, ExternalScript -ErrorAction SilentlyContinue) })
+        Write-Warning "ccr: no sessions found.$(if ($absent.Count) { " Not installed on this PC: $($absent -join ', ') - ccr -Install $($absent[0]) installs it." })"
+        return
+    }
 
     $sorted = @($sessions | Sort-Object LastActivity -Descending)
     if ($Top -gt 0) { $sorted = @($sorted | Select-Object -First $Top) }
@@ -3219,8 +3505,21 @@ function Resume-CcSessions {
 
     # Validate and build one launch entry per selection. Claude must run from
     # the recorded cwd (resume fails elsewhere); codex resumes from anywhere.
+    # A tool that is not installed here (a codex conversation of the VS Code
+    # extension, say, on a PC without the CLI) cannot resume anything.
+    $absentTool = @{}
+    foreach ($t in @(@($picked) | ForEach-Object { $_.Tool } | Select-Object -Unique)) {
+        if (-not (Get-Command $t -CommandType Application, ExternalScript -ErrorAction SilentlyContinue)) {
+            Update-CcrSessionPath
+            if (-not (Get-Command $t -CommandType Application, ExternalScript -ErrorAction SilentlyContinue)) { $absentTool[$t] = $true }
+        }
+    }
     $launch = [System.Collections.Generic.List[object]]::new()
     foreach ($s in @($picked)) {
+        if ($absentTool[$s.Tool]) {
+            Write-Warning "ccr: skipping '$($s.Tool) $([char]0x00B7) $($s.Title)' - $($s.Tool) is not installed on this PC (ccr -Install $($s.Tool), or Ctrl+I in the picker)"
+            continue
+        }
         if ($s.SessionId -notmatch '^[0-9a-fA-F-]{36}$') {
             Write-Warning "ccr: skipping '$($s.Title)' - unexpected session id '$($s.SessionId)'"
             continue

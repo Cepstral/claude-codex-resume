@@ -41,6 +41,17 @@ record it in the parity table in `docs/multi-account.md`. Known cases so far:
   disk, so its list is the `claude --model` aliases + `.claude.json`
   `additionalModelOptionsCache` + the settings.json model. Codex app threads
   (ccr.py) take no model from outside: ccr warns and hands them to the app.
+- Installing (Ctrl+I / Ctrl+T, -Install): both vendors publish a standalone
+  installer (claude.ai/install.ps1|sh, chatgpt.com/codex/install.ps1|sh), and
+  ccr fetches it from that URL at install time and runs it as published -
+  never a copy in the repo. Updates: claude native -> `claude update`; codex
+  has no update command, so its installer again (it updates in place); npm /
+  winget / brew -> their documented upgrade; anything else is left alone.
+  Codex's installer keeps its package under CODEX_HOME (packages/standalone),
+  so ccr always runs it with the default account's dir, never another
+  account's. Claude's installer makes the channel it installs the auto-update
+  channel, and settings.json is synced across PCs here, so ccr passes
+  `stable` when settings.json has chosen it.
 
 ## PowerShell ↔ Python parity (hard rule)
 
@@ -67,6 +78,8 @@ and alt-enter is Windows Terminal's fullscreen key, so the PowerShell picker
 takes Ctrl+E as well. In ccr.py a row cannot change account and get a model
 in one step (Ctrl-O and Ctrl-E each launch); on Windows Space + Shift+Enter
 combine. The mapping table lives in `docs/multi-account.md`.
+The install page is Ctrl+I on Windows as asked, plus Ctrl+T on both sides:
+fzf cannot take ctrl-i, the byte Tab sends too, so it would steal marking.
 
 Known asymmetries (2026-09-17): `ccr.py` has Codex desktop-app support
 (`codex app` rows, deeplinks, `--terminal`) and a `+ new folder` entry on
@@ -87,6 +100,15 @@ pane, which shows the full title and folder of the highlighted row.
   working copy to the pushed (older) version and silently discarded
   uncommitted edits. When testing from the checkout anyway, set
   `CCR_AUTO_UPDATE=0` and prefer `--dry-run` / `-WhatIf`.
+- The vendors' installers call `exit` and `Set-StrictMode`: run through
+  `irm | iex` in ccr's own session they would end or change the user's
+  shell. ccr runs them in a child `powershell -NoProfile -ExecutionPolicy
+  Bypass -Command` (Windows) or `sh -c` (elsewhere), then appends the new
+  registry PATH entries to its own session so the tool works at once.
+- `ForEach-Object <Member>` (the member-name form) goes through ShouldProcess:
+  under `-WhatIf` it prints "What if: ... property ..." and returns nothing.
+  Always write `ForEach-Object { $_.Member }` - a launch check and the
+  account cycling silently broke under `ccr -WhatIf` before 2026-09-29.
 - Windows Terminal splits its whole command line on `;`, inside a quoted
   `-Command` argument too, so every `;` in the command a tab runs has to
   reach `wt.exe` as `\;`. The account env prefix carries one, and without

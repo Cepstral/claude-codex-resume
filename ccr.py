@@ -8,7 +8,7 @@ as the launch backend. Python 3.9+, stdlib only; fzf for UI.
 
 Keys in the picker (fzf conventions): type to fuzzy-filter, Tab marks,
 Enter opens, Ctrl-E opens with a model / effort, Ctrl-N new conversation, Ctrl-A accounts, Ctrl-O open the
-marked rows under another account, Del deletes, Esc cancels.
+marked rows under another account, Ctrl-T installs or updates claude / codex, Del deletes, Esc cancels.
 """
 import argparse
 import base64
@@ -32,7 +32,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.62"
+VERSION = "0.63"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -78,6 +78,22 @@ def hint(*pairs, tail: str = "") -> str:
     sep = f"{DIM}  ·  {RESET}"
     line = sep.join(f"{BOLD}{CYAN}{k}{RESET} {DIM}{v}{RESET}" for k, v in pairs)
     return right_align(line, f"{DIM}{tail}{RESET}") if tail else line
+
+
+def hint_wrapped(pairs, width: int = 0) -> list:
+    """A key legend broken into as many lines as the terminal needs: fzf cuts
+    a header line that does not fit, which hid the keys at its end."""
+    width = width or shutil.get_terminal_size((100, 24)).columns - 4
+    lines, cur = [], []
+    for pr in pairs:
+        if cur and visible_len(hint(*(cur + [pr]))) > width:
+            lines.append(hint(*cur))
+            cur = [pr]
+        else:
+            cur = cur + [pr]
+    if cur:
+        lines.append(hint(*cur))
+    return lines
 
 
 def ask(prompt: str):
@@ -1288,8 +1304,8 @@ def picker_hint(ctx: Ctx, upd_note: str = "") -> str:
     if ctx.multi_root:
         keys.append(("Ctrl-O", "open under another account"))
     keys += [("Ctrl-N", "new"), ("Ctrl-A", "accounts"), ("Ctrl-K", "usage"), ("Ctrl-J", "details"),
-             ("Ctrl-X", "close"), ("Del", "delete"), ("Esc", "cancel")]
-    lines.append(hint(*keys))
+             ("Ctrl-X", "close"), ("Ctrl-T", "install"), ("Del", "delete"), ("Esc", "cancel")]
+    lines += hint_wrapped(keys)
     words = f"{DIM},{RESET} ".join(f"{CYAN}{w}{RESET}" for w in ("run", "cleared", "app"))
     filters = f"{DIM}type to filter — {RESET}{words}{DIM} match as words{RESET}"
     lines.append(right_align(filters, f"{DIM}ccr v{VERSION}{RESET}"))
@@ -1907,6 +1923,199 @@ def exec_inline(cwd: str, argv: list, title: str, dry: bool, env_prefix: str = "
 
 
 # ----------------------------------------------------------------------------
+# installing the tools: Ctrl-T in the picker (Ctrl+I or Ctrl+T in the
+# PowerShell picker; fzf sees Ctrl-I as Tab), --install <tool>
+# ----------------------------------------------------------------------------
+# The vendors' published installers, fetched from their official URLs at the
+# moment of the install and run as published: ccr keeps no copy of them. Both
+# check what they download (claude: the SHA256 listed in a signed manifest;
+# codex: the release's SHA256 sums), need no admin rights and no Node.js, and
+# put their tool on the PATH (a link in ~/.local/bin plus the shell rc file).
+INSTALLER_URL = {"claude": {"nt": "https://claude.ai/install.ps1", "posix": "https://claude.ai/install.sh"},
+                 "codex": {"nt": "https://chatgpt.com/codex/install.ps1", "posix": "https://chatgpt.com/codex/install.sh"}}
+
+
+def installer_url(tool: str) -> str:
+    return INSTALLER_URL[tool]["nt" if os.name == "nt" else "posix"]
+
+
+def tool_path(tool: str) -> str:
+    """The tool's executable, '' when it is not installed here. Right after an
+    install the installers' link dir may be missing from this process's PATH
+    (they write the shell rc file for new shells); found there, the dir is
+    added to this process's PATH so launches and exec find it too."""
+    found = shutil.which(tool)
+    if found:
+        return found
+    exe = tool + (".exe" if os.name == "nt" else "")
+    dirs = [HOME / ".local" / "bin"]
+    if os.name == "nt" and tool == "codex" and os.environ.get("LOCALAPPDATA"):
+        dirs.append(Path(os.environ["LOCALAPPDATA"]) / "Programs" / "OpenAI" / "Codex" / "bin")
+    for d in dirs:
+        if (d / exe).is_file():
+            os.environ["PATH"] = str(d) + os.pathsep + os.environ.get("PATH", "")
+            return str(d / exe)
+    return ""
+
+
+def tool_install(tool: str) -> dict:
+    """Where a tool comes from on this machine: path, version, and how it was
+    installed - 'native' (claude's own installer), 'standalone' (codex's own
+    installer), 'npm', 'winget', 'brew', 'other', or '' when it is not
+    installed."""
+    path = tool_path(tool)
+    if not path:
+        return {"tool": tool, "path": "", "real": "", "version": "", "method": ""}
+    real = os.path.realpath(path)
+    ver = ""
+    try:
+        out = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=60).stdout or ""
+        m = re.search(r"\d+\.\d+\.\d+[^\s)]*", out)
+        ver = m.group(0) if m else ""
+    except (OSError, subprocess.SubprocessError):
+        pass
+    r = real.replace("\\", "/").lower()
+    home = str(HOME).replace("\\", "/").lower()
+    local = (os.environ.get("LOCALAPPDATA") or "").replace("\\", "/").lower()
+    roam = (os.environ.get("APPDATA") or "").replace("\\", "/").lower()
+    if tool == "claude" and (r in (f"{home}/.local/bin/claude", f"{home}/.local/bin/claude.exe")
+                             or "/.local/share/claude/versions/" in r):
+        method = "native"
+    elif tool == "codex" and ((local and r.startswith(f"{local}/programs/openai/codex/")) or "/packages/standalone/" in r):
+        method = "standalone"
+    elif (roam and r.startswith(f"{roam}/npm/")) or "/node_modules/" in r:
+        method = "npm"
+    elif "/microsoft/winget/" in r:
+        method = "winget"
+    elif "/caskroom/" in r:
+        method = "brew"
+    else:
+        method = "other"
+    return {"tool": tool, "path": path, "real": real, "version": ver, "method": method}
+
+
+def install_plan(st: dict) -> dict:
+    """What installing or updating a tool means here. A missing tool gets its
+    vendor's published installer; an installed one is updated the way it was
+    installed (claude: `claude update`; codex has no update command, so its
+    installer again, which updates in place; npm / winget / brew their own
+    upgrade); one installed another way is left alone."""
+    tool, method = st["tool"], st["method"]
+    data_dir = default_root(tool).path
+    plan = {"tool": tool, "verb": "", "kind": "none", "text": "", "argv": [], "data_dir": data_dir, "url": "", "note": ""}
+    if not method or (tool == "codex" and method == "standalone"):
+        url = installer_url(tool)
+        # Claude's installer makes the channel it installs from the one it
+        # auto-updates from, and settings.json may be shared across machines:
+        # keep "stable" when that is the chosen channel.
+        target = ""
+        if tool == "claude":
+            sj = _json_at(Path(data_dir) / "settings.json")
+            if isinstance(sj, dict) and str(sj.get("autoUpdatesChannel") or "") == "stable":
+                target = "stable"
+        if os.name == "nt":
+            script = f"& ([scriptblock]::Create((irm {url}))) {target}" if target else f"irm {url} | iex"
+            plan["argv"] = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script]
+        else:
+            script = (f"curl -fsSL {url} | bash" + (f" -s {target}" if target else "")) if tool == "claude" \
+                else f"curl -fsSL {url} | sh"
+            plan["argv"] = ["sh", "-c", script]
+        plan.update(kind="installer", verb="update" if method else "install", text=script, url=url)
+        if tool == "claude":
+            plan["note"] = ("Claude's published installer: it checks the download against a signed manifest and puts "
+                            f"claude on your PATH ({target or 'latest'} channel, as in settings.json).")
+        else:
+            plan["note"] = ("Codex's published installer: it checks the download against the release's SHA256 sums, "
+                            f"keeps its package in the default account's data dir ({fmt_cwd(data_dir, 40)}) and puts "
+                            "codex on your PATH" + ("; run again it updates in place." if method else "."))
+        return plan
+    argv, note = [], ""
+    if tool == "claude" and method == "native":
+        argv, note = [st["path"], "update"], "Claude updates itself in place, on the channel set in settings.json."
+    elif method == "npm":
+        pkg = "@anthropic-ai/claude-code" if tool == "claude" else "@openai/codex"
+        argv, note = ["npm", "install", "-g", f"{pkg}@latest"], "Installed with npm, so updated with npm (the vendor's documented command)."
+    elif method == "winget" and tool == "claude":
+        argv, note = ["winget", "upgrade", "Anthropic.ClaudeCode"], "Installed with WinGet, so updated with WinGet."
+    elif method == "brew":
+        m = re.search(r"/caskroom/([^/]+)/", st["real"].replace("\\", "/"), re.I)
+        cask = m.group(1) if m else ("claude-code" if tool == "claude" else "codex")
+        argv, note = ["brew", "upgrade", "--cask", cask], "Installed with Homebrew, so updated with Homebrew."
+    if not argv:
+        plan.update(verb="leave", note=f"{tool} is installed at {fmt_cwd(st['path'], 60)} by a method ccr does not "
+                                       "manage - update it the way you installed it.")
+        return plan
+    shown = ["claude"] + argv[1:] if argv[0] == st["path"] else argv
+    plan.update(kind="command", verb="update", argv=argv, text=" ".join(shown), note=note)
+    return plan
+
+
+def run_install(tool: str, dry: bool) -> bool:
+    """Install or update one tool. The installer runs as a child process with
+    the tool's data dir set to the default account's (codex keeps its package
+    there) and the terminal attached, so its own questions reach you."""
+    before = tool_install(tool)
+    plan = install_plan(before)
+    if plan["kind"] == "none":
+        print(f"{YELLOW}ccr: {plan['note']}{RESET}", file=sys.stderr)
+        return False
+    if dry:
+        print(f"dry-run: would run  {plan['text']}   ({tool}: {before['version'] + ' ' + before['method'] if before['method'] else 'not installed'})")
+        return True
+    argv = list(plan["argv"])
+    exe = shutil.which(argv[0]) or argv[0]   # npm.cmd / powershell.exe on Windows
+    print(f"{YELLOW}ccr: {plan['verb']} {tool} - running: {plan['text']}{RESET}")
+    try:
+        code = subprocess.run([exe] + argv[1:], env=tool_env(tool, plan["data_dir"])).returncode
+    except OSError as e:
+        print(f"ccr: cannot run {argv[0]}: {e}", file=sys.stderr)
+        return False
+    after = tool_install(tool)
+    if after["path"]:
+        was = f" (was {before['version']})" if before["version"] and after["version"] and before["version"] != after["version"] else ""
+        print(f"{GREEN}ccr: {tool} {after['version']} is ready{was} - {fmt_cwd(after['path'], 60)}{RESET}")
+        if not shutil.which(tool):
+            print(f"{DIM}ccr: new shells find it once they read the updated rc file - open a new terminal.{RESET}")
+        return code == 0
+    print(f"ccr: {tool} is still not found after the installer (exit code {code}) - open a new terminal, "
+          "or see the vendor's instructions.", file=sys.stderr)
+    return False
+
+
+def install_page():
+    """Ctrl-T: claude and codex, their state here and what Enter runs.
+    Returns the tool picked (after a confirmation), or None."""
+    print(f"{DIM}ccr: looking at claude and codex on this computer...{RESET}")
+    rows, plans = [], {}
+    for t in ("claude", "codex"):
+        st = tool_install(t)
+        pl = install_plan(st)
+        plans[t] = (st, pl)
+        state = f"{st['version']}  {st['method']}" if st["method"] else "not installed"
+        state_col = f"{state:<26}" if st["method"] else f"{YELLOW}{state:<26}{RESET}"
+        what = {"install": "Enter installs it", "update": "Enter updates it"}.get(pl["verb"], "ccr leaves it alone")
+        runs = f"   {DIM}{pl['text']}{RESET}" if pl["kind"] != "none" else ""
+        rows.append(f"{t}\t{TOOL_COLOR[t]}{t:<7}{RESET} {state_col}  {DIM}{what}{RESET}{runs}")
+    res = run_fzf(rows, hint(("Enter", "install / update"), ("Esc", "back"),
+                             tail="the vendors' published installers, fetched now and run as published"),
+                  multi=False, preview=False, prompt="install> ")
+    if not res or not res[1]:
+        return None
+    t = res[1][0]
+    st, pl = plans[t]
+    if pl["kind"] == "none":
+        print(f"{YELLOW}ccr: {pl['note']}{RESET}")
+        pause("(Enter to continue)")
+        return None
+    print(f"\n{BOLD}{pl['verb'].capitalize()} {t}{RESET}\n    runs    {BOLD}{pl['text']}{RESET}")
+    if pl["kind"] == "installer":
+        print(f"    from    {pl['url']}  {DIM}(downloaded now, run as published){RESET}")
+    print(f"\n  {DIM}{pl['note']}{RESET}\n")
+    ans = ask("  run it? [y/N] ")
+    return t if ans and ans.strip().lower() in ("y", "yes") else None
+
+
+# ----------------------------------------------------------------------------
 # launch options: a model and an effort for the conversations being resumed
 # (Ctrl-E here; Shift+Enter in the PowerShell picker, which fzf cannot see)
 # ----------------------------------------------------------------------------
@@ -2165,6 +2374,12 @@ def launch(picked: list, new_window: bool, dry: bool, ctx: Ctx, terminal: bool =
                 continue
             print(f"ccr: no URL handler here - resuming 'codex app · {s.title}' in a terminal instead",
                   file=sys.stderr)
+        # A tool that is not installed here (a codex conversation of the IDE
+        # extension, say, on a machine without the CLI) cannot resume anything.
+        if not tool_path(s.tool):
+            print(f"ccr: skipping '{s.tool} · {s.title}' - {s.tool} is not installed on this computer "
+                  f"(ccr --install {s.tool}, or Ctrl-T in the picker)", file=sys.stderr)
+            continue
         cwd = s.cwd
         if not cwd or not Path(cwd).is_dir():
             if s.tool == "claude":
@@ -2614,6 +2829,7 @@ PS_FLAGS = {"update": "--update", "channel": "--channel", "root": "--root", "acc
             "copysettings": "--copy-settings", "copystatusline": "--copy-settings", "tool": "--tool", "top": "--top",
             "new": "--new", "newwindow": "--new-window", "whatif": "--dry-run", "dryrun": "--dry-run",
             "usagehours": "--usage-hours", "usage": "--usage", "tabs": "--tabs", "terminal": "--terminal", "version": "--version",
+            "install": "--install",
             "filter": None}
 
 
@@ -2671,6 +2887,10 @@ def main():
                      help="move its sessions to the default account and forget the entry (nothing deleted)")
     acc.add_argument("--disable-accounts", action="store_true",
                      help="do that for every account and turn multi-account mode off")
+    ins = ap.add_argument_group("installing the tools")
+    ins.add_argument("--install", choices=["claude", "codex", "all"], default="",
+                     help="install or update claude / codex with the vendor's published installer, fetched from its "
+                          "official URL and run as published (Ctrl-T in the picker); all = both")
     upd = ap.add_argument_group("release channels")
     upd.add_argument("--update", action="store_true",
                      help="refresh this copy from its own channel (ccr: main, ccrtest: the test branch)")
@@ -2712,6 +2932,11 @@ def main():
             env = dict(os.environ)
             env["CCR_UPDATED_FROM"] = f"{upd[0]}>{upd[1]}"
             os.execve(sys.executable, [sys.executable, channel_path(channel_of(me), me)] + sys.argv[1:], env)
+    if a.install:
+        ok = True
+        for t in (["claude", "codex"] if a.install == "all" else [a.install]):
+            ok = run_install(t, a.dry_run) and ok
+        sys.exit(0 if ok else 1)
     if a.accounts:
         show_accounts()
         return
@@ -2745,7 +2970,9 @@ def main():
             for r in ctx.codex:
                 sessions += codex_sessions(r)
         if not sessions:
-            sys.exit("ccr: no sessions found.")
+            absent = [t for t in ("claude", "codex") if not tool_path(t)]
+            sys.exit("ccr: no sessions found." + (f" Not installed on this computer: {', '.join(absent)} - "
+                                                  f"ccr --install {absent[0]} installs it." if absent else ""))
         sessions.sort(key=lambda s: s.last, reverse=True)
         if a.top > 0:
             sessions = sessions[: a.top]
@@ -2781,7 +3008,7 @@ def main():
             index = {}
             rows = session_rows(sessions, index, ctx, usage_of if usage_on else None)
             res = run_fzf(rows, picker_hint(ctx, upd_note), query=query,
-                          expect=["del", "ctrl-n", "ctrl-a", "ctrl-o", "ctrl-k", "ctrl-j", "ctrl-x", "ctrl-e"])
+                          expect=["del", "ctrl-n", "ctrl-a", "ctrl-o", "ctrl-k", "ctrl-j", "ctrl-x", "ctrl-e", "ctrl-t"])
             if res is None:
                 print("ccr: cancelled.")
                 return
@@ -2807,6 +3034,16 @@ def main():
                 if not new_conversation(sessions, "", a.dry_run, ctx, a.terminal):
                     print("ccr: cancelled.")
                 return
+            if key == "ctrl-t":
+                # Install or update claude / codex (Ctrl+I or Ctrl+T in the
+                # PowerShell picker; fzf sees Ctrl-I as Tab), then list again.
+                tool = install_page()
+                if tool:
+                    run_install(tool, a.dry_run)
+                    pause()
+                    restart = True
+                    upd_note = ""
+                continue
             if key == "ctrl-a":
                 # The account page: add / remove / copy settings / turn off,
                 # then run again from the top so the listing and the account
