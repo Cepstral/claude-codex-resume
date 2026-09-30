@@ -200,6 +200,14 @@ pane, which shows the full title and folder of the highlighted row.
   - `$null | ForEach-Object { }` runs the block once: filter with
     `Where-Object { $_ }` before turning a list that may be absent into
     strings.
+- `& exe @(F)`, where F returns `, $list.ToArray()`, hands the native
+  program ONE argument, the whole list joined with spaces: `@()` holds the
+  list as a single element. wt then opened one default-profile tab and no MAP
+  viewer (v0.69-v0.70); every test passed because they checked the list, not
+  the call. Assign, then splat: `$argv = F; & exe @argv`. And wt returns before
+  its tabs exist and says nothing when it drops a request: Open-CcrPanelTabs /
+  open_panel_tabs wait for the viewers' processes. The harness gives the real
+  function a stand-in wt.exe that records its arguments (scratch, csc-built).
 - The MAP tabs never run an agent: ccr owns every process, and a tab only
   follows the run's live record (agent-<i>.jsonl plus each turn's output,
   both append-only) and at the end offers `--resume` / `resume`. A tab that

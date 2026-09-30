@@ -161,6 +161,12 @@ says how, and **`Enter` there opens the agent's session** — `claude --resume` 
 normal CLI, to go on with it. Any other key closes the tab. Windows Terminal
 moves to each tab it opens; ccr's own tab keeps the summary.
 
+ccr checks that the tabs started: a terminal returns before its new tabs exist
+and says nothing when it drops a request, so ccr waits a few seconds for each
+tab's viewer and otherwise says in the header how many opened. **`T`** during
+the MAP opens the agents' tabs again — after closing one, or when the terminal
+did not open them; each new tab replays its agent's record from the start.
+
 Nobody can answer an agent during the MAP: the rules tell every agent to state
 its assumptions instead of asking. A question an agent writes anyway reaches the
 other agents, and you, in its tab; you answer it in that agent's session at the
@@ -284,5 +290,6 @@ The same panel, the same rules and flags, with fzf menus instead of the pages:
 | the agents' tabs: Windows Terminal tabs (tmux windows in the background inside tmux); at the end any key but `Enter` closes | an iTerm2 tab, a Terminal.app window or a tmux window in the background; at the end `Enter` opens the session, `Ctrl-C` closes. Not on Windows, where `ccr.py` has no tab backend |
 | `Ctrl+C` read as a key; agents in hidden child processes | `Ctrl-C`, and `SIGHUP` / `SIGTERM` too, end every agent's process group (`taskkill /T` on Windows) |
 | a long turn: `Enter` keeps waiting, `S` stops it | `Enter` keeps waiting, `s` + `Enter` stops it (the terminal reads whole lines) |
+| `T`: the agents' tabs again | `t` + `Enter` |
 | going on: `Ctrl+R` on the question page or `ccr -Panel -Continue`; the saved MAPs, the message page, the panel page (model, effort, round limit) | `r` at the question prompt or `ccr --panel --continue`; the saved MAPs in fzf, the message at the prompt (`e` for the editor), the agents list (model, effort, round limit) |
 | transcript in `%LOCALAPPDATA%\ccr\panels\` | transcript in `~/.cache/ccr/panels/` |

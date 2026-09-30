@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.70'
+$script:CcrVersion = '0.71'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -2582,13 +2582,18 @@ function Stop-CcrAgentTurn([object]$Turn) {
 }
 
 # Keys typed while agents run (TreatControlCAsInput is on): Ctrl+C stops the
-# MAP; while ccr asks about a turn past the time mark, Enter keeps waiting and
-# S stops that agent.
+# MAP; T opens the agents' tabs again; while ccr asks about a turn past the
+# time mark, Enter keeps waiting and S stops that agent.
 function Test-CcrPanelStop([object]$Ctx) {
     try {
         while ([Console]::KeyAvailable) {
             $k = [Console]::ReadKey($true)
             if ($k.Key -eq [ConsoleKey]::C -and ($k.Modifiers -band [ConsoleModifiers]::Control)) { $Ctx.Stopped = $true }
+            elseif ("$($k.KeyChar)" -eq 't' -and $Ctx.Tabs) {
+                # the agents' tabs again: one was closed, or the terminal dropped them
+                $why = Open-CcrPanelTabs -Agents $Ctx.Agents -Dir $Ctx.Temp -Folder $Ctx.Folder
+                [Console]::Write("`r`e[K`e[33mccr: $(if ($why) { "tabs: $why" } else { 'the agents'' tabs are open' }).`e[39m`n")
+            }
             elseif ($Ctx.Asking) {
                 if ($k.Key -eq [ConsoleKey]::Enter) { $Ctx.Asking.AskAt = [DateTime]::UtcNow.AddMinutes($Ctx.AskAfter); $Ctx.Asking = $null }
                 elseif ("$($k.KeyChar)" -eq 's') { $Ctx.Asking.StopRequested = $true; $Ctx.Asking = $null }
@@ -2737,7 +2742,7 @@ function Invoke-CcrPanelBatch {
             }
             $tok = [long]0
             foreach ($x in $Ctx.Agents) { $tok += $x.In + $x.Out }
-            Write-CcrPanelStatus "$($Ctx.Status) $([char]0x00B7) thinking: $($parts -join ', ') $([char]0x00B7) $(Format-CcrTokens $tok) tokens $([char]0x00B7) Ctrl+C stops"
+            Write-CcrPanelStatus "$($Ctx.Status) $([char]0x00B7) thinking: $($parts -join ', ') $([char]0x00B7) $(Format-CcrTokens $tok) tokens $([char]0x00B7) $(if ($Ctx.Tabs) { "T reopens tabs $([char]0x00B7) " })Ctrl+C stops"
         }
         $until = [DateTime]::UtcNow.AddMilliseconds(250)
         while ([DateTime]::UtcNow -lt $until -and -not (Test-CcrPanelStop $Ctx)) { Start-Sleep -Milliseconds 50 }
@@ -2975,14 +2980,32 @@ function Get-CcrPanelTabTitle([object]$Agent, [int]$N) {
 }
 
 # Open the live tabs: Windows Terminal tabs in this window, or tmux windows
-# (in the background) when ccr runs inside tmux. $false = neither is here.
+# (in the background) when ccr runs inside tmux. '' = they are open, else why
+# not ('not available here ...' when neither is here).
 function Open-CcrPanelTabs {
     param([object[]]$Agents, [string]$Dir, [string]$Folder)
     $self = $MyInvocation.MyCommand.ScriptBlock.File
-    if (-not $self) { return $false }
+    if (-not $self) { return 'ccr does not know its own file' }
     $wt = @(Get-Command wt.exe -CommandType Application -ErrorAction SilentlyContinue)[0]
     if ($IsWindows -and $env:WT_SESSION -and $wt) {
-        try { & $wt.Source @(Get-CcrPanelTabArgs -Agents $Agents -Dir $Dir -Folder $Folder -Self $self); return $true } catch { return $false }
+        # Splat the list. @(Get-CcrPanelTabArgs ...) held it as ONE element,
+        # which a native command gets as a single space-joined argument: wt
+        # then opened one default-profile tab and no viewer (v0.69-v0.70).
+        $argv = Get-CcrPanelTabArgs -Agents $Agents -Dir $Dir -Folder $Folder -Self $self
+        try { $null = & $wt.Source @argv } catch { return "wt failed: $_" }
+        # wt returns before the tabs exist and says nothing when it drops a
+        # request: wait for the viewers (their command line names the run).
+        $leaf = Split-Path -Leaf $Dir
+        $want = @($Agents).Count
+        $seen = 0
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        while ($seen -lt $want -and $sw.Elapsed.TotalSeconds -lt 5) {
+            Start-Sleep -Milliseconds 250
+            $seen = @(Get-CimInstance Win32_Process -Filter "Name='pwsh.exe'" -ErrorAction SilentlyContinue |
+                    Where-Object { "$($_.CommandLine)".Contains($leaf) }).Count
+        }
+        if ($seen -lt $want) { return "Windows Terminal opened $seen of $want" }
+        return ''
     }
     if ($env:TMUX -and (Get-Command tmux -CommandType Application -ErrorAction SilentlyContinue)) {
         $sq = { param($s) "'" + ("$s" -replace "'", "''") + "'" }
@@ -2990,10 +3013,11 @@ function Open-CcrPanelTabs {
         foreach ($a in $Agents) {
             $cmd = ". $(& $sq $self); Watch-CcrPanelAgent -Dir $(& $sq $Dir) -Index $($a.Index)"
             & tmux new-window -d -n (Get-CcrPanelTabTitle $a $n) -c $Folder pwsh -NoProfile -Command $cmd
+            if ($LASTEXITCODE) { return "tmux failed (exit $LASTEXITCODE)" }
         }
-        return $true
+        return ''
     }
-    $false
+    'not available here (Windows Terminal or tmux only)'
 }
 
 # An agent's tab: what the agent does, live - its reads, searches, commands
@@ -3455,8 +3479,10 @@ function Invoke-CcrPanel {
                 role = $(if ($a.Master) { 'master, can change files' } else { 'reviewer, no file changes' }); folder = $Folder
                 question = (Get-CcrPanelShort $Question 120); pid = $PID; session = $a.SessionId }
         }
-        if (Open-CcrPanelTabs -Agents $agents -Dir $ctx.Temp -Folder $Folder) { $tabsNote = 'tabs: one per agent, live - Enter there at the end opens its session' }
-        else { $ctx.Tabs = $false; $tabsNote = 'tabs: not available here (Windows Terminal or tmux only)' }
+        $why = Open-CcrPanelTabs -Agents $agents -Dir $ctx.Temp -Folder $Folder
+        if (-not $why) { $tabsNote = 'tabs: one per agent, live - Enter there at the end opens its session; T opens them again' }
+        elseif ($why -like 'not available*') { $ctx.Tabs = $false; $tabsNote = "tabs: $why" }
+        else { $tabsNote = "tabs: $why - T tries again" }
     }
     $prevCtrlC = try { [Console]::TreatControlCAsInput } catch { $null }
     $prevEnc = [Console]::OutputEncoding
@@ -3726,7 +3752,7 @@ function Show-CcrPanelPage {
         $pa | Add-Member -Force -NotePropertyName EffModel -NotePropertyValue $(if ($pa.Model) { $pa.Model } elseif ($pinfo.Conf.Model -and $pinfo.Conf.Model -ne '*') { $pinfo.Conf.Model } else { '' })
         $pa | Add-Member -Force -NotePropertyName EffEffort -NotePropertyValue $(if ($pa.Effort) { $pa.Effort } elseif ($pinfo.Conf.Effort -and $pinfo.Conf.Effort -ne '*') { $pinfo.Conf.Effort } else { '' })
         $goesOn = $Continue -and $pa.PSObject.Properties['Prev'] -and ("$($pa.Prev.session)" -or "$($pa.Prev.thread)")
-        $pv = Get-CcrPanelArgv -Agent $pa -First (-not $goesOn) -SessionId '<id>' -Name 'MAP ...' -MasterMode (Get-CcrPanelMasterMode (Get-PanelRoot $pa).Path ([bool]$pa.Master))
+        $pv = Get-CcrPanelArgv -Agent $pa -First (-not $goesOn) -SessionId '<id>' -Name 'MAP ...' -MasterMode $(if ($pa.Tool -eq 'claude') { Get-CcrPanelMasterMode (Get-PanelRoot $pa).Path ([bool]$pa.Master) } else { '' })
         $plain = "  agent $($ai + 1), round $($from): $($pa.Tool) $((@($pv) | ForEach-Object { ConvertTo-CcrWinArg $_ }) -join ' ')"
         if ($plain.Length -gt $w - 1) { $plain = $plain.Substring(0, $w - 2) + [char]0x2026 }
         $lines.Add('')

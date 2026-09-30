@@ -33,7 +33,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.70"
+VERSION = "0.71"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -3381,6 +3381,12 @@ def run_panel_batch(batch: list, prompts: dict, title: str, pc: PanelRun):
                 pc.asking = late
                 sys.stdout.write("\a")
         keys = _poll_keys()
+        if pc.tabs and "t" in keys.lower():
+            # the agents' tabs again: one was closed, or the terminal dropped them
+            why = open_panel_tabs(pc.agents, pc.tmp, pc.folder)
+            msg = f"tabs: {why}" if why else "the agents' tabs are open"
+            sys.stdout.write(f"\r\033[K{YELLOW}ccr: {msg}.{RESET}\n")
+            sys.stdout.flush()
         if pc.asking is not None and keys:
             if "s" in keys.lower():
                 pc.asking["stop"], pc.asking = True, None
@@ -3397,7 +3403,7 @@ def run_panel_batch(batch: list, prompts: dict, title: str, pc: PanelRun):
                     s = int(time.monotonic() - t["started"])
                     parts.append(f"agent {t['agent'].index} {s // 60}:{s % 60:02d}")
             tok = sum(x.inp + x.out for x in pc.agents)
-            panel_status(f"{pc.status} · thinking: {', '.join(parts)} · {fmt_tokens(tok)} tokens · Ctrl-C stops")
+            panel_status(f"{pc.status} · thinking: {', '.join(parts)} · {fmt_tokens(tok)} tokens · {'t + Enter reopens tabs · ' if pc.tabs else ''}Ctrl-C stops")
         time.sleep(0.25)
     pc.asking = None
     sys.stdout.write("\r\033[K")
@@ -3573,11 +3579,14 @@ def run_panel(panel: dict, question: str, folder: str, ctx, dry: bool, resume: d
                                       "role": "master, can change files" if a.master else "reviewer, no file changes",
                                       "folder": folder, "question": panel_short(question, 120), "pid": os.getpid(),
                                       "session": a.session_id})
-        if open_panel_tabs(agents, pc.tmp, folder):
-            tabs_note = "tabs: one per agent, live - Enter there at the end opens its session"
-        else:
+        why = open_panel_tabs(agents, pc.tmp, folder)
+        if not why:
+            tabs_note = "tabs: one per agent, live - Enter there at the end opens its session; t + Enter opens them again"
+        elif why.startswith("not available"):
             pc.tabs = False
-            tabs_note = "tabs: not available here (iTerm2, Terminal or tmux only)"
+            tabs_note = f"tabs: {why}"
+        else:
+            tabs_note = f"tabs: {why} - t + Enter tries again"
     try:
         sys.stdout.reconfigure(errors="replace")   # a reply in any script prints on any console
     except (AttributeError, ValueError):
@@ -4153,17 +4162,36 @@ def panel_tab_title(a, n: int) -> str:
     return f"MAP {'★' if a.master else ''}{a.index}/{n} · {panel_agent_label(a)}".replace(";", "")
 
 
-def open_panel_tabs(agents: list, tmp: str, folder: str) -> bool:
+def open_panel_tabs(agents: list, tmp: str, folder: str) -> str:
     """One terminal surface per agent (a background tmux window, an iTerm2
     tab, a Terminal.app window), each running this script's viewer of that
-    agent. False = no backend here (open_tab's rule)."""
+    agent. '' = they are open, else why not ('not available here ...' when
+    there is no backend: open_tab's rule)."""
     me = self_path()
     for a in agents:
         cmd = (f"{shlex.quote(sys.executable)} {shlex.quote(me)} --panel-watch {shlex.quote(tmp)} "
                f"--panel-agent {a.index}")
         if not open_tab(folder, cmd, False, False, detached=True):
-            return False
-    return True
+            return "not available here (iTerm2, Terminal or tmux only)"
+    # the terminal returns before the tabs exist and may drop a request
+    # without a word: wait for the viewers (their command line names the run)
+    leaf, want, seen = os.path.basename(tmp.rstrip("/\\")), len(agents), 0
+    end = time.monotonic() + 5
+    while seen < want and time.monotonic() < end:
+        time.sleep(0.25)
+        seen = _panel_viewers(leaf)
+        if seen < 0:
+            return ""   # no process list here: trust the terminal
+    return "" if seen >= want else f"the terminal opened {seen} of {want}"
+
+
+def _panel_viewers(leaf: str) -> int:
+    """How many MAP viewers of this run are running; -1 = cannot tell."""
+    try:
+        out = subprocess.run(["ps", "-Ao", "command"], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return -1
+    return sum(1 for line in out.splitlines() if "--panel-watch" in line and leaf in line)
 
 
 def watch_panel_agent(d: str, index: int):
@@ -4291,7 +4319,8 @@ def panel_page(folder: str, ctx, initial: dict = None, question: str = "", cont:
             pa = a.copy()
             pa.eff_model, pa.eff_effort = panel_effective(a, conf)
             goes_on = cont and isinstance(a.prev, dict) and bool(a.prev.get("session") or a.prev.get("thread"))
-            cmd = _cmdline([a.tool] + panel_argv(pa, not goes_on, "<id>", "MAP ...", panel_master_mode(r.path, a.master)))
+            cmd = _cmdline([a.tool] + panel_argv(pa, not goes_on, "<id>", "MAP ...",
+                                                      panel_master_mode(r.path, a.master) if a.tool == "claude" else ""))
             model = a.model or "(no override)"
             effort = a.effort or "(no override)"
             acct = acct_label(r.label, r.default) if len(ctx.roots(a.tool, all_=True)) > 1 else ""
