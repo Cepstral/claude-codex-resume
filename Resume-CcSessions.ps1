@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.67'
+$script:CcrVersion = '0.68'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -1818,13 +1818,14 @@ function Select-CcrPath {
 
         $sb = [System.Text.StringBuilder]::new()
         [void]$sb.Append("`e[H")
-        $hdr = "new session in> $filter"
+        $hdr = "$(if ($PanelOnly) { 'panel in' } else { 'new session in' })> $filter"
         $counts = "$($view.Count - 1)/$($groups.Count)"
         $pad = [Math]::Max(1, $w - 1 - $hdr.Length - $counts.Length - 2)
         $line1 = $hdr + (' ' * $pad) + $counts
         if ($line1.Length -gt $w - 1) { $line1 = $line1.Substring(0, $w - 1) }
         [void]$sb.Append($line1).Append("`e[K`n")
-        $hint = "Enter choose folder (then tool, name) $([char]0x00B7) Esc back $([char]0x00B7) type to filter"
+        $hint = if ($PanelOnly) { "Enter choose the folder the agents work in (then the agents) $([char]0x00B7) Esc back to the question $([char]0x00B7) type to filter" }
+        else { "Enter choose folder (then tool, name) $([char]0x00B7) Esc back $([char]0x00B7) type to filter" }
         if ($hint.Length -gt $w - 1) { $hint = $hint.Substring(0, $w - 1) }
         [void]$sb.Append("`e[2m").Append($hint).Append("`e[22m`e[K")
 
@@ -1861,18 +1862,24 @@ function Select-CcrPath {
             'Enter' {
                 if ($view.Count -gt 0) {
                     # Folder -> tool -> (claude only) name -> (multi-account
-                    # only) account; or folder -> panel page -> question. Esc
-                    # at any step comes back one step and repaints.
+                    # only) account; or folder -> panel: the question, then
+                    # the agents (-PanelOnly: Ctrl+P / ccr -Panel, the question
+                    # is known, so the agents). Enter on the agents starts.
+                    # Esc at any step comes back one step and repaints.
                     $tool = if ($PanelOnly) { 'panel' } else { Select-CcrTool -WithPanel }
                     if ($tool -eq 'panel') {
                         $pc = if ($null -ne $PanelClaudeRoots) { $PanelClaudeRoots } else { $ClaudeRoots }
                         $px = if ($null -ne $PanelCodexRoots) { $PanelCodexRoots } else { $CodexRoots }
-                        $panel = $null
+                        $folder = $view[$cursor].Path
+                        $q = $InitialQuestion
                         while ($true) {
-                            $panel = Show-CcrPanelPage -Folder $view[$cursor].Path -ClaudeRoots $pc -CodexRoots $px -Initial $panel
-                            if (-not $panel) { break }
-                            $q = Read-CcrPanelQuestion -Panel $panel -Folder $view[$cursor].Path -Text $InitialQuestion
-                            if ($null -ne $q) { return [pscustomobject]@{ Path = $view[$cursor].Path; Tool = 'panel'; Name = ''; Root = $null; Panel = $panel; Question = $q } }
+                            if (-not $PanelOnly) {
+                                $q = Read-CcrPanelQuestion -Panel (Get-CcrPanelDefault -ClaudeRoots $pc -CodexRoots $px) -Folder $folder -Text $q
+                                if ($null -eq $q) { break }
+                            }
+                            $panel = Show-CcrPanelPage -Folder $folder -ClaudeRoots $pc -CodexRoots $px -Question $q
+                            if ($panel) { return [pscustomobject]@{ Path = $folder; Tool = 'panel'; Name = ''; Root = $null; Panel = $panel; Question = $q } }
+                            if ($PanelOnly) { break }
                         }
                     }
                     if ($tool -eq 'codex') {
@@ -2935,12 +2942,30 @@ function Invoke-CcrPanel {
     }
 }
 
-# The panel page (Ctrl+N -> panel): one block of fields per agent - tool,
-# model, effort, account (when the tool has several) - plus the round limit,
-# and the round-1 command of the highlighted agent at the bottom. Returns
-# @{ Agents; Rounds } or $null on Esc. Runs inside the alt buffer.
+# A panel from the start (Ctrl+P, ccr -Panel): the question page first,
+# with the rules ccr puts in front of it (the last panel's agents; the folder
+# comes next), then the folder, then the agents. Esc steps back one page, the
+# question kept. Returns what Select-CcrPath returns for a panel, or $null.
+function Select-CcrPanel {
+    param([AllowEmptyCollection()][object[]]$Sessions = @(), [object[]]$ClaudeRoots = @(), [object[]]$CodexRoots = @(), [string]$Question = '')
+    $q = $Question
+    while ($true) {
+        $q = Read-CcrPanelQuestion -Panel (Get-CcrPanelDefault -ClaudeRoots $ClaudeRoots -CodexRoots $CodexRoots) -Folder '<the folder you pick next>' -Text $q
+        if ($null -eq $q) { return $null }
+        $pick = Select-CcrPath -Sessions $Sessions -ClaudeRoots $ClaudeRoots -CodexRoots $CodexRoots -PanelOnly -InitialQuestion $q `
+            -PanelClaudeRoots $ClaudeRoots -PanelCodexRoots $CodexRoots
+        if ($pick) { return $pick }
+    }
+}
+
+# The panel page, the last one before the start (Ctrl+P / ccr -Panel:
+# question -> folder -> this page; Ctrl+N -> folder -> panel: question -> this
+# page): one block of fields per agent - tool, model, effort, account (when
+# the tool has several) - plus the round limit, and the round-1 command of
+# the highlighted agent at the bottom. Enter starts. Returns @{ Agents;
+# Rounds } or $null on Esc. Runs inside the alt buffer.
 function Show-CcrPanelPage {
-    param([Parameter(Mandatory)][string]$Folder, [object[]]$ClaudeRoots = @(), [object[]]$CodexRoots = @(), [object]$Initial = $null)
+    param([Parameter(Mandatory)][string]$Folder, [object[]]$ClaudeRoots = @(), [object[]]$CodexRoots = @(), [object]$Initial = $null, [string]$Question = '')
     $dot = [char]0x00B7
     $state = if ($Initial) { $Initial } else { Get-CcrPanelDefault -ClaudeRoots $ClaudeRoots -CodexRoots $CodexRoots }
     $agents = [System.Collections.Generic.List[object]]::new()
@@ -2979,7 +3004,8 @@ function Show-CcrPanelPage {
         $hasMaster = [bool](@($agents | Where-Object Master).Count)
         $lines = [System.Collections.Generic.List[string]]::new()
         $lines.Add("`e[1mPanel`e[22m  `e[2m$(Format-CcrCwd $Folder 60) $dot $($agents.Count) agents $dot parallel rounds$(if ($hasMaster) { ', the master first from round 2' })`e[22m")
-        $lines.Add("`e[2m$([char]0x2191)$([char]0x2193) field $dot $([char]0x2190)$([char]0x2192) change $dot Del no override $dot + add agent $dot - remove $dot M master $dot Enter next $dot Esc back`e[22m")
+        $lines.Add("`e[2m$([char]0x2191)$([char]0x2193) field $dot $([char]0x2190)$([char]0x2192) change $dot Del no override $dot + add agent $dot - remove $dot M master $dot Enter start $dot Esc back`e[22m")
+        if ($Question) { $lines.Add("`e[2mquestion: $(Get-CcrPanelShort $Question ([Math]::Max(20, $w - 14)))`e[22m") }
         for ($i = 0; $i -lt $agents.Count; $i++) {
             $a = $agents[$i]
             $info = Get-PanelInfo $a
@@ -3080,8 +3106,9 @@ function Show-CcrPanelPage {
     }
 }
 
-# The question page: the rules ccr adds (dim), then the question. Enter
-# starts; an Enter inside a paste (more keys already coming) is a new line,
+# The question page (the first page of Ctrl+P / ccr -Panel): the rules ccr
+# adds (dim, read-only), then the question. Enter goes on to the folder (or
+# the agents); an Enter inside a paste (more keys already coming) is a new line,
 # and so are Shift+Enter and Ctrl+J; Ctrl+O edits it in $VISUAL / $EDITOR /
 # Notepad. Returns the question, or $null on Esc. Runs inside the alt buffer.
 function Read-CcrPanelQuestion {
@@ -3105,7 +3132,7 @@ function Read-CcrPanelQuestion {
             if ($shownQ.Count -eq 0) { $shownQ.Add('') }
             $lines = [System.Collections.Generic.List[string]]::new()
             $lines.Add("`e[1mPanel $dot your question`e[22m  `e[2mccr puts these rules in front of it (agent 1's copy)`e[22m")
-            $lines.Add("`e[2mEnter start $dot Shift+Enter or Ctrl+J new line $dot Ctrl+O editor $dot Esc back`e[22m")
+            $lines.Add("`e[2mEnter next $dot Shift+Enter or Ctrl+J new line $dot Ctrl+O editor $dot Esc back`e[22m")
             $lines.Add('')
             $room = [Math]::Max(3, $h - 5 - $shownQ.Count)
             $shownR = if ($rules.Count -gt $room) { @($rules | Select-Object -First ($room - 1)) + @("$([char]0x2026) (the full rules are saved with the transcript)") } else { $rules }
@@ -3572,8 +3599,8 @@ function Select-CcrSession {
             $w = [Console]::WindowWidth
             $h = [Console]::WindowHeight
             # The key legend wraps onto as many lines as the window needs.
-            $hint = if ($acctMode) { "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space cycles the account (dot = as is) $([char]0x00B7) Enter open $([char]0x00B7) Shift+Enter model/effort $([char]0x00B7) Ctrl+N new $([char]0x00B7) Ctrl+A accounts $([char]0x00B7) Ctrl+K usage $([char]0x00B7) Ctrl+J details $([char]0x00B7) Ctrl+X close $([char]0x00B7) Ctrl+I install $([char]0x00B7) Del delete $([char]0x00B7) Esc cancel $([char]0x00B7) v$script:CcrVersion" }
-            else { "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space mark $([char]0x00B7) Enter open $([char]0x00B7) Shift+Enter model/effort $([char]0x00B7) Ctrl+N new $([char]0x00B7) Del delete $([char]0x00B7) Ctrl+A accounts $([char]0x00B7) Ctrl+K usage $([char]0x00B7) Ctrl+J details $([char]0x00B7) Ctrl+X close $([char]0x00B7) Ctrl+I install $([char]0x00B7) Esc cancel $([char]0x00B7) type to filter $([char]0x00B7) v$script:CcrVersion" }
+            $hint = if ($acctMode) { "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space cycles the account (dot = as is) $([char]0x00B7) Enter open $([char]0x00B7) Shift+Enter model/effort $([char]0x00B7) Ctrl+N new $([char]0x00B7) Ctrl+P panel $([char]0x00B7) Ctrl+A accounts $([char]0x00B7) Ctrl+K usage $([char]0x00B7) Ctrl+J details $([char]0x00B7) Ctrl+X close $([char]0x00B7) Ctrl+I install $([char]0x00B7) Del delete $([char]0x00B7) Esc cancel $([char]0x00B7) v$script:CcrVersion" }
+            else { "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space mark $([char]0x00B7) Enter open $([char]0x00B7) Shift+Enter model/effort $([char]0x00B7) Ctrl+N new $([char]0x00B7) Ctrl+P panel $([char]0x00B7) Del delete $([char]0x00B7) Ctrl+A accounts $([char]0x00B7) Ctrl+K usage $([char]0x00B7) Ctrl+J details $([char]0x00B7) Ctrl+X close $([char]0x00B7) Ctrl+I install $([char]0x00B7) Esc cancel $([char]0x00B7) type to filter $([char]0x00B7) v$script:CcrVersion" }
             $hintLines = @(Split-CcrHint $hint ($w - 1))
             $viewH = [Math]::Max(1, $h - 1 - $hintLines.Count - $(if ($acctMode) { $entries.Count + 1 } else { 0 }) - $(if ($updNote) { 1 } else { 0 }))
             if ($cursor -gt $view.Count - 1) { $cursor = [Math]::Max(0, $view.Count - 1) }
@@ -3833,6 +3860,12 @@ function Select-CcrSession {
                 # Ctrl+N: pick a folder (and tool, and account) for a brand-new conversation.
                 $newPick = Select-CcrPath -Sessions $Sessions -ClaudeRoots $ClaudeRoots -CodexRoots $CodexRoots -PanelClaudeRoots $AllClaudeRoots -PanelCodexRoots $AllCodexRoots
                 if ($newPick) { return [pscustomobject]@{ NewSessionPath = $newPick.Path; NewSessionTool = $newPick.Tool; NewSessionName = $newPick.Name; NewSessionRoot = $newPick.Root; NewSessionPanel = $newPick.Panel; NewSessionQuestion = $newPick.Question } }
+                continue
+            }
+            if ($k.Key -eq [ConsoleKey]::P -and $ctrl) {
+                # Ctrl+P: a panel - the question first, then the folder, then the agents.
+                $newPick = Select-CcrPanel -Sessions $Sessions -ClaudeRoots $AllClaudeRoots -CodexRoots $AllCodexRoots
+                if ($newPick) { return [pscustomobject]@{ NewSessionPath = $newPick.Path; NewSessionTool = 'panel'; NewSessionName = ''; NewSessionRoot = $null; NewSessionPanel = $newPick.Panel; NewSessionQuestion = $newPick.Question } }
                 continue
             }
             switch ($k.Key) {
@@ -4265,8 +4298,10 @@ function Resume-CcSessions {
         ccr -Panel "why does the nightly import skip rows?"
         A panel: two to four fresh agents (claude and/or codex, each with its
         model, effort and account) discuss one question in a folder until
-        they agree. Also Ctrl+N -> folder -> panel. The panel page sets the
-        agents and the round limit; M makes one agent the master, the only
+        they agree. Also Ctrl+P in the picker (or Ctrl+N -> folder -> panel).
+        The question page comes first, with the rules ccr puts in front of
+        it, then the folder, then the panel page, which sets the agents and
+        the round limit (Enter starts); M makes one agent the master, the only
         one allowed to change files (the others are read-only reviewers; with
         a master it works first from round 2). ccr puts fixed rules in front
         of the question, runs parallel rounds, stops at consensus (from round
@@ -4305,7 +4340,7 @@ function Resume-CcSessions {
         # installers (the same as Ctrl+I in the picker); all = both.
         [ValidateSet('claude', 'codex', 'all')][string]$Install = '',
         # A panel: several fresh agents discuss one question until they agree
-        # (Ctrl+N -> panel); the words after it prefill the question.
+        # (Ctrl+P in the picker); the words after it prefill the question.
         [switch]$Panel,
         # Multi-account: restrict the list to one configured account (label
         # from ccr.json). Also the account Ctrl+N/-n defaults to.
@@ -4491,11 +4526,14 @@ function Resume-CcSessions {
         [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
         [Console]::Write("`e[?1049h`e[?25l")
         # Any text after `ccr -n` prefills the NAME box, after `ccr -Panel` the
-        # question - never the folder filter.
+        # question - never the folder filter. -Panel is Ctrl+P: the question
+        # first, then the folder, then the agents.
         try {
-            $newPick = Select-CcrPath -Sessions $sorted -ClaudeRoots $claudeRoots -CodexRoots $codexRoots `
-                -InitialName $(if ($Panel) { '' } else { $filterText }) -InitialQuestion $(if ($Panel) { $filterText } else { '' }) `
-                -PanelOnly:$Panel -PanelClaudeRoots $allClaudeRoots -PanelCodexRoots $allCodexRoots
+            $newPick = if ($Panel) { Select-CcrPanel -Sessions $sorted -Question $filterText -ClaudeRoots $allClaudeRoots -CodexRoots $allCodexRoots }
+            else {
+                Select-CcrPath -Sessions $sorted -ClaudeRoots $claudeRoots -CodexRoots $codexRoots -InitialName $filterText `
+                    -PanelClaudeRoots $allClaudeRoots -PanelCodexRoots $allCodexRoots
+            }
         }
         finally {
             [Console]::Write("`e[?25h`e[?1049l")

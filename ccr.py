@@ -7,7 +7,7 @@ as the picker and real terminal tabs (iTerm2, Terminal.app) or tmux windows
 as the launch backend. Python 3.9+, stdlib only; fzf for UI.
 
 Keys in the picker (fzf conventions): type to fuzzy-filter, Tab marks,
-Enter opens, Ctrl-E opens with a model / effort, Ctrl-N new conversation or panel, Ctrl-A accounts, Ctrl-O open the
+Enter opens, Ctrl-E opens with a model / effort, Ctrl-N new conversation, Ctrl-P panel, Ctrl-A accounts, Ctrl-O open the
 marked rows under another account, Ctrl-T installs or updates claude / codex, Del deletes, Esc cancels.
 """
 import argparse
@@ -33,7 +33,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.67"
+VERSION = "0.68"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -1304,7 +1304,7 @@ def picker_hint(ctx: Ctx, upd_note: str = "") -> str:
     keys = [("↑↓", "move"), ("Tab", "mark"), ("Enter", "open"), ("Ctrl-E", "model/effort")]
     if ctx.multi_root:
         keys.append(("Ctrl-O", "open under another account"))
-    keys += [("Ctrl-N", "new"), ("Ctrl-A", "accounts"), ("Ctrl-K", "usage"), ("Ctrl-J", "details"),
+    keys += [("Ctrl-N", "new"), ("Ctrl-P", "panel"), ("Ctrl-A", "accounts"), ("Ctrl-K", "usage"), ("Ctrl-J", "details"),
              ("Ctrl-X", "close"), ("Ctrl-T", "install"), ("Del", "delete"), ("Esc", "cancel")]
     lines += hint_wrapped(keys)
     words = f"{DIM},{RESET} ".join(f"{CYAN}{w}{RESET}" for w in ("run", "cleared", "app"))
@@ -2599,12 +2599,10 @@ def open_new_app_thread(folder: str, prompt_text: str, opener: list, dry: bool) 
     return True
 
 
-def new_conversation(sessions: list, initial_name: str, dry: bool, ctx: Ctx, terminal: bool = False,
-                     panel: bool = False, question: str = "") -> bool:
-    """Folder -> tool -> (claude) name -> (several accounts for that tool)
-    account, then the tool takes over this terminal. Or folder -> panel ->
-    question, and the panel runs here (panel=True skips the tool step;
-    question prefills the question)."""
+def choose_folder(sessions: list, seed: str, dry: bool, tail: str, prompt: str = "new session in> "):
+    """The folder step of a new conversation or a panel: "here" (the folder ccr
+    runs in) first, "+ new folder", then every folder past sessions used, most
+    recent first. Returns a folder (created on request), or None on Esc."""
     here = str(Path.cwd())
     groups = {}
     for s in sessions:
@@ -2626,45 +2624,51 @@ def new_conversation(sessions: list, initial_name: str, dry: bool, ctx: Ctx, ter
         index[str(i)] = g
         rows.append(f"{i}\t{fmt_age(g['last']):>6}  {DIM}{g['count']:>3}×{RESET}  "
                     f"{fmt_cwd(g['path'], 70)}\t{g['path']}")
-    res = run_fzf(rows, hint(("Enter", "next"), ("Ctrl-O", "new folder"), ("Esc", "back"),
-                             tail=f"{'panel' if panel else 'new conversation'} · step 1: folder"),
-                  multi=False, prompt="new session in> ", expect=["ctrl-o"])
+    res = run_fzf(rows, hint(("Enter", "next"), ("Ctrl-O", "new folder"), ("Esc", "back"), tail=tail),
+                  multi=False, prompt=prompt, expect=["ctrl-o"])
     if not res or not (res[0] or res[1]):
-        return False
+        return None
     if res[0] == "ctrl-o" or (res[1] and res[1][0] == "new"):
-        folder = ask_new_folder(initial_name if os.sep in initial_name else "", dry)
-        if not folder:
-            return False
-    else:
-        folder = index[res[1][0]]["path"]
+        return ask_new_folder(seed if os.sep in seed else "", dry) or None
+    return index[res[1][0]]["path"]
+
+
+def new_conversation(sessions: list, initial_name: str, dry: bool, ctx: Ctx, terminal: bool = False) -> bool:
+    """Folder -> tool -> (claude) name -> (several accounts for that tool)
+    account, then the tool takes over this terminal. Or folder -> panel ->
+    question -> agents, and the panel runs here."""
+    folder = choose_folder(sessions, initial_name, dry, "new conversation · step 1: folder")
+    if not folder:
+        return False
     opener = [] if terminal else url_opener()
-    app_ok = bool(opener) and not panel and codex_app_installed(sessions)
+    app_ok = bool(opener) and codex_app_installed(sessions)
     extra = []
     if app_ok:
         extra.append(f"codex app\t{CYAN}codex{RESET}{DIM} app{RESET}{' ' * 2}{DIM}a new thread in the Codex "
                      f"desktop app, rooted at this folder{RESET}\tcodex app desktop")
     extra.append(f"panel\t{MAGENTA}panel{RESET}{' ' * 6}{DIM}several agents discuss one question until they "
                  f"agree{RESET}\tpanel agents")
-    tool = "panel" if panel else choose_tool(f"step 2: tool · {fmt_cwd(folder, 46)}", "asks for a session name",
-                                             "a terminal tab · no start name - /rename inside", extra)
+    tool = choose_tool(f"step 2: tool · {fmt_cwd(folder, 46)}", "asks for a session name",
+                       "a terminal tab · no start name - /rename inside", extra)
     if not tool:
         return False
     if tool == "panel":
-        # A panel runs its agents here, in this terminal, without handing it over.
+        # A panel runs its agents here, in this terminal, without handing it
+        # over: the question, then the agents; Esc on the agents goes back to
+        # the question.
         if not dry and not Path(folder).is_dir():
             print(f"ccr: folder no longer exists: {folder}", file=sys.stderr)
             return False
-        choice = None
+        q = ""
         while True:
-            choice = panel_page(folder, ctx, choice)
-            if not choice:
+            q = read_panel_question(panel_default(ctx), folder, q)
+            if q is None:
                 return False
-            q = read_panel_question(choice, folder, question)
-            if q is not None:
-                break
-        if not dry:
-            save_panel_default(choice)
-        return run_panel(choice, q, folder, ctx, dry)
+            choice = panel_page(folder, ctx, None, q)
+            if choice:
+                if not dry:
+                    save_panel_default(choice)
+                return run_panel(choice, q, folder, ctx, dry)
     if tool != "codex app" and not dry and not Path(folder).is_dir():
         print(f"ccr: folder no longer exists: {folder}", file=sys.stderr)
         return False
@@ -3538,12 +3542,13 @@ def run_panel(panel: dict, question: str, folder: str, ctx, dry: bool) -> bool:
 
 # The panel page (Ctrl-N -> panel) as fzf menus: the PowerShell page's
 # fields, one menu per step (fzf has no editable fields).
-def panel_page(folder: str, ctx, initial: dict = None):
-    """The agents as an fzf list: Enter on an agent opens its settings (tool,
-    model, effort, account, master, remove), Del removes it, "+ add agent"
-    adds a copy of the last one, "rounds" sets the round limit, "start" goes
-    on to the question. The preview shows the agent's round-1 command, so the
-    permissions show. Returns {"agents", "rounds"}, or None on Esc."""
+def panel_page(folder: str, ctx, initial: dict = None, question: str = ""):
+    """The agents as an fzf list, the last step before the start: Enter on an
+    agent opens its settings (tool, model, effort, account, master, remove),
+    Del removes it, "+ add agent" adds a copy of the last one, "rounds" sets
+    the round limit, "start" starts. The preview shows the agent's round-1
+    command, so the permissions show. Returns {"agents", "rounds"}, or None
+    on Esc."""
     state = initial or panel_default(ctx)
     agents = [a.copy() for a in state["agents"]]
     rounds = min(8, max(2, int(state["rounds"])))
@@ -3558,8 +3563,8 @@ def panel_page(folder: str, ctx, initial: dict = None):
     while True:
         n = len(agents)
         multi = any(len(ctx.roots(t, all_=True)) > 1 for t in ("claude", "codex"))
-        rows = [f"start\t{GREEN}{BOLD}▶ start{RESET}  {DIM}next: the question{RESET}"
-                f"\tgo on to the question - the rules ccr puts in front of it are shown there"]
+        rows = [f"start\t{GREEN}{BOLD}▶ start{RESET}  {DIM}the agents go to work{RESET}"
+                f"\tstart the panel: the rules and the question go to every agent"]
         for i, a in enumerate(agents):
             choices, conf = info(a)
             r = panel_root(ctx, a)
@@ -3582,9 +3587,10 @@ def panel_page(folder: str, ctx, initial: dict = None):
                     f"(2-8){RESET}\tEnter: choose 2-8")
         has_master = any(a.master for a in agents)
         title = (f"{BOLD}Panel{RESET}  {DIM}{fmt_cwd(folder, 50)} · {n} agents · parallel rounds"
-                 f"{', the master first from round 2' if has_master else ''}{RESET}")
+                 f"{', the master first from round 2' if has_master else ''}{RESET}"
+                 + (f"\n{DIM}question: {panel_short(question, 90)}{RESET}" if question else ""))
         res = run_fzf(rows, title + "\n" + hint(("Enter", "start / change"), ("Del", "remove agent"), ("Esc", "back"),
-                                               tail="panel · step 2: agents"),
+                                               tail="panel · last step: agents"),
                       multi=False, expect=["del"], prompt="panel> ")
         if res is None:
             return None
@@ -3669,6 +3675,33 @@ def panel_agent_menu(agents: list, i: int, ctx, info):
             if len(agents) > 2:
                 del agents[i]
             return
+
+
+def new_panel(sessions: list, question: str, dry: bool, ctx) -> bool:
+    """Ctrl-P / --panel: the question first (the rules ccr puts in front of it
+    shown above), then the folder, then the agents; the panel runs here. Esc
+    (Ctrl-C at the question) steps back one page, the question kept."""
+    q, folder, step = question, None, "question"
+    while True:
+        if step == "question":
+            q = read_panel_question(panel_default(ctx), "<the folder you pick next>", q or "")
+            if q is None:
+                return False
+            step = "folder"
+        elif step == "folder":
+            folder = choose_folder(sessions, "", dry, "panel · step 2: the folder the agents work in", "panel in> ")
+            step = "agents" if folder else "question"
+        else:
+            if not dry and not Path(folder).is_dir():
+                print(f"ccr: folder no longer exists: {folder}", file=sys.stderr)
+                return False
+            choice = panel_page(folder, ctx, None, q)
+            if not choice:
+                step = "folder"
+                continue
+            if not dry:
+                save_panel_default(choice)
+            return run_panel(choice, q, folder, ctx, dry)
 
 
 def editor_argv() -> list:
@@ -3762,7 +3795,7 @@ def read_panel_question(panel: dict, folder: str, seed: str = ""):
         if cur:
             more = cur.count("\n")
             shown = panel_short(cur, 60) + (f" (+{more} line{'' if more == 1 else 's'})" if more else "")
-            prompt = f"question [{shown}]  {DIM}Enter starts · e edits it in {ed} · or type another{RESET}\n> "
+            prompt = f"question [{shown}]  {DIM}Enter keeps it · e edits it in {ed} · or type another{RESET}\n> "
         else:
             prompt = f"question  {DIM}one line, or Enter to write it in {ed}{RESET}\n> "
         line = ask(prompt)
@@ -4012,8 +4045,9 @@ def main():
                     help="start a new conversation (folder menu); trailing text prefills the name box")
     ap.add_argument("--panel", action="store_true",
                     help="a panel: 2-4 fresh agents (claude and/or codex, each with its model, effort and account) "
-                         "discuss one question in a folder until they agree (also Ctrl-N -> folder -> panel); the "
-                         "trailing words prefill the question - quote it. --dry-run prints the round-1 commands")
+                         "discuss one question in a folder until they agree (Ctrl-P in the picker): the question, "
+                         "then the folder, then the agents; the trailing words prefill the question - quote it. "
+                         "--dry-run prints the round-1 commands")
     ap.add_argument("--new-window", action="store_true", help="open selections in new windows, keep this tab")
     ap.add_argument("--tabs", action="store_true",
                     help="Terminal.app: open the extra sessions as tabs instead of windows. Terminal has no "
@@ -4135,10 +4169,12 @@ def main():
 
         if a.new or a.panel:
             # -n: the folder menu (works with no session at all: the "here"
-            # row is always there); the trailing text prefills the name box,
-            # with --panel the question.
-            if not new_conversation(sessions, "" if a.panel else query, a.dry_run, ctx, a.terminal,
-                                    panel=a.panel, question=query if a.panel else ""):
+            # row is always there); the trailing text prefills the name box.
+            # --panel is Ctrl-P: the question (prefilled with the trailing
+            # text), then the folder, then the agents.
+            ok = (new_panel(sessions, query, a.dry_run, ctx) if a.panel
+                  else new_conversation(sessions, query, a.dry_run, ctx, a.terminal))
+            if not ok:
                 print("ccr: cancelled.")
             return
 
@@ -4168,7 +4204,8 @@ def main():
             index = {}
             rows = session_rows(sessions, index, ctx, usage_of if usage_on else None)
             res = run_fzf(rows, picker_hint(ctx, upd_note), query=query,
-                          expect=["del", "ctrl-n", "ctrl-a", "ctrl-o", "ctrl-k", "ctrl-j", "ctrl-x", "ctrl-e", "ctrl-t"])
+                          expect=["del", "ctrl-n", "ctrl-p", "ctrl-a", "ctrl-o", "ctrl-k", "ctrl-j", "ctrl-x", "ctrl-e",
+                                  "ctrl-t"])
             if res is None:
                 print("ccr: cancelled.")
                 return
@@ -4192,6 +4229,11 @@ def main():
                 continue
             if key == "ctrl-n":
                 if not new_conversation(sessions, "", a.dry_run, ctx, a.terminal):
+                    print("ccr: cancelled.")
+                return
+            if key == "ctrl-p":
+                # A panel: the question first, then the folder, then the agents.
+                if not new_panel(sessions, "", a.dry_run, ctx):
                     print("ccr: cancelled.")
                 return
             if key == "ctrl-t":

@@ -93,6 +93,8 @@ Ctrl+J new line, Ctrl+O editor) ↔ one line, a multi-line paste, or `e` / an
 empty line for $EDITOR. In ccr.py a row cannot change account and get a model
 in one step (Ctrl-O and Ctrl-E each launch); on Windows Space + Shift+Enter
 combine. The mapping table lives in `docs/multi-account.md`.
+The panel is Ctrl+P on both sides: fzf binds ctrl-p to "up" by default, and
+`--expect` takes it over (the arrows still move).
 The install page is Ctrl+I on Windows as asked, plus Ctrl+T on both sides:
 fzf cannot take ctrl-i, the byte Tab sends too, so it would steal marking.
 

@@ -11,12 +11,26 @@ sessions in the picker, ready to be resumed.
 ccr -Panel "why does the nightly import skip rows?"     # quote the question
 ```
 
-Or `Ctrl+N` in the picker → folder → **`panel`** (`p` jumps there). `ccr --panel`
-works on both platforms, and `-Panel` / `--panel` work without a question too.
+Or **`Ctrl+P`** in the picker. Both start from the question, then ask for the
+folder, then for the agents; `Enter` on the agents page starts. `Ctrl+N` →
+folder → **`panel`** (`p` jumps there) works too: the question, then the agents.
+`ccr --panel` works on both platforms, and `-Panel` / `--panel` work without a
+question too.
 
 ## Setting it up
 
-**The panel page** (Windows) lists every agent's fields, one per line: **tool**,
+**The question page** comes first: the rules ccr puts in front of the question
+(agent 1's copy; the folder and the agents are filled in once chosen), read-only,
+and below them the box for the question. `Enter` goes on; `Shift+Enter` or
+`Ctrl+J` adds a line, and so does an `Enter` inside a paste, so a pasted
+multi-line question arrives whole. `Ctrl+O` opens `$VISUAL` / `$EDITOR` /
+Notepad on the text; an editor that returns at once (Windows 11 Notepad, VS Code
+without `--wait`) gets a "save, close, then press Enter here".
+
+**The folder** comes next: the same list as `Ctrl+N`, the folder ccr runs in
+first.
+
+**The panel page**, the last one, lists every agent's fields, one per line: **tool**,
 **model**, **effort**, and **account** when that tool has several accounts, then the
 **round limit** (2–8, default 4). At the bottom, the round-1 command line of the
 highlighted agent, so the permissions are always in view.
@@ -29,18 +43,11 @@ highlighted agent, so the permissions are always in view.
 | `+` | add an agent: a copy of the highlighted one (at most 4) |
 | `-` | remove the highlighted agent (at least 2 stay) |
 | `M` | make the highlighted agent the **master**; again to take it back |
-| `Enter` / `Esc` | on to the question / back |
+| `Enter` / `Esc` | **start the panel** / back to the folder |
 
 The first panel is codex + claude on their configured models; afterwards ccr
 remembers the last one (`ccr.json`, key `panel`). An account that is not on this
 PC falls back to the tool's default account.
-
-**The question page** shows the rules ccr puts in front of the question (agent
-1's copy), then an input box. `Enter` starts; `Shift+Enter` or `Ctrl+J` adds a
-line, and so does an `Enter` inside a paste, so a pasted multi-line question
-arrives whole. `Ctrl+O` opens `$VISUAL` / `$EDITOR` / Notepad on the text; an
-editor that returns at once (Windows 11 Notepad, VS Code without `--wait`) gets
-a "save, close, then press Enter here".
 
 ## How a panel runs
 
@@ -167,6 +174,7 @@ The same panel, the same rules and flags, with fzf menus instead of the pages:
 
 | PowerShell | Python |
 |---|---|
+| `Ctrl+P`: question page → folder → panel page | `Ctrl-P`: the question at the prompt → the folder (fzf) → the agents (fzf); same order |
 | the panel page: fields changed with `←` `→` | an fzf list: `▶ start`, the agents, `+ add agent`, `rounds`. `Enter` on an agent opens its settings (tool, model, effort, account, master, remove) — the model and effort menus of `Ctrl-E` — and `Del` removes it. The preview shows the agent's round-1 command |
 | the question page: `Enter`, `Shift+Enter` / `Ctrl+J` for a new line, paste, `Ctrl+O` editor | one line typed at the prompt, or a multi-line paste (taken whole and shown back before it starts); an empty line — or `e` to edit a question already there — opens `$VISUAL` / `$EDITOR` / `nano` / `vi` |
 | `Ctrl+C` read as a key; agents in hidden child processes | `Ctrl-C`, and `SIGHUP` / `SIGTERM` too, end every agent's process group (`taskkill /T` on Windows) |
