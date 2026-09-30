@@ -52,17 +52,18 @@ record it in the parity table in `docs/multi-account.md`. Known cases so far:
   account's. Claude's installer makes the channel it installs the auto-update
   channel, and settings.json is synced across PCs here, so ccr passes
   `stable` when settings.json has chosen it.
-- Panel (Ctrl+N -> panel, -Panel; docs/panel.md): the same rules text, rounds
-  and consensus for both tools, but each tool's own way to be read-only:
-  claude `--restricted --tools Read,Grep,Glob --strict-mcp-config
-  --permission-mode dontAsk --permission-prompts none`; codex `exec -s
-  read-only --disable plugins --disable apps --ignore-rules`. Masters: claude
-  `--permission-mode auto|acceptEdits`, codex `-s workspace-write`. Claude's
-  `--restricted` skips the folder's CLAUDE.md, codex loads AGENTS.md, so the
-  rules ask every agent to read both. Session ids: claude takes the uuid ccr
-  chooses; codex's comes from `thread.started`, and its name goes to
-  session_index.jsonl. Codex's shell on Windows needs a PATH without
-  WindowsApps; claude has no counterpart (not a restricted-token sandbox).
+- MAP (Ctrl+P, Ctrl+N -> MAP, -Panel; docs/panel.md): the same rules text,
+  rounds and consensus for both tools, and since v0.70 every agent like its
+  CLI in auto mode, the web included: claude `-p --permission-mode
+  auto|acceptEdits|default --permission-prompts none --allowedTools
+  WebSearch,WebFetch`, a reviewer also `--disallowedTools
+  Edit,Write,MultiEdit,NotebookEdit`; codex `exec -s read-only|workspace-write
+  -c web_search=live` (unless config.toml sets web_search) with its plugins,
+  apps and rules. Session ids: claude takes the uuid ccr chooses; codex's comes
+  from `thread.started`, and its name goes to session_index.jsonl. Codex's
+  shell on Windows needs a PATH without WindowsApps; claude has no counterpart
+  (not a restricted-token sandbox). Going on (-Panel -Continue; Ctrl+R on the
+  question page, `r` at the Python prompt) resumes both tools' sessions.
 
 ## PowerShell ↔ Python parity (hard rule)
 
@@ -156,19 +157,31 @@ pane, which shows the full title and folder of the highlighted row.
 - Headless agents (the panel), verified with claude 2.1.285 and codex
   0.159.0 on 2026-09-30:
   - `claude -p` keeps nothing between turns but the conversation: pass the
-    model, effort and permission mode on every turn. `--restricted` ignores
-    settings.json (so the model and effort go on the command line even for
-    *no override*) and does not load the project's CLAUDE.md. `plan` mode is
-    not read-only. A model without auto mode (haiku) given `--permission-mode
+    model, effort and permission mode on every turn. `--restricted` (the
+    reviewers' flag up to v0.69) ignores settings.json and does not load the
+    project's CLAUDE.md; since v0.70 agents run like the CLI and a reviewer
+    only loses the edit tools. `plan` mode is not read-only. A model without auto mode (haiku) given `--permission-mode
     auto` silently runs in `default`: only the stream-json init event
     (`--output-format stream-json --verbose`) says so, together with the
     tools the agent got. `--no-session-persistence` keeps a probe out of the
-    picker.
-  - `codex exec`: `-s`, `--disable`, `--ignore-rules` go before `resume`;
-    resume only by uuid; never pass `--thread-source` (ccr lists
-    `thread_source: user`). The sandbox covers commands, not plugins or apps
-    (connectors): a read-only agent gets `--disable plugins --disable apps`.
-    `--ephemeral` keeps a probe out of the picker.
+    picker. A session killed in the middle of a command resumes normally.
+  - `codex exec`: `-s` goes before `resume`; resume only by uuid; never pass
+    `--thread-source` (ccr lists `thread_source: user`). The sandbox covers
+    commands, not plugins or apps (connectors): up to v0.69 a read-only agent
+    got `--disable plugins --disable apps --ignore-rules`; v0.70 runs codex as
+    configured. `exec` takes no `--search`: `-c web_search=live` asks for live
+    search (a probe without it searched too, in codex's default mode), and
+    `web_search` in config.toml wins. A thread killed in the middle of a
+    command resumes normally. `--ephemeral` keeps a probe out of the picker.
+  - ccr never ends a MAP turn on its own (v0.70): past `askAfterMinutes`
+    (ccr.json `panel`, default 20, 0 = never) it rings and asks, Enter waits,
+    S ends that agent's process tree. The old 20-minute kill cut a codex turn
+    of a real MAP in the middle of its research.
+  - A MAP's state is a `.json` next to its transcript, which -Continue reads;
+    a transcript from before v0.70 is parsed back from its Markdown
+    (ConvertFrom-CcrPanelTranscript / parse_panel_transcript must agree).
+    Tests set CCR_STATE as well as CCR_CONFIG: transcripts go next to the
+    state file, and a test MAP would otherwise land in the user's own list.
   - `codex delete <id>` asks for a confirmation since codex 0.159 and, with
     its output captured, refuses ("cannot confirm session deletion without an
     interactive terminal; rerun with --force and a session UUID"). ccr's Del
