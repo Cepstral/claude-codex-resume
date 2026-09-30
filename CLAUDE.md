@@ -162,6 +162,12 @@ pane, which shows the full title and folder of the highlighted row.
     `thread_source: user`). The sandbox covers commands, not plugins or apps
     (connectors): a read-only agent gets `--disable plugins --disable apps`.
     `--ephemeral` keeps a probe out of the picker.
+  - `codex delete <id>` asks for a confirmation since codex 0.159 and, with
+    its output captured, refuses ("cannot confirm session deletion without an
+    interactive terminal; rerun with --force and a session UUID"). ccr's Del
+    fell back to removing the rollout alone, leaving the thread in codex's
+    catalog: ccr now passes `--force` after its own confirmation, then the
+    plain command (stdin empty) for an older codex (v0.67).
   - codex's Windows sandbox (`[windows] sandbox = "unelevated"`, a restricted
     token) cannot start programs under WindowsApps: from a Store `pwsh`,
     whose folder is on PATH, every command failed with `CreateProcessAsUserW

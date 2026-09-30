@@ -33,7 +33,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.66"
+VERSION = "0.67"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -1782,10 +1782,17 @@ def remove_session_data(s: Session) -> bool:
         # do the delete, with the session's own account dir as CODEX_HOME
         # (or codex looks in the default dir and misses it, leaving the
         # account's catalog stale); fall back to removing the rollout.
+        # Since codex 0.159 `codex delete <id>` asks for a confirmation and,
+        # with its output captured, refuses ("cannot confirm session deletion
+        # without an interactive terminal"): --force skips it, and ccr has
+        # asked already. A codex without --force gets the plain command, with
+        # nothing on stdin, so it can never wait for an answer.
         try:
             env = tool_env("codex", s.root_path) if s.root_path else None
-            if subprocess.run(["codex", "delete", s.id], capture_output=True, env=env).returncode == 0:
-                return True
+            exe = tool_path("codex") or "codex"
+            for argv in ([exe, "delete", "--force", s.id], [exe, "delete", s.id]):
+                if subprocess.run(argv, capture_output=True, stdin=subprocess.DEVNULL, env=env).returncode == 0:
+                    return True
         except Exception:
             pass
         if s.source and Path(s.source).exists():

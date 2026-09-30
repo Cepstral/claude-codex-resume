@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.66'
+$script:CcrVersion = '0.67'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -1200,12 +1200,21 @@ function Remove-CcrSessionData {
         # The session's own account dir must be CODEX_HOME for the call, or
         # codex looks in the default dir and misses it (leaving the account's
         # catalog stale).
+        # Since codex 0.159 `codex delete <id>` asks for a confirmation and,
+        # with its output captured here, refuses ("cannot confirm session
+        # deletion without an interactive terminal"): --force skips it, and ccr
+        # has asked already. A codex without --force gets the plain command,
+        # with nothing on stdin, so it can never wait for an answer.
         $ok = $false
         $prevHome = $env:CODEX_HOME
         if ($Session.PSObject.Properties['RootPath'] -and $Session.RootPath) { $env:CODEX_HOME = $Session.RootPath }
         try {
-            $null = & codex delete $Session.SessionId 2>&1
+            $null = & codex delete --force $Session.SessionId 2>&1
             $ok = ($LASTEXITCODE -eq 0)
+            if (-not $ok) {
+                $null = '' | & codex delete $Session.SessionId 2>&1
+                $ok = ($LASTEXITCODE -eq 0)
+            }
         }
         catch { $ok = $false }
         finally { $env:CODEX_HOME = $prevHome }
