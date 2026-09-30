@@ -93,8 +93,13 @@ Ctrl+J new line, Ctrl+O editor) ↔ one line, a multi-line paste, or `e` / an
 empty line for $EDITOR. In ccr.py a row cannot change account and get a model
 in one step (Ctrl-O and Ctrl-E each launch); on Windows Space + Shift+Enter
 combine. The mapping table lives in `docs/multi-account.md`.
-The panel is Ctrl+P on both sides: fzf binds ctrl-p to "up" by default, and
-`--expect` takes it over (the arrows still move).
+The panel is Ctrl+P on both sides (named MAP, multi-agent panel, in the UI;
+-MAP / --map alias -Panel / --panel): fzf binds ctrl-p to "up" by default,
+and `--expect` takes it over (the arrows still move). Its agents' tabs are
+Windows Terminal tabs or tmux windows on the PowerShell side, iTerm2 tabs /
+Terminal.app windows / tmux windows on the Python side (open_tab); ccr.py has
+no tab backend on Windows. The viewer's last prompt is a key on Windows and a
+line (Enter / Ctrl-C) in ccr.py.
 The install page is Ctrl+I on Windows as asked, plus Ctrl+T on both sides:
 fzf cannot take ctrl-i, the byte Tab sends too, so it would steal marking.
 
@@ -182,4 +187,16 @@ pane, which shows the full title and folder of the highlighted row.
   - `$null | ForEach-Object { }` runs the block once: filter with
     `Where-Object { $_ }` before turning a list that may be absent into
     strings.
+- The MAP tabs never run an agent: ccr owns every process, and a tab only
+  follows the run's live record (agent-<i>.jsonl plus each turn's output,
+  both append-only) and at the end offers `--resume` / `resume`. A tab that
+  was the agent's interactive CLI during the run would be a second process on
+  the same conversation. The viewer's rendering is one function per side
+  (Format-CcrPanelEvent / format_panel_event), and both viewers must print the
+  same text for the same record. Windows Terminal focuses each tab it opens;
+  there is no background option (tmux: `new-window -d`).
+- `.claude.json`'s `additionalModelOptionsCache` can hold disabled notices
+  (`{"value": "cc-update-required-1", "label": "Opus 5.5 (disabled)",
+  "disabled": true}` in an account last used by an older claude): the model
+  lists skip `disabled` entries.
 - No absolute machine paths, no personal data in the repo or docs.

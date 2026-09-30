@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.68'
+$script:CcrVersion = '0.69'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -1735,10 +1735,10 @@ function Select-CcrTool {
         [switch]$WithPanel
     )
     $tools = @(
-        [pscustomobject]@{ Name = 'claude'; Color = "`e[38;5;208m"; Note = $ClaudeNote },
-        [pscustomobject]@{ Name = 'codex'; Color = "`e[36m"; Note = $CodexNote }
+        [pscustomobject]@{ Name = 'claude'; Label = 'claude'; Color = "`e[38;5;208m"; Note = $ClaudeNote },
+        [pscustomobject]@{ Name = 'codex'; Label = 'codex'; Color = "`e[36m"; Note = $CodexNote }
     )
-    if ($WithPanel) { $tools += [pscustomobject]@{ Name = 'panel'; Color = "`e[35m"; Note = 'several agents discuss one question until they agree' } }
+    if ($WithPanel) { $tools += [pscustomobject]@{ Name = 'panel'; Label = 'MAP'; Color = "`e[35m"; Note = 'multi-agent panel: several agents discuss one question until they agree' } }
     $cursor = 0
     while ($true) {
         $sb = [System.Text.StringBuilder]::new()
@@ -1746,7 +1746,7 @@ function Select-CcrTool {
         [void]$sb.Append("`e[2m$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Enter choose $([char]0x00B7) c / x$(if ($WithPanel) { ' / p' }) jump $([char]0x00B7) Esc back`e[22m`e[K")
         for ($i = 0; $i -lt $tools.Count; $i++) {
             $t = $tools[$i]
-            $row = "  $($t.Color)$($t.Name.PadRight(8))`e[39m `e[2m$($t.Note)`e[22m"
+            $row = "  $($t.Color)$($t.Label.PadRight(8))`e[39m `e[2m$($t.Note)`e[22m"
             if ($i -eq $cursor) { $row = "`e[7m$row`e[27m" }
             [void]$sb.Append("`n").Append($row).Append("`e[K")
         }
@@ -1818,7 +1818,7 @@ function Select-CcrPath {
 
         $sb = [System.Text.StringBuilder]::new()
         [void]$sb.Append("`e[H")
-        $hdr = "$(if ($PanelOnly) { 'panel in' } else { 'new session in' })> $filter"
+        $hdr = "$(if ($PanelOnly) { 'MAP in' } else { 'new session in' })> $filter"
         $counts = "$($view.Count - 1)/$($groups.Count)"
         $pad = [Math]::Max(1, $w - 1 - $hdr.Length - $counts.Length - 2)
         $line1 = $hdr + (' ' * $pad) + $counts
@@ -2194,6 +2194,7 @@ function Get-CcrPanelDefault {
     param([object[]]$ClaudeRoots = @(), [object[]]$CodexRoots = @())
     $agents = [System.Collections.Generic.List[object]]::new()
     $rounds = 4
+    $tabs = $true
     $cfg = Get-CcrConfig
     if ($cfg -and $cfg.panel) {
         foreach ($a in @($cfg.panel.agents)) {
@@ -2210,6 +2211,7 @@ function Get-CcrPanelDefault {
             $agents.Add((New-CcrPanelAgent -Tool $tool -Model $model -Effort $effort -Account $acct -Master ([bool]$a.master)))
         }
         if ([int]$cfg.panel.rounds -ge 2) { $rounds = [Math]::Min(8, [int]$cfg.panel.rounds) }
+        if ($null -ne $cfg.panel.tabs) { $tabs = [bool]$cfg.panel.tabs }
     }
     if ($agents.Count -lt 2 -or $agents.Count -gt $script:CcrPanelMaxAgents) {
         $agents.Clear()
@@ -2218,7 +2220,7 @@ function Get-CcrPanelDefault {
     }
     $seen = $false
     foreach ($a in $agents) { if ($a.Master) { if ($seen) { $a.Master = $false } else { $seen = $true } } }
-    [pscustomobject]@{ Agents = @($agents); Rounds = $rounds }
+    [pscustomobject]@{ Agents = @($agents); Rounds = $rounds; Tabs = $tabs }
 }
 
 # Remember the panel for next time (ccr.json "panel"; other keys untouched).
@@ -2229,6 +2231,7 @@ function Save-CcrPanelDefault([object]$Panel) {
         $keep = if ($cfg.panel -and [int]$cfg.panel.turnTimeoutMinutes -gt 0) { [int]$cfg.panel.turnTimeoutMinutes } else { $null }
         $val = [ordered]@{
             rounds = [int]$Panel.Rounds
+            tabs   = [bool]($Panel.Tabs -ne $false)
             agents = @($Panel.Agents | ForEach-Object { [ordered]@{ tool = $_.Tool; model = $_.Model; effort = $_.Effort; account = $_.Account; master = [bool]$_.Master } })
         }
         if ($keep) { $val.turnTimeoutMinutes = $keep }
@@ -2610,10 +2613,12 @@ function Invoke-CcrPanelBatch {
             $turns.Add($t)
             $Ctx.Running.Add($t)
             $a.Starts++
+            Add-CcrPanelEvent $Ctx $a.Index @{ ev = 'turn'; turn = $a.Starts; title = $Title; out = (Split-Path -Leaf $t.Out) }
         }
         catch {
             $a.Active = $false
             Write-CcrPanelMessage $a $Title ([pscustomobject]@{ Ok = $false; Error = "cannot start $($a.Exe): $_" })
+            Add-CcrPanelEvent $Ctx $a.Index @{ ev = 'done'; title = $Title; ok = $false; error = "cannot start $($a.Exe): $_" }
         }
     }
     $pending = [System.Collections.Generic.List[object]]::new()
@@ -2671,6 +2676,9 @@ function Invoke-CcrPanelBatch {
             else { $a.Active = $false }
             Write-CcrPanelMessage $a $Title $res
             if ($note) { [Console]::Write("`e[33mccr: agent $($a.Index): $note.`e[39m`n`n") }
+            Add-CcrPanelEvent $Ctx $a.Index @{ ev = 'done'; title = $Title; ok = [bool]$res.Ok; error = "$($res.Error)"; note = $note
+                consensus = $(if ($res.Ok -and $Title -like 'round*') { Get-CcrPanelConsensus $res.Text } else { '' })
+                session = $(if ($a.Tool -eq 'claude') { $a.SessionId } else { $a.ThreadId }) }
         }
         if (-not $pending.Count) { break }
         $parts = foreach ($t in $turns) {
@@ -2696,7 +2704,7 @@ function Get-CcrPanelTranscript {
     param([object[]]$Agents, [string]$Question, [string]$Folder, [object[]]$Log, [string]$Outcome, [datetime]$Started)
     $ti = (Get-Culture).TextInfo
     $sb = [System.Text.StringBuilder]::new()
-    [void]$sb.Append("# ccr panel $([char]0x00B7) $(Get-CcrPanelShort $Question 80)`n`n")
+    [void]$sb.Append("# ccr MAP $([char]0x00B7) $(Get-CcrPanelShort $Question 80)`n`n")
     [void]$sb.Append("- date: $($Started.ToString('yyyy-MM-dd HH:mm'))`n- folder: $Folder`n- outcome: $Outcome`n")
     foreach ($a in $Agents) {
         $id = if ($a.Tool -eq 'claude') { $a.SessionId } else { $a.ThreadId }
@@ -2733,6 +2741,305 @@ function Save-CcrPanelTranscript([string]$Markdown, [string]$Short) {
     $file = Join-Path $dir ('{0}-{1}.md' -f [DateTime]::Now.ToString('yyyyMMdd-HHmmss'), $slug)
     [IO.File]::WriteAllText($file, $Markdown, [Text.UTF8Encoding]::new($false))
     $file
+}
+
+# =============================================================================
+#  MAP tabs: one terminal tab per agent shows live what it does
+#  (Windows Terminal tabs; tmux windows elsewhere)
+# =============================================================================
+
+# One line of an agent's live record, agent-<i>.jsonl in the run's folder: its
+# header, the start and end of each turn, the end of the MAP. The agent's tab
+# follows it. Nothing is written when the run has no tabs.
+function Add-CcrPanelEvent([object]$Ctx, [int]$Index, [hashtable]$Event) {
+    if (-not $Ctx.Tabs) { return }
+    try {
+        $b = [Text.UTF8Encoding]::new($false).GetBytes((($Event | ConvertTo-Json -Compress -Depth 6) + "`n"))
+        $fs = [IO.File]::Open((Join-Path $Ctx.Temp "agent-$Index.jsonl"), [IO.FileMode]::Append, [IO.FileAccess]::Write,
+            [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+        try { $fs.Write($b, 0, $b.Length) } finally { $fs.Dispose() }
+    }
+    catch { }
+}
+
+# The complete lines appended to a file since the last call; $Cursor keeps the
+# byte offset and a partial last line. Another process may be writing it.
+function Read-CcrNewLines([string]$Path, [hashtable]$Cursor) {
+    if (-not $Cursor.ContainsKey('Off')) { $Cursor.Off = [long]0; $Cursor.Rest = [byte[]]@() }
+    if (-not (Test-Path -LiteralPath $Path)) { return @() }
+    $fs = $null
+    $buf = $null
+    try {
+        $fs = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+        if ($fs.Length -le $Cursor.Off) { return @() }
+        [void]$fs.Seek($Cursor.Off, [IO.SeekOrigin]::Begin)
+        $buf = [byte[]]::new($fs.Length - $Cursor.Off)
+        $got = $fs.Read($buf, 0, $buf.Length)
+        if ($got -lt $buf.Length) { [Array]::Resize([ref]$buf, $got) }
+        $Cursor.Off += $got
+    }
+    catch { return @() }
+    finally { if ($fs) { $fs.Dispose() } }
+    $all = [System.Collections.Generic.List[byte]]::new()
+    if ($Cursor.Rest) { $all.AddRange([byte[]]$Cursor.Rest) }
+    $all.AddRange($buf)
+    $bytes = $all.ToArray()
+    $last = [Array]::LastIndexOf($bytes, [byte]10)
+    if ($last -lt 0) { $Cursor.Rest = $bytes; return @() }
+    $rest = [byte[]]::new($bytes.Length - $last - 1)
+    [Array]::Copy($bytes, $last + 1, $rest, 0, $rest.Length)
+    $Cursor.Rest = $rest
+    @([Text.Encoding]::UTF8.GetString($bytes, 0, $last + 1) -split "`r?`n" | Where-Object { $_ })
+}
+
+# The first non-empty line of a text, cut to $Max characters.
+function Get-CcrOneLine([string]$Text, [int]$Max = 160) {
+    $l = "$(@("$Text" -split "`r?`n" | Where-Object { $_.Trim() })[0])".Trim()
+    if ($l.Length -gt $Max) { $l = $l.Substring(0, $Max - 1) + [char]0x2026 }
+    $l
+}
+
+# The command inside a shell wrapper (codex runs `pwsh -Command '...'`,
+# `bash -lc '...'`), else the command as it is.
+function Get-CcrShellInner([string]$Command) {
+    $m = [regex]::Match("$Command", "(?s)\s-(?:Command|c|lc)\s+'(.*)'\s*$")
+    if ($m.Success) { return $m.Groups[1].Value.Replace("''", "'") }
+    $m = [regex]::Match("$Command", '(?s)\s-(?:Command|c|lc)\s+"(.*)"\s*$')
+    if ($m.Success) { return $m.Groups[1].Value }
+    "$Command"
+}
+
+# A claude tool call in one line: the tool and what it works on.
+function Get-CcrToolUseText([string]$Name, [object]$ToolInput) {
+    $i = $ToolInput
+    $arg = switch -Regex ($Name) {
+        '^(Read|Write|Edit|MultiEdit)$' { "$($i.file_path)"; break }
+        '^NotebookEdit$' { "$($i.notebook_path)"; break }
+        '^(Grep|Glob)$' { $(if ($Name -eq 'Grep') { "`"$($i.pattern)`"" } else { "$($i.pattern)" }) + $(if ($i.path) { " in $($i.path)" } else { '' }); break }
+        '^(Bash|PowerShell)$' { "$($i.command)"; break }
+        '^WebFetch$' { "$($i.url)"; break }
+        '^WebSearch$' { "$($i.query)"; break }
+        default {
+            $p = @(if ($i) { $i.PSObject.Properties | Where-Object { $_.Value -is [string] -and $_.Value } })
+            if ($p.Count) { "$($p[0].Value)" } else { '' }
+        }
+    }
+    "$Name  $(Get-CcrOneLine $arg 120)".TrimEnd()
+}
+
+# One line of an agent's output as its tab shows it: @{ Style; Text } items,
+# Style = text (what the agent writes), tool (what it reads, runs, changes),
+# dim (model, reasoning) or err. $State remembers the codex commands shown
+# when they started. Pure: the tests feed it recorded lines.
+function Format-CcrPanelEvent {
+    param([string]$Tool, [string]$Line, [hashtable]$State = @{})
+    $out = [System.Collections.Generic.List[object]]::new()
+    $emit = { param($st, $tx) $t = (Format-CcrAgentText "$tx").TrimEnd(); if ($t) { $out.Add([pscustomobject]@{ Style = $st; Text = $t }) } }
+    try { $e = $Line | ConvertFrom-Json -ErrorAction Stop } catch { return , $out.ToArray() }
+    $arrow = [char]0x25B8
+    if ($Tool -eq 'claude') {
+        switch ("$($e.type)") {
+            'system' {
+                if ("$($e.subtype)" -eq 'init') {
+                    $tools = @(@($e.tools) | Where-Object { $_ })
+                    $tt = if ($tools.Count -le 6) { $tools -join ', ' } else { "$($tools.Count) tools" }
+                    & $emit 'dim' "model $($e.model) $([char]0x00B7) $($e.permissionMode) $([char]0x00B7) $tt"
+                }
+            }
+            'assistant' {
+                foreach ($c in @($e.message.content)) {
+                    switch ("$($c.type)") {
+                        'text' { & $emit 'text' $c.text }
+                        'tool_use' { & $emit 'tool' "$arrow $(Get-CcrToolUseText "$($c.name)" $c.input)" }
+                        'thinking' { if ("$($c.thinking)".Trim()) { & $emit 'dim' "$([char]0x2026) $(Get-CcrOneLine $c.thinking 160)" } }
+                    }
+                }
+            }
+            'user' {
+                foreach ($c in @($e.message.content)) {
+                    if ("$($c.type)" -eq 'tool_result' -and $c.is_error) {
+                        $txt = if ($c.content -is [string]) { $c.content } else { (@($c.content) | ForEach-Object { "$($_.text)" }) -join "`n" }
+                        & $emit 'err' "  $([char]0x2717) $(Get-CcrOneLine $txt 160)"
+                    }
+                }
+            }
+        }
+        return , $out.ToArray()
+    }
+    switch ("$($e.type)") {
+        'item.started' {
+            if ("$($e.item.type)" -eq 'command_execution') {
+                if ("$($e.item.id)") { $State["$($e.item.id)"] = $true }
+                & $emit 'tool' "$arrow `$ $(Get-CcrOneLine (Get-CcrShellInner "$($e.item.command)") 140)"
+            }
+        }
+        'item.completed' {
+            $it = $e.item
+            switch ("$($it.type)") {
+                'command_execution' {
+                    if (-not ("$($it.id)" -and $State.ContainsKey("$($it.id)"))) { & $emit 'tool' "$arrow `$ $(Get-CcrOneLine (Get-CcrShellInner "$($it.command)") 140)" }
+                    $code = "$($it.exit_code)"
+                    if (($code -ne '' -and $code -ne '0') -or "$($it.status)" -eq 'failed') {
+                        & $emit 'err' "  $([char]0x2717) exit $(if ($code) { $code } else { '?' }): $(Get-CcrOneLine "$($it.aggregated_output)" 150)"
+                    }
+                }
+                'reasoning' { if ("$($it.text)".Trim()) { & $emit 'dim' "$([char]0x2026) $(Get-CcrOneLine $it.text 160)" } }
+                'agent_message' { & $emit 'text' $it.text }
+                'file_change' {
+                    $paths = @(@($it.changes) | ForEach-Object { "$($_.path)" } | Where-Object { $_ })
+                    $shown = (@($paths | Select-Object -First 3) -join ', ') + $(if ($paths.Count -gt 3) { " +$($paths.Count - 3)" } else { '' })
+                    if ($paths.Count) { & $emit 'tool' "$([char]0x270E) $shown" }
+                }
+                'mcp_tool_call' { & $emit 'tool' "$arrow $($it.server).$($it.tool)" }
+                'web_search' { & $emit 'tool' "$arrow web search: $(Get-CcrOneLine "$($it.query)" 120)" }
+                'error' { & $emit 'err' "$([char]0x2717) $(Get-CcrOneLine "$($it.message)" 160)" }
+            }
+        }
+        'turn.failed' { & $emit 'err' "$([char]0x2717) $(Get-CcrOneLine $(if ("$($e.error.message)") { "$($e.error.message)" } else { 'turn failed' }) 160)" }
+        'error' { & $emit 'err' "$([char]0x2717) $(Get-CcrOneLine $(if ("$($e.message)") { "$($e.message)" } else { 'error' }) 160)" }
+    }
+    , $out.ToArray()
+}
+
+# The arguments for wt.exe: one new-tab per agent, in this window, each tab
+# running Watch-CcrPanelAgent from this very script file. Every ';' inside a
+# tab's command reaches wt as '\;' (wt splits its whole command line on ';').
+function Get-CcrPanelTabArgs {
+    param([object[]]$Agents, [string]$Dir, [string]$Folder, [string]$Self)
+    $sq = { param($s) "'" + ("$s" -replace "'", "''") + "'" }
+    $n = @($Agents).Count
+    $out = [System.Collections.Generic.List[string]]::new()
+    foreach ($x in '-w', '0') { $out.Add($x) }
+    foreach ($a in $Agents) {
+        if ($out.Count -gt 2) { $out.Add(';') }
+        $cmd = ". $(& $sq $Self); Watch-CcrPanelAgent -Dir $(& $sq $Dir) -Index $($a.Index)"
+        foreach ($x in 'new-tab', '--title', (Get-CcrPanelTabTitle $a $n), '--suppressApplicationTitle', '-d', $Folder,
+            'pwsh.exe', '-NoProfile', '-Command', ($cmd -replace ';', '\;')) { $out.Add($x) }
+    }
+    , $out.ToArray()
+}
+
+function Get-CcrPanelTabTitle([object]$Agent, [int]$N) {
+    ("MAP {0}{1}/{2} {3} {4}" -f $(if ($Agent.Master) { [string][char]0x2605 } else { '' }), $Agent.Index, $N, [char]0x00B7,
+        (Get-CcrPanelAgentLabel $Agent)) -replace ';', ''
+}
+
+# Open the live tabs: Windows Terminal tabs in this window, or tmux windows
+# (in the background) when ccr runs inside tmux. $false = neither is here.
+function Open-CcrPanelTabs {
+    param([object[]]$Agents, [string]$Dir, [string]$Folder)
+    $self = $MyInvocation.MyCommand.ScriptBlock.File
+    if (-not $self) { return $false }
+    $wt = @(Get-Command wt.exe -CommandType Application -ErrorAction SilentlyContinue)[0]
+    if ($IsWindows -and $env:WT_SESSION -and $wt) {
+        try { & $wt.Source @(Get-CcrPanelTabArgs -Agents $Agents -Dir $Dir -Folder $Folder -Self $self); return $true } catch { return $false }
+    }
+    if ($env:TMUX -and (Get-Command tmux -CommandType Application -ErrorAction SilentlyContinue)) {
+        $sq = { param($s) "'" + ("$s" -replace "'", "''") + "'" }
+        $n = @($Agents).Count
+        foreach ($a in $Agents) {
+            $cmd = ". $(& $sq $self); Watch-CcrPanelAgent -Dir $(& $sq $Dir) -Index $($a.Index)"
+            & tmux new-window -d -n (Get-CcrPanelTabTitle $a $n) -c $Folder pwsh -NoProfile -Command $cmd
+        }
+        return $true
+    }
+    $false
+}
+
+# An agent's tab: what the agent does, live - its reads, searches, commands
+# and changes, its messages, turn after turn - from the run's live record.
+# At the end Enter opens the agent's own session in this tab (claude --resume
+# / codex resume, under its account); any other key closes the tab.
+function Watch-CcrPanelAgent {
+    param([Parameter(Mandatory)][string]$Dir, [Parameter(Mandatory)][int]$Index)
+    try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) } catch { }
+    $dot = [char]0x00B7
+    $bar = [string][char]0x2500 * 2
+    $style = @{ text = ''; tool = "`e[36m"; dim = "`e[2m"; err = "`e[31m" }
+    $manifest = Join-Path $Dir "agent-$Index.jsonl"
+    $mCur = @{}
+    $turn = $null
+    $state = @{}
+    $hdr = $null
+    $end = $null
+    $sid = ''
+    $tool = ''
+    $tc = "`e[39m"
+    $quiet = 0
+    $show = {
+        param($items)
+        foreach ($x in @($items)) {
+            $c = $style["$($x.Style)"]
+            [Console]::Write("$c$($x.Text)$(if ($c) { "`e[0m" })`n")
+        }
+    }
+    $flush = { if ($turn) { foreach ($l in @(Read-CcrNewLines $turn.Path $turn)) { & $show (Format-CcrPanelEvent $tool $l $state) } } }
+    while (-not $end) {
+        $news = 0
+        foreach ($l in @(Read-CcrNewLines $manifest $mCur)) {
+            $news++
+            try { $e = $l | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+            switch ("$($e.ev)") {
+                'agent' {
+                    $hdr = $e
+                    $tool = "$($e.tool)"
+                    $sid = "$($e.session)"
+                    $tc = if ($tool -eq 'claude') { "`e[38;5;208m" } else { "`e[36m" }
+                    try { $Host.UI.RawUI.WindowTitle = "MAP $($e.index)/$($e.n) $dot $($e.label)" } catch { }
+                    [Console]::Write("$tc`e[1magent $($e.index)/$($e.n) $dot $($e.label) $dot $($e.role)`e[0m`n")
+                    [Console]::Write("`e[2mfolder: $($e.folder)`nquestion: $($e.question)`e[22m`n")
+                }
+                'turn' {
+                    & $flush
+                    $turn = @{ Path = (Join-Path $Dir "$($e.out)") }
+                    [Console]::Write("`n$tc$bar $($e.title) $bar`e[39m`n")
+                }
+                'done' {
+                    & $flush
+                    $turn = $null
+                    if ("$($e.session)") { $sid = "$($e.session)" }
+                    if ($e.ok) {
+                        $c = switch ("$($e.consensus)") { 'AGREE' { "`e[32m" } 'CONTINUE' { "`e[33m" } default { "`e[2m" } }
+                        [Console]::Write("$c$([char]0x2713) $($e.title)$(if ("$($e.consensus)") { " $dot $($e.consensus)" })`e[0m`n")
+                    }
+                    else { [Console]::Write("`e[31m$([char]0x2717) $($e.title) failed: $(Format-CcrAgentText "$($e.error)")`e[0m`n") }
+                    if ("$($e.note)") { [Console]::Write("`e[33mccr: $($e.note).`e[0m`n") }
+                }
+                'end' { & $flush; $end = $e }
+            }
+        }
+        if ($end) { break }
+        if ($turn) {
+            foreach ($l in @(Read-CcrNewLines $turn.Path $turn)) { $news++; & $show (Format-CcrPanelEvent $tool $l $state) }
+        }
+        if ($news) { $quiet = 0 } else { $quiet++ }
+        if ($hdr -and $quiet -gt 25 -and -not (Get-Process -Id ([int]$hdr.pid) -ErrorAction SilentlyContinue)) {
+            $end = [pscustomobject]@{ outcome = 'ccr is no longer running' }
+            break
+        }
+        Start-Sleep -Milliseconds 200
+    }
+    [Console]::Write("`n`e[1m$bar MAP finished: $(if ("$($end.outcome)") { $end.outcome } else { 'done' }) $bar`e[22m`n")
+    if ("$($end.session)") { $sid = "$($end.session)" }
+    try {
+        if ($sid -and "$($end.exe)") {
+            $resume = @($end.resume | ForEach-Object { "$_" })
+            [Console]::Write("Enter: open this agent's session here ($tool $($resume -join ' ')) $dot any other key: close the tab ")
+            $k = [Console]::ReadKey($true)
+            [Console]::WriteLine()
+            if ($k.Key -eq [ConsoleKey]::Enter) {
+                if ("$($end.var)" -and "$($end.root)") { [Environment]::SetEnvironmentVariable("$($end.var)", "$($end.root)") }
+                if ("$($end.path)") { $env:PATH = "$($end.path)" }
+                if ("$($end.folder)" -and (Test-Path -LiteralPath "$($end.folder)")) { Set-Location -LiteralPath "$($end.folder)" }
+                & "$($end.exe)" @resume
+            }
+        }
+        else {
+            [Console]::Write("no session to open $dot any key: close the tab ")
+            [void][Console]::ReadKey($true)
+        }
+    }
+    catch { }   # no console to ask: the tab just ends
 }
 
 # Run a panel: check, start the agents round after round, stop at consensus
@@ -2776,7 +3083,7 @@ function Invoke-CcrPanel {
             Exe        = "$(@(Get-Command $a.Tool -CommandType Application -ErrorAction SilentlyContinue)[0].Source)"
             SessionId  = $(if ($a.Tool -eq 'claude') { [guid]::NewGuid().ToString() } else { '' })
             ThreadId   = ''
-            Name       = "panel $(if ($a.Master) { [string][char]0x2605 })$($i + 1)/$n $([char]0x00B7) $short"
+            Name       = "MAP $(if ($a.Master) { [string][char]0x2605 })$($i + 1)/$n $([char]0x00B7) $short"
             MasterMode = $(if ($a.Tool -eq 'claude' -and $a.Master) { Get-CcrPanelMasterMode $root.Path } else { 'acceptEdits' })
             ChildPath  = $(if ($a.Tool -eq 'codex') { Get-CcrCodexChildPath } else { '' })
             Active     = $true
@@ -2799,13 +3106,16 @@ function Invoke-CcrPanel {
     $master = @($agents | Where-Object Master)[0]
 
     if ($WhatIfPreference) {
-        Write-Host "WhatIf: a panel of $n agents in $Folder would start like this (the rules and the question go on stdin):" -ForegroundColor Yellow
+        Write-Host "WhatIf: a MAP of $n agents in $Folder would start like this (the rules and the question go on stdin):" -ForegroundColor Yellow
         foreach ($a in $agents) {
             $argv = Get-CcrPanelArgv -Agent $a -First $true -SessionId $a.SessionId -Name $a.Name -MasterMode $a.MasterMode
             $pre = if ($a.EnvVar) { "$($a.EnvVar)=$($a.RootPath) " } else { '' }
             "  agent $($a.Index)$(if ($a.Master) { ' (master)' }): $pre$($a.Exe) $((@($argv) | ForEach-Object { ConvertTo-CcrWinArg $_ }) -join ' ')"
         }
         if (@($agents | Where-Object ChildPath).Count) { "  codex agents: PATH without its WindowsApps entries (codex's sandbox cannot start the Store PowerShell)" }
+        $tabsTxt = if ($Panel.Tabs -eq $false) { 'off' } elseif ($IsWindows -and $env:WT_SESSION) { 'one Windows Terminal tab per agent, live' }
+        elseif ($env:TMUX) { 'one tmux window per agent, live' } else { 'not available here (Windows Terminal or tmux only)' }
+        "  tabs: $tabsTxt"
         return
     }
 
@@ -2829,8 +3139,27 @@ function Invoke-CcrPanel {
         Agents         = $agents
         Log            = [System.Collections.Generic.List[object]]::new()
         Running        = [System.Collections.Generic.List[object]]::new()
+        Tabs           = $false
     }
     [void][IO.Directory]::CreateDirectory($ctx.Temp)
+    # The live records of earlier runs stay for their tabs; a day later they go.
+    foreach ($old in @(Get-ChildItem -LiteralPath ([IO.Path]::GetTempPath()) -Directory -Filter 'ccr-panel-*' -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-1) })) {
+        try { Remove-Item -LiteralPath $old.FullName -Recurse -Force -ErrorAction Stop } catch { }
+    }
+    # One tab per agent: its header goes into the live record first, then the
+    # tabs open and follow the record.
+    $tabsNote = ''
+    if ($Panel.Tabs -ne $false) {
+        $ctx.Tabs = $true
+        foreach ($a in $agents) {
+            Add-CcrPanelEvent $ctx $a.Index @{ ev = 'agent'; index = $a.Index; n = $n; tool = $a.Tool; label = (Get-CcrPanelAgentLabel $a)
+                role = $(if ($a.Master) { 'master, can change files' } else { 'reviewer, read-only' }); folder = $Folder
+                question = (Get-CcrPanelShort $Question 120); pid = $PID; session = $a.SessionId }
+        }
+        if (Open-CcrPanelTabs -Agents $agents -Dir $ctx.Temp -Folder $Folder) { $tabsNote = 'tabs: one per agent, live - Enter there at the end opens its session' }
+        else { $ctx.Tabs = $false; $tabsNote = 'tabs: not available here (Windows Terminal or tmux only)' }
+    }
     $prevCtrlC = try { [Console]::TreatControlCAsInput } catch { $null }
     $prevEnc = [Console]::OutputEncoding
     $agreed = $false
@@ -2840,13 +3169,14 @@ function Invoke-CcrPanel {
         # so Italian replies print right on a legacy code page.
         try { [Console]::TreatControlCAsInput = $true } catch { }
         try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) } catch { }
-        [Console]::Write("`e[?25l`n`e[1mccr panel`e[22m$(if ($master) { ' with a master' }) $([char]0x00B7) $Folder`n")
+        [Console]::Write("`e[?25l`n`e[1mccr MAP`e[22m$(if ($master) { ' with a master' }) $([char]0x00B7) $Folder`n")
         foreach ($a in $agents) {
             $tc = if ($a.Tool -eq 'claude') { "`e[38;5;208m" } else { "`e[36m" }
             $role = if ($a.Master) { "`e[33m$([char]0x2605) master, can change files`e[39m" } else { "`e[2mreviewer, read-only`e[22m" }
             $acct = if ($a.EnvVar) { "  `e[35m$(Format-CcrAcctLabel $a.Root.Label $a.Root.Default)`e[39m" } else { '' }
             [Console]::Write("  ${tc}agent $($a.Index)`e[39m  $(Get-CcrPanelAgentLabel $a)$acct  $role`n")
         }
+        if ($tabsNote) { [Console]::Write("`e[2m$tabsNote`e[22m`n") }
         [Console]::Write("`e[2mquestion: $(Get-CcrPanelShort $Question 120)`e[22m`n`n")
 
         $maxRounds = [Math]::Max(2, [int]$Panel.Rounds)
@@ -2910,10 +3240,18 @@ function Invoke-CcrPanel {
     }
     finally {
         foreach ($t in @($ctx.Running)) { Stop-CcrAgentTurn $t }
+        # the tabs' last word: the outcome, and how to open each session there
+        $endTxt = if ($ctx.Stopped) { 'stopped with Ctrl+C' } elseif ($agreed) { "consensus in round $($ctx.Round)" } else { "no consensus after $($ctx.Round) round(s)" }
+        foreach ($a in $agents) {
+            $sid = if ($a.Tool -eq 'claude') { if ($a.Turns) { $a.SessionId } else { '' } } else { $a.ThreadId }
+            Add-CcrPanelEvent $ctx $a.Index @{ ev = 'end'; outcome = $endTxt; session = $sid; exe = $a.Exe
+                resume = @(if ($a.Tool -eq 'claude') { '--resume', $sid } else { 'resume', $sid })
+                var = $(if ($a.Tool -eq 'claude') { 'CLAUDE_CONFIG_DIR' } else { 'CODEX_HOME' }); root = $a.RootPath; path = $a.ChildPath; folder = $Folder }
+        }
         [Console]::Write("`r`e[K`e[?25h")
         if ($null -ne $prevCtrlC) { try { [Console]::TreatControlCAsInput = $prevCtrlC } catch { } }
         try { [Console]::OutputEncoding = $prevEnc } catch { }
-        try { [IO.Directory]::Delete($ctx.Temp, $true) } catch { }
+        if (-not $ctx.Tabs) { try { [IO.Directory]::Delete($ctx.Temp, $true) } catch { } }
     }
 
     $mins = [int][Math]::Round(((Get-Date) - $started).TotalMinutes)
@@ -2924,9 +3262,10 @@ function Invoke-CcrPanel {
         catch { Write-Warning "ccr: transcript not saved: $_" }
     }
     Write-Host ''
-    Write-Host "ccr: panel finished - $outcome, $mins min." -ForegroundColor $(if ($agreed) { 'Green' } else { 'Yellow' })
+    Write-Host "ccr: MAP finished - $outcome, $mins min." -ForegroundColor $(if ($agreed) { 'Green' } else { 'Yellow' })
     if ($file) { Write-Host "  transcript: $file" }
-    Write-Host '  sessions, in the picker as "panel i/n" - resume one to go on:'
+    if ($ctx.Tabs) { Write-Host '  tabs: Enter in an agent''s tab opens its session there, any other key closes it' }
+    Write-Host '  sessions, in the picker as "MAP i/n" - resume one to go on:'
     foreach ($a in $agents) {
         $id = if ($a.Tool -eq 'claude') { $a.SessionId } else { $a.ThreadId }
         $note = if (-not $a.Starts) { 'not started' } elseif (-not $a.Turns) { 'stopped before its first reply' }
@@ -2971,6 +3310,7 @@ function Show-CcrPanelPage {
     $agents = [System.Collections.Generic.List[object]]::new()
     foreach ($a in @($state.Agents)) { $agents.Add($a.PSObject.Copy()) }
     $rounds = [Math]::Min(8, [Math]::Max(2, [int]$state.Rounds))
+    $tabs = [bool]($state.Tabs -ne $false)
     $cache = @{}
     function Get-PanelRoot([object]$a) {
         $roots = if ($a.Tool -eq 'codex') { @($CodexRoots) } else { @($ClaudeRoots) }
@@ -2997,13 +3337,14 @@ function Show-CcrPanelPage {
             $roots = if ($agents[$i].Tool -eq 'codex') { @($CodexRoots) } else { @($ClaudeRoots) }
             if ($roots.Count -gt 1) { $fields.Add([pscustomobject]@{ I = $i; F = 'account' }) }
         }
+        $fields.Add([pscustomobject]@{ I = -1; F = 'tabs' })
         $fields.Add([pscustomobject]@{ I = -1; F = 'rounds' })
         if ($cursor -ge $fields.Count) { $cursor = $fields.Count - 1 }
         $cur = $fields[$cursor]
         $ai = if ($cur.I -ge 0) { $cur.I } else { $agents.Count - 1 }
         $hasMaster = [bool](@($agents | Where-Object Master).Count)
         $lines = [System.Collections.Generic.List[string]]::new()
-        $lines.Add("`e[1mPanel`e[22m  `e[2m$(Format-CcrCwd $Folder 60) $dot $($agents.Count) agents $dot parallel rounds$(if ($hasMaster) { ', the master first from round 2' })`e[22m")
+        $lines.Add("`e[1mMAP`e[22m  `e[2m$(Format-CcrCwd $Folder 60) $dot $($agents.Count) agents $dot parallel rounds$(if ($hasMaster) { ', the master first from round 2' })`e[22m")
         $lines.Add("`e[2m$([char]0x2191)$([char]0x2193) field $dot $([char]0x2190)$([char]0x2192) change $dot Del no override $dot + add agent $dot - remove $dot M master $dot Enter start $dot Esc back`e[22m")
         if ($Question) { $lines.Add("`e[2mquestion: $(Get-CcrPanelShort $Question ([Math]::Max(20, $w - 14)))`e[22m") }
         for ($i = 0; $i -lt $agents.Count; $i++) {
@@ -3035,6 +3376,11 @@ function Show-CcrPanelPage {
             }
         }
         $lines.Add('')
+        $tabsNote = if (($IsWindows -and $env:WT_SESSION) -or $env:TMUX) { 'one tab per agent shows live what it does; at the end Enter there opens its session' }
+        else { 'one tab per agent - Windows Terminal or tmux only, not available here' }
+        $row = "  tabs       $([char]0x2039) $($(if ($tabs) { 'yes' } else { 'no' }).PadRight(24)) $([char]0x203A)  `e[2m$tabsNote`e[22m"
+        if ($cur.F -eq 'tabs') { $row = "`e[7m$row`e[27m" }
+        $lines.Add($row)
         $row = "  rounds     $([char]0x2039) $("$rounds".PadRight(24)) $([char]0x203A)  `e[2mhow many rounds before ccr asks whether to go on (2-8)`e[22m"
         if ($cur.F -eq 'rounds') { $row = "`e[7m$row`e[27m" }
         $lines.Add($row)
@@ -3055,7 +3401,7 @@ function Show-CcrPanelPage {
         switch ($k.Key) {
             'UpArrow' { if ($cursor -gt 0) { $cursor-- } }
             'DownArrow' { if ($cursor -lt $fields.Count - 1) { $cursor++ } }
-            'Enter' { return [pscustomobject]@{ Agents = @($agents); Rounds = $rounds } }
+            'Enter' { return [pscustomobject]@{ Agents = @($agents); Rounds = $rounds; Tabs = $tabs } }
             'Escape' { return $null }
             { $_ -in 'Delete', 'Backspace' } {
                 if ($a) { switch ($cur.F) { 'model' { $a.Model = ''; $a.Effort = '' } 'effort' { $a.Effort = '' } 'account' { $a.Account = '' } } }
@@ -3063,6 +3409,7 @@ function Show-CcrPanelPage {
             { $_ -in 'LeftArrow', 'RightArrow' } {
                 $step = if ($k.Key -eq [ConsoleKey]::RightArrow) { 1 } else { -1 }
                 if ($cur.F -eq 'rounds') { $rounds = [Math]::Min(8, [Math]::Max(2, $rounds + $step)) }
+                elseif ($cur.F -eq 'tabs') { $tabs = -not $tabs }
                 elseif ($a) {
                     $info = Get-PanelInfo $a
                     switch ($cur.F) {
@@ -3131,7 +3478,7 @@ function Read-CcrPanelQuestion {
             }
             if ($shownQ.Count -eq 0) { $shownQ.Add('') }
             $lines = [System.Collections.Generic.List[string]]::new()
-            $lines.Add("`e[1mPanel $dot your question`e[22m  `e[2mccr puts these rules in front of it (agent 1's copy)`e[22m")
+            $lines.Add("`e[1mMAP $dot your question`e[22m  `e[2mccr puts these rules in front of it (agent 1's copy)`e[22m")
             $lines.Add("`e[2mEnter next $dot Shift+Enter or Ctrl+J new line $dot Ctrl+O editor $dot Esc back`e[22m")
             $lines.Add('')
             $room = [Math]::Max(3, $h - 5 - $shownQ.Count)
@@ -3278,7 +3625,9 @@ function Get-CcrModelChoices {
             try {
                 $j = Get-Content -LiteralPath (Join-Path $p '.claude.json') -Raw -ErrorAction Stop | ConvertFrom-Json
                 foreach ($o in @($j.additionalModelOptionsCache)) {
-                    if (-not $o.value) { continue }
+                    # a disabled entry is a notice ("Update to 2.1.280+ to use
+                    # Opus 5.5"), not a model
+                    if (-not $o.value -or $o.disabled) { continue }
                     $note = (@("$($o.label)", "$($o.description)") | Where-Object { $_ }) -join " $([char]0x00B7) "
                     & $add "$($o.value)" $note $script:CcrClaudeEfforts
                 }
@@ -3599,8 +3948,8 @@ function Select-CcrSession {
             $w = [Console]::WindowWidth
             $h = [Console]::WindowHeight
             # The key legend wraps onto as many lines as the window needs.
-            $hint = if ($acctMode) { "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space cycles the account (dot = as is) $([char]0x00B7) Enter open $([char]0x00B7) Shift+Enter model/effort $([char]0x00B7) Ctrl+N new $([char]0x00B7) Ctrl+P panel $([char]0x00B7) Ctrl+A accounts $([char]0x00B7) Ctrl+K usage $([char]0x00B7) Ctrl+J details $([char]0x00B7) Ctrl+X close $([char]0x00B7) Ctrl+I install $([char]0x00B7) Del delete $([char]0x00B7) Esc cancel $([char]0x00B7) v$script:CcrVersion" }
-            else { "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space mark $([char]0x00B7) Enter open $([char]0x00B7) Shift+Enter model/effort $([char]0x00B7) Ctrl+N new $([char]0x00B7) Ctrl+P panel $([char]0x00B7) Del delete $([char]0x00B7) Ctrl+A accounts $([char]0x00B7) Ctrl+K usage $([char]0x00B7) Ctrl+J details $([char]0x00B7) Ctrl+X close $([char]0x00B7) Ctrl+I install $([char]0x00B7) Esc cancel $([char]0x00B7) type to filter $([char]0x00B7) v$script:CcrVersion" }
+            $hint = if ($acctMode) { "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space cycles the account (dot = as is) $([char]0x00B7) Enter open $([char]0x00B7) Shift+Enter model/effort $([char]0x00B7) Ctrl+N new $([char]0x00B7) Ctrl+P MAP $([char]0x00B7) Ctrl+A accounts $([char]0x00B7) Ctrl+K usage $([char]0x00B7) Ctrl+J details $([char]0x00B7) Ctrl+X close $([char]0x00B7) Ctrl+I install $([char]0x00B7) Del delete $([char]0x00B7) Esc cancel $([char]0x00B7) v$script:CcrVersion" }
+            else { "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space mark $([char]0x00B7) Enter open $([char]0x00B7) Shift+Enter model/effort $([char]0x00B7) Ctrl+N new $([char]0x00B7) Ctrl+P MAP $([char]0x00B7) Del delete $([char]0x00B7) Ctrl+A accounts $([char]0x00B7) Ctrl+K usage $([char]0x00B7) Ctrl+J details $([char]0x00B7) Ctrl+X close $([char]0x00B7) Ctrl+I install $([char]0x00B7) Esc cancel $([char]0x00B7) type to filter $([char]0x00B7) v$script:CcrVersion" }
             $hintLines = @(Split-CcrHint $hint ($w - 1))
             $viewH = [Math]::Max(1, $h - 1 - $hintLines.Count - $(if ($acctMode) { $entries.Count + 1 } else { 0 }) - $(if ($updNote) { 1 } else { 0 }))
             if ($cursor -gt $view.Count - 1) { $cursor = [Math]::Max(0, $view.Count - 1) }
@@ -4296,7 +4645,8 @@ function Resume-CcSessions {
         macOS picker) opens the same as a page.
     .EXAMPLE
         ccr -Panel "why does the nightly import skip rows?"
-        A panel: two to four fresh agents (claude and/or codex, each with its
+        A MAP (multi-agent panel; -MAP works too): two to four fresh agents
+        (claude and/or codex, each with its
         model, effort and account) discuss one question in a folder until
         they agree. Also Ctrl+P in the picker (or Ctrl+N -> folder -> panel).
         The question page comes first, with the rules ccr puts in front of
@@ -4307,7 +4657,10 @@ function Resume-CcSessions {
         of the question, runs parallel rounds, stops at consensus (from round
         2), lets the master (else agent 1) write the final answer, saves the
         whole discussion under %LOCALAPPDATA%\ccr\panels and leaves the agents'
-        sessions in the picker as "panel i/n". Quote the question.
+        sessions in the picker as "MAP i/n". Each agent gets a tab (Windows
+        Terminal; tmux windows elsewhere) showing live what it reads, runs,
+        changes and writes; at the end Enter there opens its session. Quote
+        the question.
         -WhatIf prints the round-1 commands.
     .EXAMPLE
         ccr -Channel test   then   ccrtest
@@ -4341,7 +4694,7 @@ function Resume-CcSessions {
         [ValidateSet('claude', 'codex', 'all')][string]$Install = '',
         # A panel: several fresh agents discuss one question until they agree
         # (Ctrl+P in the picker); the words after it prefill the question.
-        [switch]$Panel,
+        [Alias('MAP')][switch]$Panel,
         # Multi-account: restrict the list to one configured account (label
         # from ccr.json). Also the account Ctrl+N/-n defaults to.
         [string]$Root = '',
@@ -4373,7 +4726,7 @@ function Resume-CcSessions {
         $map = @{ update = 'Update'; channel = 'Channel'; root = 'Root'; accounts = 'Accounts'; 'add-account' = 'AddAccount'
             'remove-account' = 'RemoveAccount'; 'disable-accounts' = 'DisableAccounts'; 'copy-settings' = 'CopySettings'
             'copy-statusline' = 'CopySettings'; tool = 'Tool'; top = 'Top'; new = 'New'; 'new-window' = 'NewWindow'
-            'dry-run' = 'WhatIf'; whatif = 'WhatIf'; 'usage-hours' = 'UsageHours'; usage = 'Usage'; install = 'Install'; panel = 'Panel' }
+            'dry-run' = 'WhatIf'; whatif = 'WhatIf'; 'usage-hours' = 'UsageHours'; usage = 'Usage'; install = 'Install'; panel = 'Panel'; map = 'Panel' }
         $takesValue = 'Channel', 'Root', 'AddAccount', 'RemoveAccount', 'Tool', 'Top', 'UsageHours', 'Install'
         $again = @{} + $PSBoundParameters
         $again.Remove('Filter')

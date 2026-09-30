@@ -1,19 +1,22 @@
-# A panel: several agents discuss one question until they agree
+# MAP: a multi-agent panel
 
 You ask one question; two to four **fresh** agents — any mix of Claude Code and
 Codex, each with its own model, effort and account — work on it in the folder you
 pick, read each other's answers round after round, and stop when they all agree.
 ccr runs them headless in the tab you started it from, shows every reply as it
 lands, and ends with one final answer, a saved transcript, and the agents'
-sessions in the picker, ready to be resumed.
+sessions in the picker, ready to be resumed. Each agent can also have a tab of
+its own that shows live what it reads, runs, changes and writes.
+
+MAP stands for *multi-agent panel*; the rules the agents get just call it a panel.
 
 ```powershell
-ccr -Panel "why does the nightly import skip rows?"     # quote the question
+ccr -Panel "why does the nightly import skip rows?"     # quote the question; -MAP works too
 ```
 
 Or **`Ctrl+P`** in the picker. Both start from the question, then ask for the
 folder, then for the agents; `Enter` on the agents page starts. `Ctrl+N` →
-folder → **`panel`** (`p` jumps there) works too: the question, then the agents.
+folder → **`MAP`** (`p` jumps there) works too: the question, then the agents.
 `ccr --panel` works on both platforms, and `-Panel` / `--panel` work without a
 question too.
 
@@ -31,8 +34,8 @@ without `--wait`) gets a "save, close, then press Enter here".
 first.
 
 **The panel page**, the last one, lists every agent's fields, one per line: **tool**,
-**model**, **effort**, and **account** when that tool has several accounts, then the
-**round limit** (2–8, default 4). At the bottom, the round-1 command line of the
+**model**, **effort**, and **account** when that tool has several accounts, then
+**tabs** (one tab per agent, on by default) and the **round limit** (2–8, default 4). At the bottom, the round-1 command line of the
 highlighted agent, so the permissions are always in view.
 
 | Key | Action |
@@ -43,7 +46,7 @@ highlighted agent, so the permissions are always in view.
 | `+` | add an agent: a copy of the highlighted one (at most 4) |
 | `-` | remove the highlighted agent (at least 2 stay) |
 | `M` | make the highlighted agent the **master**; again to take it back |
-| `Enter` / `Esc` | **start the panel** / back to the folder |
+| `Enter` / `Esc` | **start the MAP** / back to the folder |
 
 The first panel is codex + claude on their configured models; afterwards ccr
 remembers the last one (`ccr.json`, key `panel`). An account that is not on this
@@ -86,6 +89,36 @@ the folder. The sessions are ordinary sessions: they appear in the picker as
 **The transcript** is a Markdown file: the final answer first, then every round
 agent by agent, then the rules agent 1 received. It is saved under
 `%LOCALAPPDATA%\ccr\panels\` (Windows) or `~/.cache/ccr/panels/` (macOS, Linux).
+
+## The agents' tabs
+
+With **tabs** on (the default), the start opens one tab per agent: in Windows
+Terminal a tab of the window ccr runs in, titled `MAP 2/3 · claude opus max`;
+inside tmux a window in the background. Each tab follows its agent live:
+
+- its model, permission mode and tools, as the agent reports them;
+- every round as it runs: the files it reads, what it searches, the commands it
+  runs (and those that fail), the files it changes, its reasoning in brief, and
+  its messages;
+- the end of each round, with its `AGREE` / `CONTINUE`, and ccr's notes.
+
+The tabs only watch: ccr drives every agent, one turn at a time, on the agent's
+own session, and a CLI opened on the same session at the same time would be a
+second process writing to the same conversation. When the MAP ends, each tab
+says how, and **`Enter` there opens the agent's session** — `claude --resume` /
+`codex resume`, under its account — so from then on the tab is that agent's
+normal CLI, to go on with it. Any other key closes the tab. Windows Terminal
+moves to each tab it opens; ccr's own tab keeps the summary.
+
+Nobody can answer an agent during the MAP: the rules tell every agent to state
+its assumptions instead of asking. A question an agent writes anyway reaches the
+other agents, and you, in its tab; you answer it in that agent's session at the
+end.
+
+The tabs read the run's live record: `agent-<i>.jsonl` (each turn's start and end)
+and each turn's output, in the run's folder under the temporary folder
+(`ccr-panel-<pid>-<time>`). With tabs the folder stays after the run for them,
+and the next MAP removes the ones older than a day.
 
 ## The rules (fixed, shown before the start)
 
@@ -165,7 +198,7 @@ checking a panel works; the answers of the strong ones are the point.
 
 The Claude agents' sessions live in the Claude data dir like any other session,
 so when that dir is synced they are on every PC; the Codex ones stay in the PC's
-`~/.codex`, and the transcripts in the PC's own `panels` folder. `ccr.json`
+`~/.codex`, and the transcripts and the tabs' live records on the PC itself. `ccr.json`
 (and with it the last panel) travels with the script folder.
 
 ## macOS / Linux (`ccr.py`)
@@ -177,5 +210,6 @@ The same panel, the same rules and flags, with fzf menus instead of the pages:
 | `Ctrl+P`: question page → folder → panel page | `Ctrl-P`: the question at the prompt → the folder (fzf) → the agents (fzf); same order |
 | the panel page: fields changed with `←` `→` | an fzf list: `▶ start`, the agents, `+ add agent`, `rounds`. `Enter` on an agent opens its settings (tool, model, effort, account, master, remove) — the model and effort menus of `Ctrl-E` — and `Del` removes it. The preview shows the agent's round-1 command |
 | the question page: `Enter`, `Shift+Enter` / `Ctrl+J` for a new line, paste, `Ctrl+O` editor | one line typed at the prompt, or a multi-line paste (taken whole and shown back before it starts); an empty line — or `e` to edit a question already there — opens `$VISUAL` / `$EDITOR` / `nano` / `vi` |
+| the agents' tabs: Windows Terminal tabs (tmux windows in the background inside tmux); at the end any key but `Enter` closes | an iTerm2 tab, a Terminal.app window or a tmux window in the background; at the end `Enter` opens the session, `Ctrl-C` closes. Not on Windows, where `ccr.py` has no tab backend |
 | `Ctrl+C` read as a key; agents in hidden child processes | `Ctrl-C`, and `SIGHUP` / `SIGTERM` too, end every agent's process group (`taskkill /T` on Windows) |
 | transcript in `%LOCALAPPDATA%\ccr\panels\` | transcript in `~/.cache/ccr/panels/` |

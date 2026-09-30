@@ -7,7 +7,7 @@ as the picker and real terminal tabs (iTerm2, Terminal.app) or tmux windows
 as the launch backend. Python 3.9+, stdlib only; fzf for UI.
 
 Keys in the picker (fzf conventions): type to fuzzy-filter, Tab marks,
-Enter opens, Ctrl-E opens with a model / effort, Ctrl-N new conversation, Ctrl-P panel, Ctrl-A accounts, Ctrl-O open the
+Enter opens, Ctrl-E opens with a model / effort, Ctrl-N new conversation, Ctrl-P MAP (multi-agent panel), Ctrl-A accounts, Ctrl-O open the
 marked rows under another account, Ctrl-T installs or updates claude / codex, Del deletes, Esc cancels.
 """
 import argparse
@@ -33,7 +33,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.68"
+VERSION = "0.69"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -1304,7 +1304,7 @@ def picker_hint(ctx: Ctx, upd_note: str = "") -> str:
     keys = [("↑↓", "move"), ("Tab", "mark"), ("Enter", "open"), ("Ctrl-E", "model/effort")]
     if ctx.multi_root:
         keys.append(("Ctrl-O", "open under another account"))
-    keys += [("Ctrl-N", "new"), ("Ctrl-P", "panel"), ("Ctrl-A", "accounts"), ("Ctrl-K", "usage"), ("Ctrl-J", "details"),
+    keys += [("Ctrl-N", "new"), ("Ctrl-P", "MAP"), ("Ctrl-A", "accounts"), ("Ctrl-K", "usage"), ("Ctrl-J", "details"),
              ("Ctrl-X", "close"), ("Ctrl-T", "install"), ("Del", "delete"), ("Esc", "cancel")]
     lines += hint_wrapped(keys)
     words = f"{DIM},{RESET} ".join(f"{CYAN}{w}{RESET}" for w in ("run", "cleared", "app"))
@@ -1862,7 +1862,7 @@ def run_osascript(script: str):
     return r.returncode == 0, msg[:200]
 
 
-def open_tab(cwd: str, cmd: str, new_window: bool, dry: bool, tabs: bool = False) -> bool:
+def open_tab(cwd: str, cmd: str, new_window: bool, dry: bool, tabs: bool = False, detached: bool = False) -> bool:
     """Run cmd in a new terminal surface: a tmux window when inside tmux,
     else an iTerm2 / Terminal.app tab (or window). False = no backend.
 
@@ -1872,7 +1872,7 @@ def open_tab(cwd: str, cmd: str, new_window: bool, dry: bool, tabs: bool = False
     shell_cmd = f"cd {shlex.quote(cwd)} && {cmd}"
     tp = os.environ.get("TERM_PROGRAM", "")
     if os.environ.get("TMUX"):
-        argv = ["tmux", "new-window", "-c", cwd, cmd]
+        argv = ["tmux", "new-window"] + (["-d"] if detached else []) + ["-c", cwd, cmd]
         if dry:
             print("  " + " ".join(shlex.quote(a) for a in argv))
         else:
@@ -2236,7 +2236,9 @@ def model_choices(tool: str, root_paths: list) -> list:
             j = _json_at(Path(p) / ".claude.json")
             opts = j.get("additionalModelOptionsCache") if isinstance(j, dict) else None
             for o in ([opts] if isinstance(opts, dict) else opts if isinstance(opts, list) else []):
-                if isinstance(o, dict) and o.get("value"):
+                # a disabled entry is a notice ("Update to 2.1.280+ to use
+                # Opus 5.5"), not a model
+                if isinstance(o, dict) and o.get("value") and not o.get("disabled"):
                     note = " · ".join(x for x in (str(o.get("label") or ""), str(o.get("description") or "")) if x)
                     add(o["value"], note, CLAUDE_EFFORTS)
         if cfg["model"] and cfg["model"] != "*":
@@ -2646,8 +2648,8 @@ def new_conversation(sessions: list, initial_name: str, dry: bool, ctx: Ctx, ter
     if app_ok:
         extra.append(f"codex app\t{CYAN}codex{RESET}{DIM} app{RESET}{' ' * 2}{DIM}a new thread in the Codex "
                      f"desktop app, rooted at this folder{RESET}\tcodex app desktop")
-    extra.append(f"panel\t{MAGENTA}panel{RESET}{' ' * 6}{DIM}several agents discuss one question until they "
-                 f"agree{RESET}\tpanel agents")
+    extra.append(f"panel\t{MAGENTA}MAP{RESET}{' ' * 8}{DIM}multi-agent panel: several agents discuss one question "
+                 f"until they agree{RESET}\tMAP multi-agent panel")
     tool = choose_tool(f"step 2: tool · {fmt_cwd(folder, 46)}", "asks for a session name",
                        "a terminal tab · no start name - /rename inside", extra)
     if not tool:
@@ -2757,7 +2759,7 @@ def panel_default(ctx) -> dict:
     """The panel used last time (ccr.json "panel"), else codex + claude on
     their configured models. ccr.json syncs between PCs while account dirs
     may not: an account that is not on this PC falls back to the default."""
-    agents, rounds = [], 4
+    agents, rounds, tabs = [], 4, True
     p = (load_config() or {}).get("panel")
     if isinstance(p, dict):
         for x in p.get("agents") or []:
@@ -2773,13 +2775,15 @@ def panel_default(ctx) -> dict:
                                      effort if OPT_VALUE_RE.match(effort) else "", acct, bool(x.get("master"))))
         if _as_int(p.get("rounds")) >= 2:
             rounds = min(8, _as_int(p.get("rounds")))
+        if p.get("tabs") is not None:
+            tabs = bool(p.get("tabs"))
     if not 2 <= len(agents) <= PANEL_MAX_AGENTS:
         agents = [PanelAgent("codex"), PanelAgent("claude")]
     seen = False
     for a in agents:
         if a.master:
             a.master, seen = not seen, True
-    return {"agents": agents, "rounds": rounds}
+    return {"agents": agents, "rounds": rounds, "tabs": tabs}
 
 
 def save_panel_default(panel: dict):
@@ -2790,6 +2794,7 @@ def save_panel_default(panel: dict):
         val = {"rounds": int(panel["rounds"]),
                "agents": [{"tool": a.tool, "model": a.model, "effort": a.effort, "account": a.account,
                            "master": a.master} for a in panel["agents"]]}
+        val["tabs"] = bool(panel.get("tabs", True))
         if _as_int(old.get("turnTimeoutMinutes")) > 0:
             val["turnTimeoutMinutes"] = _as_int(old.get("turnTimeoutMinutes"))
         cfg["panel"] = val
@@ -3201,6 +3206,7 @@ class PanelRun:
         self.folder, self.agents, self.timeout = folder, agents, timeout
         self.tmp = tempfile.mkdtemp(prefix=f"ccr-panel-{os.getpid()}-")
         self.stopped, self.round, self.status, self.log, self.running = False, 0, "", [], []
+        self.tabs = False
 
 
 def run_panel_batch(batch: list, prompts: dict, title: str, pc: PanelRun):
@@ -3219,10 +3225,12 @@ def run_panel_batch(batch: list, prompts: dict, title: str, pc: PanelRun):
         except OSError as e:
             a.active = False
             print_panel_message(a, title, {"ok": False, "error": f"cannot start {a.exe}: {e}"})
+            panel_event(pc, a.index, {"ev": "done", "title": title, "ok": False, "error": f"cannot start {a.exe}: {e}"})
             continue
         turns.append(t)
         pc.running.append(t)
         a.starts += 1
+        panel_event(pc, a.index, {"ev": "turn", "turn": a.starts, "title": title, "out": os.path.basename(str(t["out"]))})
     pending = list(turns)
     while pending:
         for t in list(pending):
@@ -3283,6 +3291,9 @@ def run_panel_batch(batch: list, prompts: dict, title: str, pc: PanelRun):
             if note:
                 sys.stdout.write(f"{YELLOW}ccr: agent {a.index}: {note}.{RESET}\n\n")
                 sys.stdout.flush()
+            panel_event(pc, a.index, {"ev": "done", "title": title, "ok": bool(res["ok"]), "error": res["error"], "note": note,
+                                      "consensus": panel_consensus(res["text"]) if res["ok"] and title.startswith("round") else "",
+                                      "session": a.session_id if a.tool == "claude" else a.thread_id})
         if not pending:
             break
         parts = []
@@ -3300,7 +3311,7 @@ def run_panel_batch(batch: list, prompts: dict, title: str, pc: PanelRun):
 def panel_transcript(agents: list, question: str, folder: str, log: list, outcome: str, started) -> str:
     """The whole discussion as markdown: final answer first, then the rounds,
     then the rules agent 1 received."""
-    out = [f"# ccr panel · {panel_short(question, 80)}\n\n",
+    out = [f"# ccr MAP · {panel_short(question, 80)}\n\n",
            f"- date: {started:%Y-%m-%d %H:%M}\n- folder: {folder}\n- outcome: {outcome}\n"]
     for a in agents:
         sid = a.session_id if a.tool == "claude" else a.thread_id
@@ -3370,7 +3381,7 @@ def run_panel(panel: dict, question: str, folder: str, ctx, dry: bool) -> bool:
         if child_path:
             a.env = dict(a.env or os.environ, PATH=child_path)
         a.session_id = str(uuid.uuid4()) if a.tool == "claude" else ""
-        a.name = f"panel {'★' if a.master else ''}{i}/{n} · {short}"
+        a.name = f"MAP {'★' if a.master else ''}{i}/{n} · {short}"
         a.master_mode = panel_master_mode(root.path) if a.tool == "claude" and a.master else "acceptEdits"
     for t in dict.fromkeys(a.tool for a in agents if not a.exe):
         print(f"ccr: {t} is not installed on this PC. Fix: ccr --install {t}   (or Ctrl-T in the picker)",
@@ -3384,7 +3395,7 @@ def run_panel(panel: dict, question: str, folder: str, ctx, dry: bool) -> bool:
     master = next((a for a in agents if a.master), None)
 
     if dry:
-        print(f"dry-run: a panel of {n} agents in {folder} would start like this "
+        print(f"dry-run: a MAP of {n} agents in {folder} would start like this "
               "(the rules and the question go on stdin):")
         for a in agents:
             pre = f"{ROOT_VAR[a.tool]}={shlex.quote(a.root.path)} " if a.multi else ""
@@ -3392,6 +3403,9 @@ def run_panel(panel: dict, question: str, folder: str, ctx, dry: bool) -> bool:
             print(f"  agent {a.index}{' (master)' if a.master else ''}: {pre}{_cmdline([a.exe] + argv)}")
         if any(a.tool == "codex" for a in agents) and codex_child_path():
             print("  codex agents: PATH without its WindowsApps entries (codex's sandbox cannot start the Store PowerShell)")
+        tab_ok = bool(os.environ.get("TMUX") or os.environ.get("TERM_PROGRAM") in ("iTerm.app", "Apple_Terminal"))
+        print("  tabs: " + ("off" if panel.get("tabs") is False else "one terminal tab per agent, live" if tab_ok
+                           else "not available here (iTerm2, Terminal or tmux only)"))
         return True
 
     git = shutil.which("git")
@@ -3408,6 +3422,29 @@ def run_panel(panel: dict, question: str, folder: str, ctx, dry: bool) -> bool:
 
     timeout = _as_int(((load_config() or {}).get("panel") or {}).get("turnTimeoutMinutes")) or 20
     pc = PanelRun(folder, agents, timeout)
+    # The live records of earlier runs stay for their tabs; a day later they go.
+    for old in Path(tempfile.gettempdir()).glob("ccr-panel-*"):
+        try:
+            if old.is_dir() and time.time() - old.stat().st_mtime > 86400:
+                shutil.rmtree(old, ignore_errors=True)
+        except OSError:
+            pass
+    # One tab per agent: its header goes into the live record first, then the
+    # tabs open and follow the record.
+    tabs_note = ""
+    if panel.get("tabs") is not False:
+        pc.tabs = True
+        for a in agents:
+            panel_event(pc, a.index, {"ev": "agent", "index": a.index, "n": n, "tool": a.tool,
+                                      "label": panel_agent_label(a),
+                                      "role": "master, can change files" if a.master else "reviewer, read-only",
+                                      "folder": folder, "question": panel_short(question, 120), "pid": os.getpid(),
+                                      "session": a.session_id})
+        if open_panel_tabs(agents, pc.tmp, folder):
+            tabs_note = "tabs: one per agent, live - Enter there at the end opens its session"
+        else:
+            pc.tabs = False
+            tabs_note = "tabs: not available here (iTerm2, Terminal or tmux only)"
     try:
         sys.stdout.reconfigure(errors="replace")   # a reply in any script prints on any console
     except (AttributeError, ValueError):
@@ -3429,11 +3466,13 @@ def run_panel(panel: dict, question: str, folder: str, ctx, dry: bool) -> bool:
     agreed = False
     started = datetime.now()
     try:
-        sys.stdout.write(f"\033[?25l\n{BOLD}ccr panel{RESET}{' with a master' if master else ''} · {folder}\n")
+        sys.stdout.write(f"\033[?25l\n{BOLD}ccr MAP{RESET}{' with a master' if master else ''} · {folder}\n")
         for a in agents:
             role = f"{YELLOW}★ master, can change files{RESET}" if a.master else f"{DIM}reviewer, read-only{RESET}"
             acct = f"  {MAGENTA}{acct_label(a.root.label, a.root.default)}{RESET}" if a.multi else ""
             sys.stdout.write(f"  {TOOL_COLOR[a.tool]}agent {a.index}{RESET}  {panel_agent_label(a)}{acct}  {role}\n")
+        if tabs_note:
+            sys.stdout.write(f"{DIM}{tabs_note}{RESET}\n")
         sys.stdout.write(f"{DIM}question: {panel_short(question, 120)}{RESET}\n\n")
         sys.stdout.flush()
         max_rounds = max(2, int(panel["rounds"]))
@@ -3494,6 +3533,16 @@ def run_panel(panel: dict, question: str, folder: str, ctx, dry: bool) -> bool:
                 stop_agent_turn(t)
         finally:
             signal.signal(signal.SIGINT, prev_int)
+        # the tabs' last word: the outcome, and how to open each session there
+        end_txt = ("stopped with Ctrl-C" if pc.stopped else f"consensus in round {pc.round}" if agreed
+                   else f"no consensus after {pc.round} round(s)")
+        for a in agents:
+            sid = (a.session_id if a.turns else "") if a.tool == "claude" else a.thread_id
+            panel_event(pc, a.index, {"ev": "end", "outcome": end_txt, "session": sid, "exe": a.exe,
+                                      "resume": ["--resume", sid] if a.tool == "claude" else ["resume", sid],
+                                      "var": ROOT_VAR[a.tool], "root": a.root.path if a.root else "",
+                                      "path": (a.env or {}).get("PATH", "") if a.tool == "codex" and codex_child_path() else "",
+                                      "folder": folder})
         for sig, h in old_handlers.items():
             try:
                 signal.signal(sig, h)
@@ -3505,7 +3554,8 @@ def run_panel(panel: dict, question: str, folder: str, ctx, dry: bool) -> bool:
             sys.stdout.flush()
         except OSError:
             pass
-        shutil.rmtree(pc.tmp, ignore_errors=True)
+        if not pc.tabs:
+            shutil.rmtree(pc.tmp, ignore_errors=True)
 
     mins = round((datetime.now() - started).total_seconds() / 60)
     outcome = ("stopped with Ctrl-C" if pc.stopped else f"consensus in round {pc.round}" if agreed
@@ -3517,10 +3567,12 @@ def run_panel(panel: dict, question: str, folder: str, ctx, dry: bool) -> bool:
         except OSError as e:
             print(f"ccr: transcript not saved: {e}", file=sys.stderr)
     print()
-    print(f"{GREEN if agreed else YELLOW}ccr: panel finished - {outcome}, {mins} min.{RESET}")
+    print(f"{GREEN if agreed else YELLOW}ccr: MAP finished - {outcome}, {mins} min.{RESET}")
     if saved:
         print(f"  transcript: {saved}")
-    print('  sessions, in the picker as "panel i/n" - resume one to go on:')
+    if pc.tabs:
+        print("  tabs: Enter in an agent's tab opens its session there")
+    print('  sessions, in the picker as "MAP i/n" - resume one to go on:')
     for a in agents:
         sid = a.session_id if a.tool == "claude" else a.thread_id
         note = "not started" if not a.starts else "stopped before its first reply" if not a.turns else (
@@ -3540,6 +3592,276 @@ def run_panel(panel: dict, question: str, folder: str, ctx, dry: bool) -> bool:
     return True
 
 
+# ----------------------------------------------------------------------------
+# MAP tabs: one terminal tab per agent shows live what it does
+# (tmux windows, iTerm2 tabs, Terminal.app windows)
+# ----------------------------------------------------------------------------
+def panel_event(pc, index: int, ev: dict):
+    """One line of an agent's live record, agent-<i>.jsonl in the run's
+    folder: its header, the start and end of each turn, the end of the MAP.
+    The agent's tab follows it. Nothing is written when the run has no tabs."""
+    if not pc.tabs:
+        return
+    try:
+        with open(os.path.join(pc.tmp, f"agent-{index}.jsonl"), "ab") as f:
+            f.write((json.dumps(ev, ensure_ascii=False) + "\n").encode("utf-8"))
+    except OSError:
+        pass
+
+
+def read_new_lines(path: str, cur: dict) -> list:
+    """The complete lines appended to a file since the last call; cur keeps
+    the byte offset and a partial last line. Another process may be writing."""
+    cur.setdefault("off", 0)
+    cur.setdefault("rest", b"")
+    try:
+        with open(path, "rb") as f:
+            f.seek(cur["off"])
+            data = f.read()
+    except OSError:
+        return []
+    cur["off"] += len(data)
+    buf = cur["rest"] + data
+    last = buf.rfind(b"\n")
+    if last < 0:
+        cur["rest"] = buf
+        return []
+    cur["rest"] = buf[last + 1:]
+    return [l for l in re.split(r"\r?\n", buf[:last + 1].decode("utf-8", errors="replace")) if l]
+
+
+def one_line(text, max_: int = 160) -> str:
+    """The first non-empty line of a text, cut to max_ characters."""
+    l = next((x for x in re.split(r"\r?\n", str(text or "")) if x.strip()), "").strip()
+    if len(l) > max_:
+        l = l[: max_ - 1] + "…"
+    return l
+
+
+def shell_inner(command: str) -> str:
+    """The command inside a shell wrapper (codex runs `pwsh -Command '...'`,
+    `bash -lc '...'`), else the command as it is."""
+    m = re.search(r"\s-(?:Command|c|lc)\s+'(.*)'\s*$", command or "", re.S)
+    if m:
+        return m.group(1).replace("''", "'")
+    m = re.search(r'\s-(?:Command|c|lc)\s+"(.*)"\s*$', command or "", re.S)
+    if m:
+        return m.group(1)
+    return command or ""
+
+
+def tool_use_text(name: str, inp) -> str:
+    """A claude tool call in one line: the tool and what it works on."""
+    i = inp if isinstance(inp, dict) else {}
+
+    def s(k):
+        v = i.get(k)
+        return "" if v is None else str(v)
+    if name in ("Read", "Write", "Edit", "MultiEdit"):
+        arg = s("file_path")
+    elif name == "NotebookEdit":
+        arg = s("notebook_path")
+    elif name in ("Grep", "Glob"):
+        arg = (f'"{s("pattern")}"' if name == "Grep" else s("pattern")) + (f" in {s('path')}" if i.get("path") else "")
+    elif name in ("Bash", "PowerShell"):
+        arg = s("command")
+    elif name == "WebFetch":
+        arg = s("url")
+    elif name == "WebSearch":
+        arg = s("query")
+    else:
+        arg = next((v for v in i.values() if isinstance(v, str) and v), "")
+    return f"{name}  {one_line(arg, 120)}".rstrip()
+
+
+def format_panel_event(tool: str, line: str, state: dict = None) -> list:
+    """One line of an agent's output as its tab shows it: (style, text)
+    pairs, style = text (what the agent writes), tool (what it reads, runs,
+    changes), dim (model, reasoning) or err. state remembers the codex
+    commands shown when they started. Pure: the tests feed it recorded lines."""
+    state = {} if state is None else state
+    out = []
+
+    def emit(st, tx):
+        t = agent_text(str(tx if tx is not None else "")).rstrip()
+        if t:
+            out.append((st, t))
+    try:
+        e = json.loads(line)
+    except ValueError:
+        return out
+    if not isinstance(e, dict):
+        return out
+    if tool == "claude":
+        t = str(e.get("type") or "")
+        if t == "system" and e.get("subtype") == "init":
+            tools = [x for x in (e.get("tools") or []) if x] if isinstance(e.get("tools"), list) else []
+            tt = ", ".join(str(x) for x in tools) if len(tools) <= 6 else f"{len(tools)} tools"
+            emit("dim", f"model {e.get('model') or ''} · {e.get('permissionMode') or ''} · {tt}")
+        elif t in ("assistant", "user"):
+            msg = e.get("message") if isinstance(e.get("message"), dict) else {}
+            content = msg.get("content") if isinstance(msg.get("content"), list) else []
+            for c in content:
+                if not isinstance(c, dict):
+                    continue
+                ct = c.get("type")
+                if t == "assistant" and ct == "text":
+                    emit("text", c.get("text"))
+                elif t == "assistant" and ct == "tool_use":
+                    emit("tool", f"▸ {tool_use_text(str(c.get('name') or ''), c.get('input'))}")
+                elif t == "assistant" and ct == "thinking":
+                    if str(c.get("thinking") or "").strip():
+                        emit("dim", f"… {one_line(c.get('thinking'), 160)}")
+                elif t == "user" and ct == "tool_result" and c.get("is_error"):
+                    cc = c.get("content")
+                    txt = cc if isinstance(cc, str) else "\n".join(str(x.get("text") or "") for x in (cc or [])
+                                                                if isinstance(x, dict))
+                    emit("err", f"  ✗ {one_line(txt, 160)}")
+        return out
+    t = str(e.get("type") or "")
+    it = e.get("item") if isinstance(e.get("item"), dict) else {}
+    iid = str(it.get("id") or "")
+    if t == "item.started" and it.get("type") == "command_execution":
+        if iid:
+            state[iid] = True
+        emit("tool", f"▸ $ {one_line(shell_inner(str(it.get('command') or '')), 140)}")
+    elif t == "item.completed":
+        k = it.get("type")
+        if k == "command_execution":
+            if not (iid and iid in state):
+                emit("tool", f"▸ $ {one_line(shell_inner(str(it.get('command') or '')), 140)}")
+            code = "" if it.get("exit_code") is None else str(it.get("exit_code"))
+            if (code not in ("", "0")) or it.get("status") == "failed":
+                emit("err", f"  ✗ exit {code or '?'}: {one_line(it.get('aggregated_output'), 150)}")
+        elif k == "reasoning":
+            if str(it.get("text") or "").strip():
+                emit("dim", f"… {one_line(it.get('text'), 160)}")
+        elif k == "agent_message":
+            emit("text", it.get("text"))
+        elif k == "file_change":
+            paths = [str(c.get("path")) for c in (it.get("changes") or []) if isinstance(c, dict) and c.get("path")]
+            if paths:
+                emit("tool", "✎ " + ", ".join(paths[:3]) + (f" +{len(paths) - 3}" if len(paths) > 3 else ""))
+        elif k == "mcp_tool_call":
+            emit("tool", f"▸ {it.get('server') or ''}.{it.get('tool') or ''}")
+        elif k == "web_search":
+            emit("tool", f"▸ web search: {one_line(it.get('query'), 120)}")
+        elif k == "error":
+            emit("err", f"✗ {one_line(it.get('message'), 160)}")
+    elif t == "turn.failed":
+        err = e.get("error") if isinstance(e.get("error"), dict) else {}
+        emit("err", f"✗ {one_line(err.get('message') or 'turn failed', 160)}")
+    elif t == "error":
+        emit("err", f"✗ {one_line(e.get('message') or 'error', 160)}")
+    return out
+
+
+def panel_tab_title(a, n: int) -> str:
+    return f"MAP {'★' if a.master else ''}{a.index}/{n} · {panel_agent_label(a)}".replace(";", "")
+
+
+def open_panel_tabs(agents: list, tmp: str, folder: str) -> bool:
+    """One terminal surface per agent (a background tmux window, an iTerm2
+    tab, a Terminal.app window), each running this script's viewer of that
+    agent. False = no backend here (open_tab's rule)."""
+    me = self_path()
+    for a in agents:
+        cmd = (f"{shlex.quote(sys.executable)} {shlex.quote(me)} --panel-watch {shlex.quote(tmp)} "
+               f"--panel-agent {a.index}")
+        if not open_tab(folder, cmd, False, False, detached=True):
+            return False
+    return True
+
+
+def watch_panel_agent(d: str, index: int):
+    """An agent's tab: what the agent does, live - its reads, searches,
+    commands and changes, its messages, turn after turn - from the run's live
+    record. At the end Enter opens the agent's own session in this tab
+    (claude --resume / codex resume, under its account)."""
+    colors = {"text": "", "tool": CYAN, "dim": DIM, "err": RED}
+    manifest = os.path.join(d, f"agent-{index}.jsonl")
+    mcur, turn, state = {}, None, {}
+    hdr, end, sid, tool, tc = None, None, "", "", ""
+    quiet = 0
+
+    def show(items):
+        for st, tx in items:
+            c = colors.get(st, "")
+            print(f"{c}{tx}{RESET if c else ''}")
+
+    def flush(tr):
+        if tr:
+            for l in read_new_lines(tr["path"], tr):
+                show(format_panel_event(tool, l, state))
+    while end is None:
+        news = 0
+        for l in read_new_lines(manifest, mcur):
+            news += 1
+            try:
+                e = json.loads(l)
+            except ValueError:
+                continue
+            ev = e.get("ev")
+            if ev == "agent":
+                hdr, tool, sid = e, str(e.get("tool") or ""), str(e.get("session") or "")
+                tc = TOOL_COLOR.get(tool, "")
+                sys.stdout.write(f"\033]0;MAP {e.get('index')}/{e.get('n')} · {e.get('label')}\007")
+                print(f"{tc}{BOLD}agent {e.get('index')}/{e.get('n')} · {e.get('label')} · {e.get('role')}{RESET}")
+                print(f"{DIM}folder: {e.get('folder')}\nquestion: {e.get('question')}{RESET}")
+            elif ev == "turn":
+                flush(turn)
+                turn = {"path": os.path.join(d, str(e.get("out") or ""))}
+                print(f"\n{tc}── {e.get('title')} ──{RESET}")
+            elif ev == "done":
+                flush(turn)
+                turn = None
+                if e.get("session"):
+                    sid = str(e["session"])
+                if e.get("ok"):
+                    cons = str(e.get("consensus") or "")
+                    c = GREEN if cons == "AGREE" else YELLOW if cons == "CONTINUE" else DIM
+                    print(f"{c}✓ {e.get('title')}{f' · {cons}' if cons else ''}{RESET}")
+                else:
+                    print(f"{RED}✗ {e.get('title')} failed: {agent_text(str(e.get('error') or ''))}{RESET}")
+                if e.get("note"):
+                    print(f"{YELLOW}ccr: {e['note']}.{RESET}")
+            elif ev == "end":
+                flush(turn)
+                turn = None
+                end = e
+        if end is not None:
+            break
+        if turn:
+            lines = read_new_lines(turn["path"], turn)
+            news += len(lines)
+            for l in lines:
+                show(format_panel_event(tool, l, state))
+        quiet = 0 if news else quiet + 1
+        if hdr and quiet > 25 and not pid_alive(_as_int(hdr.get("pid"))):
+            end = {"outcome": "ccr is no longer running"}
+            break
+        time.sleep(0.2)
+    print(f"\n{BOLD}── MAP finished: {end.get('outcome') or 'done'} ──{RESET}")
+    sid = str(end.get("session") or sid)
+    if sid and end.get("exe"):
+        resume = [str(x) for x in (end.get("resume") or [])]
+        if ask(f"Enter: open this agent's session here ({tool} {' '.join(resume)}) · Ctrl-C: close ") is None:
+            return
+        env = dict(os.environ)
+        if end.get("var") and end.get("root"):
+            env[str(end["var"])] = str(end["root"])
+        if end.get("path"):
+            env["PATH"] = str(end["path"])
+        if end.get("folder") and os.path.isdir(str(end["folder"])):
+            os.chdir(str(end["folder"]))
+        try:
+            os.execvpe(str(end["exe"]), [str(end["exe"])] + resume, env)
+        except OSError as ex:
+            print(f"ccr: cannot start {end['exe']}: {ex}", file=sys.stderr)
+    else:
+        ask("no session to open · Enter: close ")
+
+
 # The panel page (Ctrl-N -> panel) as fzf menus: the PowerShell page's
 # fields, one menu per step (fzf has no editable fields).
 def panel_page(folder: str, ctx, initial: dict = None, question: str = ""):
@@ -3552,6 +3874,7 @@ def panel_page(folder: str, ctx, initial: dict = None, question: str = ""):
     state = initial or panel_default(ctx)
     agents = [a.copy() for a in state["agents"]]
     rounds = min(8, max(2, int(state["rounds"])))
+    tabs = bool(state.get("tabs", True))
     cache = {}
 
     def info(a):
@@ -3583,14 +3906,19 @@ def panel_page(folder: str, ctx, initial: dict = None, question: str = ""):
         if n < PANEL_MAX_AGENTS:
             rows.append(f"add\t{GREEN}+ add agent{RESET}  {DIM}a copy of agent {n}, as a reviewer{RESET}"
                         f"\tanother agent: a copy of the last one - then Enter on it to change it")
+        tab_ok = bool(os.environ.get("TMUX") or os.environ.get("TERM_PROGRAM") in ("iTerm.app", "Apple_Terminal"))
+        rows.append(f"tabs\t  {'tabs':<15}{'yes' if tabs else 'no':<22}{DIM}"
+                    + ("one tab per agent shows live what it does; at the end Enter there opens its session" if tab_ok
+                       else "one tab per agent - iTerm2, Terminal or tmux only, not available here")
+                    + f"{RESET}\tEnter: on / off")
         rows.append(f"rounds\t  {'rounds':<15}{rounds:<22}{DIM}how many rounds before ccr asks whether to go on "
                     f"(2-8){RESET}\tEnter: choose 2-8")
         has_master = any(a.master for a in agents)
-        title = (f"{BOLD}Panel{RESET}  {DIM}{fmt_cwd(folder, 50)} · {n} agents · parallel rounds"
+        title = (f"{BOLD}MAP{RESET}  {DIM}{fmt_cwd(folder, 50)} · {n} agents · parallel rounds"
                  f"{', the master first from round 2' if has_master else ''}{RESET}"
                  + (f"\n{DIM}question: {panel_short(question, 90)}{RESET}" if question else ""))
         res = run_fzf(rows, title + "\n" + hint(("Enter", "start / change"), ("Del", "remove agent"), ("Esc", "back"),
-                                               tail="panel · last step: agents"),
+                                               tail="MAP · last step: agents"),
                       multi=False, expect=["del"], prompt="panel> ")
         if res is None:
             return None
@@ -3603,7 +3931,10 @@ def panel_page(folder: str, ctx, initial: dict = None, question: str = ""):
                 del agents[int(sel[1:])]
             continue
         if sel == "start":
-            return {"agents": agents, "rounds": rounds}
+            return {"agents": agents, "rounds": rounds, "tabs": tabs}
+        if sel == "tabs":
+            tabs = not tabs
+            continue
         if sel == "add":
             if n < PANEL_MAX_AGENTS:
                 c = agents[-1].copy()
@@ -3689,7 +4020,7 @@ def new_panel(sessions: list, question: str, dry: bool, ctx) -> bool:
                 return False
             step = "folder"
         elif step == "folder":
-            folder = choose_folder(sessions, "", dry, "panel · step 2: the folder the agents work in", "panel in> ")
+            folder = choose_folder(sessions, "", dry, "MAP · step 2: the folder the agents work in", "MAP in> ")
             step = "agents" if folder else "question"
         else:
             if not dry and not Path(folder).is_dir():
@@ -3785,7 +4116,7 @@ def read_panel_question(panel: dict, folder: str, seed: str = ""):
     preview = [a.copy() for a in panel["agents"]]
     for i, a in enumerate(preview, 1):
         a.index = i
-    print(f"\n{BOLD}Panel · your question{RESET}  {DIM}ccr puts these rules in front of it (agent 1's copy){RESET}\n")
+    print(f"\n{BOLD}MAP · your question{RESET}  {DIM}ccr puts these rules in front of it (agent 1's copy){RESET}\n")
     for l in panel_protocol(1, preview, folder, "<your question>").rstrip().split("\n"):
         print(f"{DIM}  {l}{RESET}")
     print()
@@ -4014,7 +4345,7 @@ PS_FLAGS = {"update": "--update", "channel": "--channel", "root": "--root", "acc
             "copysettings": "--copy-settings", "copystatusline": "--copy-settings", "tool": "--tool", "top": "--top",
             "new": "--new", "newwindow": "--new-window", "whatif": "--dry-run", "dryrun": "--dry-run",
             "usagehours": "--usage-hours", "usage": "--usage", "tabs": "--tabs", "terminal": "--terminal", "version": "--version",
-            "install": "--install", "panel": "--panel",
+            "install": "--install", "panel": "--panel", "map": "--panel",
             "filter": None}
 
 
@@ -4043,11 +4374,13 @@ def main():
     ap.add_argument("--top", type=int, default=200, help="most recent sessions to list (0 = all)")
     ap.add_argument("-n", "--new", action="store_true",
                     help="start a new conversation (folder menu); trailing text prefills the name box")
-    ap.add_argument("--panel", action="store_true",
+    ap.add_argument("--panel", "--map", action="store_true",
                     help="a panel: 2-4 fresh agents (claude and/or codex, each with its model, effort and account) "
                          "discuss one question in a folder until they agree (Ctrl-P in the picker): the question, "
                          "then the folder, then the agents; the trailing words prefill the question - quote it. "
                          "--dry-run prints the round-1 commands")
+    ap.add_argument("--panel-watch", default="", help=argparse.SUPPRESS)   # a MAP agent's tab (the viewer)
+    ap.add_argument("--panel-agent", type=int, default=0, help=argparse.SUPPRESS)
     ap.add_argument("--new-window", action="store_true", help="open selections in new windows, keep this tab")
     ap.add_argument("--tabs", action="store_true",
                     help="Terminal.app: open the extra sessions as tabs instead of windows. Terminal has no "
@@ -4088,6 +4421,9 @@ def main():
                      help="install/refresh the side-by-side copy of that channel (test = ccrtest next to ccr)")
     ap.add_argument("--version", action="version", version="ccr " + VERSION + " (python)")
     a = ap.parse_args(normalize_argv(sys.argv[1:]))
+    if a.panel_watch:
+        watch_panel_agent(a.panel_watch, a.panel_agent)
+        return
     query = " ".join(a.query).strip()
     # Token-usage defaults from ccr.json: "usageColumn": true starts the
     # picker with the column on, "usageHours": N sets the window. The
