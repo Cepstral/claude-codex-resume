@@ -52,6 +52,17 @@ record it in the parity table in `docs/multi-account.md`. Known cases so far:
   account's. Claude's installer makes the channel it installs the auto-update
   channel, and settings.json is synced across PCs here, so ccr passes
   `stable` when settings.json has chosen it.
+- Panel (Ctrl+N -> panel, -Panel; docs/panel.md): the same rules text, rounds
+  and consensus for both tools, but each tool's own way to be read-only:
+  claude `--restricted --tools Read,Grep,Glob --strict-mcp-config
+  --permission-mode dontAsk --permission-prompts none`; codex `exec -s
+  read-only --disable plugins --disable apps --ignore-rules`. Masters: claude
+  `--permission-mode auto|acceptEdits`, codex `-s workspace-write`. Claude's
+  `--restricted` skips the folder's CLAUDE.md, codex loads AGENTS.md, so the
+  rules ask every agent to read both. Session ids: claude takes the uuid ccr
+  chooses; codex's comes from `thread.started`, and its name goes to
+  session_index.jsonl. Codex's shell on Windows needs a PATH without
+  WindowsApps; claude has no counterpart (not a restricted-token sandbox).
 
 ## PowerShell ↔ Python parity (hard rule)
 
@@ -75,7 +86,11 @@ marked rows); `+`/`X` on the account page ↔ rows picked with Enter;
 `S` ↔ `Ctrl-S`; the Shift+Enter model/effort page ↔ `Ctrl-E` with fzf
 menus in sequence (model, then effort, per tool) — fzf has no shift-enter,
 and alt-enter is Windows Terminal's fullscreen key, so the PowerShell picker
-takes Ctrl+E as well. In ccr.py a row cannot change account and get a model
+takes Ctrl+E as well. The panel page (fields changed with arrows, `+` `-`
+`M`) ↔ an fzf list with `▶ start` / agents / `+ add agent` / `rounds` rows,
+Enter on an agent opening its settings; the question page (Shift+Enter or
+Ctrl+J new line, Ctrl+O editor) ↔ one line, a multi-line paste, or `e` / an
+empty line for $EDITOR. In ccr.py a row cannot change account and get a model
 in one step (Ctrl-O and Ctrl-E each launch); on Windows Space + Shift+Enter
 combine. The mapping table lives in `docs/multi-account.md`.
 The install page is Ctrl+I on Windows as asked, plus Ctrl+T on both sides:
@@ -131,4 +146,32 @@ pane, which shows the full title and folder of the highlighted row.
   is the usual case: ccr.json syncs, the codex dirs do not (2026-09-29).
 - Account dirs are created next to the tool's default dir (never a fixed
   `~\.claude-<label>`), and reused without a new login when they already hold one.
+- Headless agents (the panel), verified with claude 2.1.285 and codex
+  0.159.0 on 2026-09-30:
+  - `claude -p` keeps nothing between turns but the conversation: pass the
+    model, effort and permission mode on every turn. `--restricted` ignores
+    settings.json (so the model and effort go on the command line even for
+    *no override*) and does not load the project's CLAUDE.md. `plan` mode is
+    not read-only. A model without auto mode (haiku) given `--permission-mode
+    auto` silently runs in `default`: only the stream-json init event
+    (`--output-format stream-json --verbose`) says so, together with the
+    tools the agent got. `--no-session-persistence` keeps a probe out of the
+    picker.
+  - `codex exec`: `-s`, `--disable`, `--ignore-rules` go before `resume`;
+    resume only by uuid; never pass `--thread-source` (ccr lists
+    `thread_source: user`). The sandbox covers commands, not plugins or apps
+    (connectors): a read-only agent gets `--disable plugins --disable apps`.
+    `--ephemeral` keeps a probe out of the picker.
+  - codex's Windows sandbox (`[windows] sandbox = "unelevated"`, a restricted
+    token) cannot start programs under WindowsApps: from a Store `pwsh`,
+    whose folder is on PATH, every command failed with `CreateProcessAsUserW
+    failed: 5` - reads too. The panel drops those PATH entries for codex
+    agents; codex then finds PowerShell 7 under Program Files even off PATH.
+  - `Start-Process`: `$null = $p.Handle` right after the start, or `ExitCode`
+    stays empty; it does not quote `-ArgumentList`, so every argument goes
+    through ConvertTo-CcrWinArg (MSVCRT rules). Prompts go on stdin as
+    UTF-8 without BOM; `Kill($true)` ends the whole tree.
+  - `$null | ForEach-Object { }` runs the block once: filter with
+    `Where-Object { $_ }` before turning a list that may be absent into
+    strings.
 - No absolute machine paths, no personal data in the repo or docs.
