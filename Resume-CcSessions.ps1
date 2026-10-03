@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.71'
+$script:CcrVersion = '0.72'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -991,7 +991,7 @@ function Get-CcrCodexSession {
 # the rate-limit meter it saw. Full streaming reads, so only on demand.
 function New-CcrUsage {
     [pscustomobject]@{ Turns = 0; Input = 0; CacheWrite = 0; CacheRead = 0; Output = 0; Thinking = 0; Total = 0
-        Models = @{}; Buckets = @{}; Limit5h = $null; Limit7d = $null; Reset5h = $null }
+        Models = @{}; Buckets = @{}; Limit5h = $null; Limit7d = $null; Reset5h = $null; Reset7d = $null }
 }
 
 function Add-CcrUsageTurn([object]$u, [datetime]$ts, [string]$model, [long]$in, [long]$cw, [long]$cr, [long]$out, [long]$think) {
@@ -1066,10 +1066,15 @@ function Read-CcrCodexUsage([string]$Path, [datetime]$SinceUtc, [object]$u) {
             }
             # codex counts cached input inside input_tokens; split it out.
             Add-CcrUsageTurn $u $ts $model ($n['input_tokens'] - $n['cached_input_tokens']) $n['cache_write_input_tokens'] $n['cached_input_tokens'] $n['output_tokens'] $n['reasoning_output_tokens']
-            $mP = [regex]::Match($line, '"primary":\{"used_percent":([0-9.]+),"window_minutes":\d+,"resets_at":(\d+)')
-            if ($mP.Success) { $u.Limit5h = [double]::Parse($mP.Groups[1].Value, [cultureinfo]::InvariantCulture); $u.Reset5h = [long]$mP.Groups[2].Value }
-            $mS = [regex]::Match($line, '"secondary":\{"used_percent":([0-9.]+)')
-            if ($mS.Success) { $u.Limit7d = [double]::Parse($mS.Groups[1].Value, [cultureinfo]::InvariantCulture) }
+            # The meter: each window by its length, not its slot - on a plan
+            # without the 5-hour window (prolite) the week is "primary".
+            foreach ($slot in 'primary', 'secondary') {
+                $mw = [regex]::Match($line, '"' + $slot + '":\{"used_percent":([0-9.]+),"window_minutes":(\d+),"resets_at":(\d+)')
+                if (-not $mw.Success) { continue }
+                $pw = [double]::Parse($mw.Groups[1].Value, [cultureinfo]::InvariantCulture)
+                if ([long]$mw.Groups[2].Value -le 360) { $u.Limit5h = $pw; $u.Reset5h = [long]$mw.Groups[3].Value }
+                else { $u.Limit7d = $pw; $u.Reset7d = [long]$mw.Groups[3].Value }
+            }
         }
         $sr.Dispose()
     }
@@ -1153,9 +1158,15 @@ function Show-CcrUsagePage {
         }
         $lines.Add('')
         if ($Session.Tool -eq 'codex') {
-            if ($null -ne $Usage.Limit5h) {
-                $reset = if ($Usage.Reset5h) { " (resets $([DateTimeOffset]::FromUnixTimeSeconds($Usage.Reset5h).ToLocalTime().ToString('HH:mm')))" } else { '' }
-                $lines.Add("  rate limit seen at the last turn: 5 h $($Usage.Limit5h.ToString('0', $ic))%$reset $dot 7 d $(if ($null -ne $Usage.Limit7d) { $Usage.Limit7d.ToString('0', $ic) + '%' } else { '?' })")
+            if ($null -ne $Usage.Limit5h -or $null -ne $Usage.Limit7d) {
+                $parts = @()
+                if ($null -ne $Usage.Limit5h) {
+                    $parts += "5 h $($Usage.Limit5h.ToString('0', $ic))%$(if ($Usage.Reset5h) { " (resets $([DateTimeOffset]::FromUnixTimeSeconds($Usage.Reset5h).LocalDateTime.ToString('HH:mm', $ic)))" })"
+                }
+                if ($null -ne $Usage.Limit7d) {
+                    $parts += "7 d $($Usage.Limit7d.ToString('0', $ic))%$(if ($Usage.Reset7d) { " (resets $([DateTimeOffset]::FromUnixTimeSeconds($Usage.Reset7d).LocalDateTime.ToString('ddd d HH:mm', $ic)))" })"
+                }
+                $lines.Add("  rate limit seen at the last turn: $($parts -join " $dot ")")
             }
             else { $lines.Add("  `e[2mrate limit: not recorded in this rollout`e[22m") }
         }
@@ -4218,6 +4229,255 @@ function Split-CcrHint([string]$Hint, [int]$Width) {
     @($out | ForEach-Object { if ($_.Length -gt $Width) { $_.Substring(0, [Math]::Max(1, $Width)) } else { $_ } })
 }
 
+# =============================================================================
+#  account limits: the table above the picker
+# =============================================================================
+# How far each account is into its usage limits, as its own tool reports them
+# live: Claude Code's /usage (claude -p "/usage" - a local command: no model
+# call, no session, no cost) and Codex's app-server (account/rateLimits/read,
+# JSON). Neither needs ccr to read a credential. The picker asks the accounts
+# whose answer is older than $script:CcrLimitsTtl seconds in the background
+# (in-process runspaces: the list is usable at once) and redraws the table
+# when an answer lands; answers are kept in limits.json next to the state
+# file, so a picker opened again soon asks nothing. Ctrl+L asks again.
+# CCR_LIMITS=0 or ccr.json "limits": false turns the asking off.
+$script:CcrLimitsTtl = 300
+$script:CcrMonths = @('jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec')
+
+function Test-CcrLimitsOn {
+    if ("$env:CCR_LIMITS" -eq '0') { return $false }
+    $cfg = Get-CcrConfig
+    -not ($cfg -and $cfg.limits -eq $false)
+}
+
+function Get-CcrLimitsPath {
+    $st = Get-CcrStatePath
+    if ($st) { Join-Path (Split-Path -Parent $st) 'limits.json' }
+}
+
+# "tool|dir" -> the last answer: ok, note, plan, windows (name, pct, reset =
+# unix seconds or null), at (when it came), tried / error (a later failed ask).
+function Get-CcrLimitsCache {
+    $p = Get-CcrLimitsPath
+    if ($p -and (Test-Path -LiteralPath $p)) {
+        try {
+            $c = Get-Content -LiteralPath $p -Raw | ConvertFrom-Json -AsHashtable
+            if ($c -is [System.Collections.IDictionary]) { return $c }
+        }
+        catch { }
+    }
+    @{}
+}
+
+function Save-CcrLimitsEntry([string]$Key, [object]$Entry) {
+    $p = Get-CcrLimitsPath
+    if (-not $p) { return }
+    try {
+        $c = Get-CcrLimitsCache
+        $c[$Key] = $Entry
+        [void][IO.Directory]::CreateDirectory((Split-Path -Parent $p))
+        [IO.File]::WriteAllText($p, ($c | ConvertTo-Json -Depth 6), [Text.UTF8Encoding]::new($false))
+    }
+    catch { Write-Verbose "ccr: limits not cached: $_" }
+}
+
+# The first non-empty line, at most 60 characters.
+function Get-CcrShortNote([string]$Text) {
+    $t = "$(@("$Text" -split "`r?`n" | Where-Object { $_.Trim() })[0])".Trim()
+    if ($t.Length -gt 60) { $t = $t.Substring(0, 59) + [char]0x2026 }
+    $t
+}
+
+# A reset time as /usage prints it ("Oct 7, 9:59am (Europe/Rome)", "12:19am")
+# -> unix seconds. The time is this PC's local time (the zone in parentheses
+# is the one Claude Code runs in, i.e. this PC's); the year is the one that
+# puts the date in the coming days. $null when it cannot be read.
+function ConvertTo-CcrResetEpoch([string]$Text, [long]$Now) {
+    $m = [regex]::Match("$Text", '^\s*(?:([A-Za-z]{3})[A-Za-z]*\.?\s+(\d{1,2}),?\s+(?:at\s+)?)?(\d{1,2})(?::(\d{2}))?\s*([ap]m)?\b', 'IgnoreCase')
+    if (-not $m.Success) { return $null }
+    $nowL = [DateTimeOffset]::FromUnixTimeSeconds($Now).LocalDateTime
+    $h = [int]$m.Groups[3].Value
+    $mi = if ($m.Groups[4].Success) { [int]$m.Groups[4].Value } else { 0 }
+    if ($m.Groups[5].Success) {
+        if ($h -lt 1 -or $h -gt 12) { return $null }
+        if ($h -eq 12) { $h = 0 }
+        if ($m.Groups[5].Value -match '^p') { $h += 12 }
+    }
+    if ($h -gt 23 -or $mi -gt 59) { return $null }
+    try {
+        if ($m.Groups[1].Success) {
+            $mon = [array]::IndexOf($script:CcrMonths, $m.Groups[1].Value.ToLowerInvariant()) + 1
+            if ($mon -lt 1) { return $null }
+            $t = [datetime]::new($nowL.Year, $mon, [int]$m.Groups[2].Value, $h, $mi, 0, [DateTimeKind]::Local)
+            if ($t -lt $nowL.AddDays(-1)) { $t = $t.AddYears(1) }
+        }
+        else {
+            $t = [datetime]::new($nowL.Year, $nowL.Month, $nowL.Day, $h, $mi, 0, [DateTimeKind]::Local)
+            if ($t -lt $nowL.AddMinutes(-1)) { $t = $t.AddDays(1) }
+        }
+    }
+    catch { return $null }
+    [DateTimeOffset]::new($t).ToUnixTimeSeconds()
+}
+
+# claude -p "/usage" (its result text) -> limits. The lines read:
+#   Current session: 8% used · resets Oct 4, 12:20am (Europe/Rome)
+#   Current week (all models): 50% used · resets Oct 7, 10am (Europe/Rome)
+#   Current week (Fable): 40% used · resets Oct 7, 10am (Europe/Rome)
+# An account without subscription limits (an API key, access turned off by
+# its organisation) prints none of them.
+function ConvertFrom-CcrClaudeLimits([string]$Text, [bool]$IsError, [long]$Now) {
+    $wins = [System.Collections.Generic.List[object]]::new()
+    if (-not $IsError) {
+        foreach ($l in @("$Text" -split "`r?`n")) {
+            $m = [regex]::Match($l, '^\s*Current session\s*:\s*(\d+(?:\.\d+)?)\s*%\s*used(?:.*?\bresets\s+(.+?))?\s*$', 'IgnoreCase')
+            if ($m.Success) { $name = '5h'; $pct = $m.Groups[1].Value; $rs = $m.Groups[2].Value }
+            else {
+                $m = [regex]::Match($l, '^\s*Current week\s*\(([^)]*)\)\s*:\s*(\d+(?:\.\d+)?)\s*%\s*used(?:.*?\bresets\s+(.+?))?\s*$', 'IgnoreCase')
+                if (-not $m.Success) { continue }
+                $n = $m.Groups[1].Value.Trim()
+                $name = if ($n -match '^all\s+models$') { 'week' } else { $n -replace '\s+only$', '' }
+                $pct = $m.Groups[2].Value; $rs = $m.Groups[3].Value
+            }
+            $wins.Add([ordered]@{ name = $name; pct = [int][Math]::Floor([double]::Parse($pct, [cultureinfo]::InvariantCulture) + 0.5)
+                    reset = $(if ($rs) { ConvertTo-CcrResetEpoch $rs $Now } else { $null }) })
+        }
+    }
+    if ($wins.Count) { return [ordered]@{ ok = $true; note = ''; plan = ''; windows = @($wins) } }
+    $note = if ($IsError) { Get-CcrShortNote $Text } else { 'no limits reported' }
+    [ordered]@{ ok = $false; note = $(if ($note) { $note } else { 'no answer' }); plan = ''; windows = @() }
+}
+
+# codex app-server's reply to account/rateLimits/read (one JSON-RPC line) ->
+# limits. A window is named by its length, not its slot: on a plan without
+# the 5-hour window (prolite) the week is "primary".
+function ConvertFrom-CcrCodexLimits([string]$Json, [long]$Now) {
+    $none = { param($n) [ordered]@{ ok = $false; note = $n; plan = ''; windows = @() } }
+    if ([string]::IsNullOrWhiteSpace($Json)) { return (& $none 'no answer') }
+    try { $j = $Json | ConvertFrom-Json -ErrorAction Stop } catch { return (& $none 'no answer') }
+    if ($j.error) { $n = Get-CcrShortNote "$($j.error.message)"; return (& $none $(if ($n) { $n } else { 'no answer' })) }
+    $rl = $j.result.rateLimits
+    if (-not $rl) { return (& $none 'no limits reported') }
+    $all = foreach ($w in @($rl.primary, $rl.secondary)) {
+        if (-not $w) { continue }
+        $mins = [long]$w.windowDurationMins
+        $name = if ($mins -eq 300) { '5h' } elseif ($mins -eq 10080) { 'week' } elseif ($mins -gt 0 -and $mins % 1440 -eq 0) { "$([long]($mins / 1440))d" } else { "$([long][Math]::Floor($mins / 60 + 0.5))h" }
+        $pct = [int][Math]::Floor([double]$w.usedPercent + 0.5)
+        $reset = if ($w.resetsAt) { [long]$w.resetsAt } else { $null }
+        [ordered]@{ name = $name; pct = $pct; reset = $reset }
+    }
+    $all = @($all)
+    $wins = @(@($all | Where-Object { $_.name -eq '5h' }) + @($all | Where-Object { $_.name -eq 'week' }) + @($all | Where-Object { $_.name -notin '5h', 'week' }))
+    if (-not $wins.Count) { return (& $none 'no limits reported') }
+    [ordered]@{ ok = $true; note = ''; plan = "$($rl.planType)"; windows = $wins }
+}
+
+# What one background ask brought back (text / error / fail) -> limits.
+function ConvertFrom-CcrLimitsFetch([string]$Tool, [object]$Res, [long]$Now) {
+    if (-not $Res -or "$($Res.fail)") {
+        $n = if ($Res) { Get-CcrShortNote "$($Res.fail)" } else { '' }
+        return [ordered]@{ ok = $false; note = $(if ($n) { $n } else { 'no answer' }); plan = ''; windows = @() }
+    }
+    if ($Tool -eq 'claude') { ConvertFrom-CcrClaudeLimits "$($Res.text)" ([bool]$Res.error) $Now }
+    else { ConvertFrom-CcrCodexLimits "$($Res.text)" $Now }
+}
+
+# A reset in the coming hours as 09:59, a later one as Wed 7 09:59.
+function Format-CcrResetTime([long]$Epoch, [long]$Now) {
+    $t = [DateTimeOffset]::FromUnixTimeSeconds($Epoch).LocalDateTime
+    $fmt = if ($Epoch - $Now -lt 20 * 3600) { 'HH:mm' } else { 'ddd d HH:mm' }
+    $t.ToString($fmt, [cultureinfo]::InvariantCulture)
+}
+
+# The table's limits cell: "5h 9% → 00:19 · week 50% → Wed 7 09:59 · Fable 40%".
+# Percentages from 70 yellow, from 90 red; a window whose reset has passed
+# reads 0%; at 0% the reset is left out (nothing to wait for - and codex
+# gives a window nobody has used a reset of its own making); a per-model week shows its reset only when it differs from the
+# week's. Old figures say since when; "…" = an ask is under way.
+function Format-CcrLimits([object]$Entry, [long]$Now, [bool]$Pending) {
+    $more = if ($Pending) { " `e[2m$([char]0x2026)`e[22m" } else { '' }
+    if (-not $Entry) { return $(if ($Pending) { "`e[2mlimits$([char]0x2026)`e[22m" } else { '' }) }
+    if (-not $Entry.ok) { return "`e[2m$(if ("$($Entry.note)") { $Entry.note } else { 'no answer' })`e[22m$more" }
+    $week = @(@($Entry.windows) | Where-Object { $_.name -eq 'week' })[0]
+    $parts = foreach ($w in @($Entry.windows)) {
+        $pct = [int]$w.pct
+        $reset = $w.reset
+        if ($null -ne $reset -and [long]$reset -le $Now) { $pct = 0; $reset = $null }
+        if ($pct -eq 0) { $reset = $null }
+        $c = if ($pct -ge 90) { "`e[31m" } elseif ($pct -ge 70) { "`e[33m" } else { '' }
+        $s = "$($w.name) $c$pct%$(if ($c) { "`e[39m" })"
+        $same = $w.name -notin '5h', 'week' -and $week -and $null -ne $week.reset -and $null -ne $reset -and [Math]::Abs([long]$reset - [long]$week.reset) -le 300
+        if ($null -ne $reset -and -not $same) { $s += " `e[2m$([char]0x2192) $(Format-CcrResetTime ([long]$reset) $Now)`e[22m" }
+        $s
+    }
+    $out = @($parts) -join " $([char]0x00B7) "
+    $at = [long]$Entry.at
+    if ($Now - $at -gt $script:CcrLimitsTtl + 60) {
+        $out += " `e[2m(as of $([DateTimeOffset]::FromUnixTimeSeconds($at).LocalDateTime.ToString('HH:mm', [cultureinfo]::InvariantCulture)))`e[22m"
+    }
+    $out + $more
+}
+
+# One background ask, run in its own runspace (nothing of this script is
+# defined there). Returns @{ text; error; fail }.
+$script:CcrLimitsFetch = {
+    param([string]$Tool, [string]$Path, [string]$Exe)
+    $r = @{ text = ''; error = $false; fail = '' }
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $Exe
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.StandardOutputEncoding = [Text.UTF8Encoding]::new($false)
+    $psi.WorkingDirectory = [IO.Path]::GetTempPath()
+    $psi.EnvironmentVariables[$(if ($Tool -eq 'claude') { 'CLAUDE_CONFIG_DIR' } else { 'CODEX_HOME' })] = $Path
+    $p = $null
+    try {
+        if ($Tool -eq 'claude') {
+            # /usage is a local command: no model call. Haiku only in case it
+            # ever reached a model.
+            $psi.Arguments = '-p /usage --no-session-persistence --output-format json --model haiku'
+            $p = [System.Diagnostics.Process]::Start($psi)
+            $p.StandardInput.Close()
+            $null = $p.StandardError.ReadToEndAsync()
+            $outTask = $p.StandardOutput.ReadToEndAsync()
+            if (-not $p.WaitForExit(60000)) { $r.fail = 'no answer in 60 s'; return $r }
+            try { $j = $outTask.Result | ConvertFrom-Json -ErrorAction Stop } catch { $r.fail = 'no answer'; return $r }
+            $r.text = "$($j.result)"
+            $r.error = [bool]$j.is_error
+        }
+        else {
+            $psi.Arguments = 'app-server'
+            $p = [System.Diagnostics.Process]::Start($psi)
+            $null = $p.StandardError.ReadToEndAsync()
+            $in = $p.StandardInput
+            $in.WriteLine('{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"ccr","version":"1"}}}')
+            $in.WriteLine('{"jsonrpc":"2.0","method":"initialized"}')
+            $in.WriteLine('{"jsonrpc":"2.0","id":2,"method":"account/rateLimits/read","params":null}')
+            $in.Flush()
+            $deadline = [DateTime]::UtcNow.AddSeconds(30)
+            while ($true) {
+                $task = $p.StandardOutput.ReadLineAsync()
+                $left = [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds
+                if ($left -le 0 -or -not $task.Wait($left)) { $r.fail = 'no answer in 30 s'; break }
+                $line = $task.Result
+                if ($null -eq $line) { $r.fail = 'codex app-server ended'; break }
+                if ($line -match '"id"\s*:\s*2\b') { $r.text = $line; break }
+            }
+            try { $in.Close() } catch { }
+        }
+    }
+    catch { $r.fail = "$_" }
+    finally {
+        if ($p -and -not $p.HasExited -and -not $p.WaitForExit(3000)) {
+            try { $p.Kill($true) } catch { try { $p.Kill() } catch { } }
+        }
+    }
+    $r
+}
+
 # Interactive multi-select over the merged session list. Returns the chosen
 # sessions, or @() on cancel. Runs in the alternate screen buffer.
 function Select-CcrSession {
@@ -4295,6 +4555,99 @@ function Select-CcrSession {
         Write-Host "ccr: reading token usage of the last $UsageHours h..." -ForegroundColor Yellow
         foreach ($s in $Sessions) { $null = Get-CcrUsageCached $s }
     }
+    # Account limits (the table above the list): the last answers, cached
+    # per account; the stale accounts are asked in the background, and an
+    # answer redraws the table. Ctrl+L asks every account again.
+    $limitsOn = Test-CcrLimitsOn
+    $limits = if ($limitsOn) { Get-CcrLimitsCache } else { @{} }
+    $limitsJobs = [System.Collections.Generic.List[object]]::new()
+    function Start-CcrLimitsRefresh([bool]$Force) {
+        $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        foreach ($t in 'claude', 'codex') {
+            foreach ($r in @(if ($t -eq 'claude') { $ClaudeRoots } else { $CodexRoots })) {
+                $key = "$t|$($r.Path)"
+                if (@($limitsJobs | Where-Object { $_.Key -eq $key }).Count) { continue }
+                $old = $limits[$key]
+                if (-not $Force -and $old -and ($now - [Math]::Max([long]$old.at, [long]$old.tried)) -lt $script:CcrLimitsTtl) { continue }
+                if (-not (Test-Path -LiteralPath $r.Path)) { continue }
+                $exe = "$(@(Get-Command $t -CommandType Application -ErrorAction SilentlyContinue)[0].Source)"
+                if (-not $exe) { continue }
+                $ps = [powershell]::Create()
+                [void]$ps.AddScript($script:CcrLimitsFetch.ToString()).AddArgument($t).AddArgument($r.Path).AddArgument($exe)
+                $limitsJobs.Add([pscustomobject]@{ Key = $key; Tool = $t; PS = $ps; Handle = $ps.BeginInvoke() })
+            }
+        }
+    }
+    # The answers that came in since the last call; $true when there was one.
+    function Receive-CcrLimits {
+        $got = $false
+        foreach ($j in @($limitsJobs)) {
+            if (-not $j.Handle.IsCompleted) { continue }
+            [void]$limitsJobs.Remove($j)
+            $res = $null
+            try { $res = @($j.PS.EndInvoke($j.Handle))[0]; if ($null -ne $res) { $res = $res.PSObject.BaseObject } } catch { }
+            $j.PS.Dispose()
+            $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+            $e = ConvertFrom-CcrLimitsFetch $j.Tool $res $now
+            $old = $limits[$j.Key]
+            if ($e.ok -or -not ($old -and $old.ok)) { $e.at = $now; $limits[$j.Key] = $e }
+            else { $old.tried = $now; $old.error = $e.note }   # keep the last good figures
+            Save-CcrLimitsEntry $j.Key $limits[$j.Key]
+            $got = $true
+        }
+        $got
+    }
+    if ($limitsOn) { Start-CcrLimitsRefresh $false }
+    # The table above the list: one line per tool and account - the tool
+    # (once per group), in multi-account mode the number Space cycles
+    # through and the label, the dir, who is logged in there (from the dir's
+    # own files, see Get-CcrQuickIdentity) and how far it is into its usage
+    # limits. Dirs go first, then the emails, when the lines would not fit.
+    function Get-CcrAccountTable([int]$Width) {
+        $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        $rows = @(foreach ($t in 'claude', 'codex') {
+                foreach ($r in @(if ($t -eq 'claude') { $ClaudeRoots } else { $CodexRoots })) {
+                    $qk = "$t|$($r.Label)"
+                    if (-not $acctQuick.ContainsKey($qk)) { $acctQuick[$qk] = Get-CcrWhoAt $t $r.Path }
+                    $en = if ($acctMode -and $r.Label) { @($entries | Where-Object { $_.Tool -eq $t -and $_.Label -eq $r.Label })[0] } else { $null }
+                    if ($en) { $en.Who = $acctQuick[$qk]; $en.Dir = Format-CcrCwd $r.Path 28 }
+                    $key = "$t|$($r.Path)"
+                    [pscustomobject]@{
+                        Tool  = $t
+                        N     = $(if ($en) { "$($en.N)" } else { '' })
+                        Label = $(if ($acctMode -and $r.Label) { Format-CcrAcctLabel $r.Label $r.Default } else { '' })
+                        Dir   = (Format-CcrCwd $r.Path 28)
+                        Who   = "$($acctQuick[$qk])"
+                        Lim   = $(if ($limitsOn) { Format-CcrLimits $limits[$key] $now ([bool]@($limitsJobs | Where-Object { $_.Key -eq $key }).Count) } else { '' })
+                    }
+                }
+            })
+        $nW = [int]($rows | ForEach-Object { $_.N.Length } | Measure-Object -Maximum).Maximum
+        $lblW = [int]($rows | ForEach-Object { $_.Label.Length } | Measure-Object -Maximum).Maximum
+        $dirW = [int]($rows | ForEach-Object { $_.Dir.Length } | Measure-Object -Maximum).Maximum
+        $whoW = [int]($rows | ForEach-Object { $_.Who.Length } | Measure-Object -Maximum).Maximum
+        $limW = [int]($rows | ForEach-Object { ($_.Lim -replace "`e\[[0-9;]*m", '').Length } | Measure-Object -Maximum).Maximum
+        $base = 2 + 6 + $(if ($acctMode) { 2 + $nW + 1 + $lblW } else { 0 })
+        $limPart = if ($limW) { 2 + $limW } else { 0 }
+        $withDirs = ($base + 2 + $dirW + 2 + $whoW + $limPart) -le $Width - 1
+        $withWho = $withDirs -or (($base + 2 + $whoW + $limPart) -le $Width - 1)
+        $out = [System.Collections.Generic.List[string]]::new()
+        if ($acctMode) { $out.Add("`e[1;35mMulti-account mode active.`e[22;39m") }
+        $prevTool = ''
+        foreach ($r in $rows) {
+            $tc = Get-CcrToolColor $r.Tool
+            $toolTxt = if ($r.Tool -ne $prevTool) { $r.Tool.PadRight(6) } else { ' ' * 6 }
+            $prevTool = $r.Tool
+            $line = "  $tc$toolTxt`e[39m"
+            if ($acctMode) { $line += "  $tc`e[1m$($r.N.PadLeft($nW))`e[22;39m `e[35m$($r.Label.PadRight($lblW))`e[39m" }
+            if ($withDirs) { $line += "  $($r.Dir.PadRight($dirW))" }
+            if ($withWho) { $line += "  `e[2m$($r.Who.PadRight($whoW))`e[22m" }
+            if ($r.Lim) { $line += "  $($r.Lim)" }
+            $out.Add($line)
+        }
+        # one line per element: the caller collects them with @()
+        $out.ToArray()
+    }
     # The rows Enter and Shift+Enter open: the marked ones, each carrying
     # the account it opens under (TargetRoot; $null = as is), or else the
     # highlighted row.
@@ -4342,10 +4695,11 @@ function Select-CcrSession {
             $w = [Console]::WindowWidth
             $h = [Console]::WindowHeight
             # The key legend wraps onto as many lines as the window needs.
-            $hint = if ($acctMode) { "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space cycles the account (dot = as is) $([char]0x00B7) Enter open $([char]0x00B7) Shift+Enter model/effort $([char]0x00B7) Ctrl+N new $([char]0x00B7) Ctrl+P MAP $([char]0x00B7) Ctrl+A accounts $([char]0x00B7) Ctrl+K usage $([char]0x00B7) Ctrl+J details $([char]0x00B7) Ctrl+X close $([char]0x00B7) Ctrl+I install $([char]0x00B7) Del delete $([char]0x00B7) Esc cancel $([char]0x00B7) v$script:CcrVersion" }
-            else { "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space mark $([char]0x00B7) Enter open $([char]0x00B7) Shift+Enter model/effort $([char]0x00B7) Ctrl+N new $([char]0x00B7) Ctrl+P MAP $([char]0x00B7) Del delete $([char]0x00B7) Ctrl+A accounts $([char]0x00B7) Ctrl+K usage $([char]0x00B7) Ctrl+J details $([char]0x00B7) Ctrl+X close $([char]0x00B7) Ctrl+I install $([char]0x00B7) Esc cancel $([char]0x00B7) type to filter $([char]0x00B7) v$script:CcrVersion" }
+            $hint = if ($acctMode) { "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space cycles the account (dot = as is) $([char]0x00B7) Enter open $([char]0x00B7) Shift+Enter model/effort $([char]0x00B7) Ctrl+N new $([char]0x00B7) Ctrl+P MAP $([char]0x00B7) Ctrl+A accounts $([char]0x00B7) Ctrl+K usage $([char]0x00B7) Ctrl+J details $([char]0x00B7) $(if ($limitsOn) { "Ctrl+L limits $([char]0x00B7) " })Ctrl+X close $([char]0x00B7) Ctrl+I install $([char]0x00B7) Del delete $([char]0x00B7) Esc cancel $([char]0x00B7) v$script:CcrVersion" }
+            else { "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space mark $([char]0x00B7) Enter open $([char]0x00B7) Shift+Enter model/effort $([char]0x00B7) Ctrl+N new $([char]0x00B7) Ctrl+P MAP $([char]0x00B7) Del delete $([char]0x00B7) Ctrl+A accounts $([char]0x00B7) Ctrl+K usage $([char]0x00B7) Ctrl+J details $([char]0x00B7) $(if ($limitsOn) { "Ctrl+L limits $([char]0x00B7) " })Ctrl+X close $([char]0x00B7) Ctrl+I install $([char]0x00B7) Esc cancel $([char]0x00B7) type to filter $([char]0x00B7) v$script:CcrVersion" }
             $hintLines = @(Split-CcrHint $hint ($w - 1))
-            $viewH = [Math]::Max(1, $h - 1 - $hintLines.Count - $(if ($acctMode) { $entries.Count + 1 } else { 0 }) - $(if ($updNote) { 1 } else { 0 }))
+            $tableLines = @(Get-CcrAccountTable $w)
+            $viewH = [Math]::Max(1, $h - 1 - $hintLines.Count - $tableLines.Count - $(if ($updNote) { 1 } else { 0 }))
             if ($cursor -gt $view.Count - 1) { $cursor = [Math]::Max(0, $view.Count - 1) }
             if ($cursor -lt $top) { $top = $cursor }
             elseif ($cursor -ge $top + $viewH) { $top = $cursor - $viewH + 1 }
@@ -4377,36 +4731,7 @@ function Select-CcrSession {
             $line1 = $hdr + (' ' * $pad) + $counts
             if ($line1.Length -gt $w - 1) { $line1 = $line1.Substring(0, $w - 1) }
             [void]$sb.Append($line1).Append("`e[K`n")
-            if ($acctMode) {
-                # Legend, one line per tool and account: the tool (once per
-                # group), the number in the tool's colour, the label, the dir
-                # and the email logged in there (from the dir's own files, see
-                # Get-CcrQuickIdentity). Dirs are dropped when the lines would
-                # not fit.
-                [void]$sb.Append("`e[1;35mMulti-account mode active.`e[22;39m`e[K`n")
-                $lblW = ($entries | ForEach-Object { (Format-CcrAcctLabel $_.Label $_.Default).Length } | Measure-Object -Maximum).Maximum
-                $nW = "$($entries.Count)".Length
-                $dirW = 0; $whoW = 0
-                foreach ($e in $entries) {
-                    $qk = "$($e.Tool)|$($e.Label)"
-                    if (-not $acctQuick.ContainsKey($qk)) { $acctQuick[$qk] = Get-CcrWhoAt $e.Tool $e.Path }
-                    $e.Dir = Format-CcrCwd $e.Path 28
-                    $e.Who = $acctQuick[$qk]
-                    if ($e.Dir.Length -gt $dirW) { $dirW = $e.Dir.Length }
-                    if ($e.Who.Length -gt $whoW) { $whoW = $e.Who.Length }
-                }
-                $withDirs = (2 + 6 + 2 + $nW + 1 + $lblW + 2 + $dirW + 2 + $whoW) -le $w - 1
-                $prevTool = ''
-                foreach ($e in $entries) {
-                    $tc = Get-CcrToolColor $e.Tool
-                    $toolTxt = if ($e.Tool -ne $prevTool) { $e.Tool.PadRight(6) } else { ' ' * 6 }
-                    $prevTool = $e.Tool
-                    $line = "  $tc$toolTxt`e[39m  $tc`e[1m$("$($e.N)".PadLeft($nW))`e[22;39m `e[35m$((Format-CcrAcctLabel $e.Label $e.Default).PadRight($lblW))`e[39m"
-                    if ($withDirs) { $line += "  $($e.Dir.PadRight($dirW))" }
-                    $line += "  `e[2m$($e.Who.PadRight($whoW))`e[22m"
-                    [void]$sb.Append($line).Append("`e[K`n")
-                }
-            }
+            foreach ($tl in $tableLines) { [void]$sb.Append($tl).Append("`e[K`n") }
             [void]$sb.Append("`e[2m").Append($hintLines -join "`e[K`n").Append("`e[22m`e[K")
 
             # One cell of a row: cut with an ellipsis ($scroll = -1), or - on
@@ -4481,18 +4806,29 @@ function Select-CcrSession {
             # --- marquee on the highlighted row while waiting for a key ---
             # A title or path cut to fit starts rotating through its column
             # after a short pause, one character every 150 ms; the first key
-            # stops it and is handled as usual.
+            # stops it and is handled as usual. An answer about the account
+            # limits redraws the whole frame (the table above the list).
+            $redraw = $false
             if ($view.Count -gt 0 -and (Test-CcrRowOverflow $view[$cursor])) {
-                $headerLines = 1 + $hintLines.Count + $(if ($updNote) { 1 } else { 0 }) + $(if ($acctMode) { $entries.Count + 1 } else { 0 })
+                $headerLines = 1 + $hintLines.Count + $(if ($updNote) { 1 } else { 0 }) + $tableLines.Count
                 $rowLine = $headerLines + 1 + ($cursor - $top)
                 $tick = 0
                 while (-not [Console]::KeyAvailable) {
                     Start-Sleep -Milliseconds 150
+                    if ($limitsJobs.Count -and (Receive-CcrLimits)) { $redraw = $true; break }
                     $tick++
                     if ($tick -lt 4) { continue }
                     [Console]::Write("`e[$rowLine;1H`e[7m$(Format-CcrPickerRow $view[$cursor] ($tick - 4))`e[27m`e[K")
                 }
             }
+
+            elseif ($limitsJobs.Count) {
+                while (-not [Console]::KeyAvailable) {
+                    Start-Sleep -Milliseconds 100
+                    if (Receive-CcrLimits) { $redraw = $true; break }
+                }
+            }
+            if ($redraw) { continue }
 
             # --- input ---
             $k = [Console]::ReadKey($true)
@@ -4573,6 +4909,11 @@ function Select-CcrSession {
                         }
                     }
                 }
+                continue
+            }
+            # Ctrl+L: ask every account for its usage limits again.
+            if ($k.Key -eq [ConsoleKey]::L -and $ctrl) {
+                if ($limitsOn) { Start-CcrLimitsRefresh $true }
                 continue
             }
             if ($k.Key -eq [ConsoleKey]::K -and $ctrl) {
@@ -4899,7 +5240,8 @@ function Resume-CcSessions {
 
         Picker keys: Up/Down/PgUp/PgDn/Home/End move, Space marks/unmarks,
         Enter opens the marked set (or the highlighted row if nothing is
-        marked), Shift+Enter (or Ctrl+E) opens it with a model and an effort
+        marked), Ctrl+L asks every account for its usage limits again (the
+        table above the list), Shift+Enter (or Ctrl+E) opens it with a model and an effort
         chosen on a page - one section for the claude rows (--model,
         --effort), one for the codex rows (-m, -c model_reasoning_effort),
         each shown only when the selection has such rows, all starting at

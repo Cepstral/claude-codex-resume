@@ -200,11 +200,23 @@ pane, which shows the full title and folder of the highlighted row.
   - `$null | ForEach-Object { }` runs the block once: filter with
     `Where-Object { $_ }` before turning a list that may be absent into
     strings.
+- Usage limits (v0.72, the account table above the picker): claude
+  `-p "/usage"` is a local command (0 turns, $0) and prints text lines,
+  parsed by ConvertFrom-CcrClaudeLimits / parse_claude_limits; codex
+  `app-server` answers `account/rateLimits/read` in JSON. A codex window is
+  named by its length, never its slot: on prolite the week is `primary`
+  (Ctrl+J's meter had them swapped until v0.72). From Git Bash `/usage`
+  turns into `C:/Program Files/Git/usage` (MSYS path conversion) and reaches
+  the model as a prompt - it cost a real turn once: `MSYS_NO_PATHCONV=1`.
+  Tests set `CCR_LIMITS=0` wherever the picker runs, or it asks the real
+  tools.
 - `& exe @(F)`, where F returns `, $list.ToArray()`, hands the native
   program ONE argument, the whole list joined with spaces: `@()` holds the
   list as a single element. wt then opened one default-profile tab and no MAP
   viewer (v0.69-v0.70); every test passed because they checked the list, not
-  the call. Assign, then splat: `$argv = F; & exe @argv`. And wt returns before
+  the call. Assign, then splat: `$argv = F; & exe @argv`. The same wrap hit
+  `@(Get-CcrAccountTable)` in v0.72 (one "System.String[]" line): a function
+  whose caller collects with `@()` returns its lines unwrapped. And wt returns before
   its tabs exist and says nothing when it drops a request: Open-CcrPanelTabs /
   open_panel_tabs wait for the viewers' processes. The harness gives the real
   function a stand-in wt.exe that records its arguments (scratch, csc-built).

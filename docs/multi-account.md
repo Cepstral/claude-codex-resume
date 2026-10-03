@@ -117,23 +117,24 @@ each dir is independent (see the table at the end); project trust is asked again
 
 Without a `ccr.json`, nothing changes: ccr uses the default dirs as before.
 
-`ccr.json` also holds two keys unrelated to accounts: `"usageColumn": true` starts the picker with
-the token-usage column on (what `Ctrl+K` toggles), and `"usageHours": 24` sets its window (default 5).
+`ccr.json` also holds keys unrelated to accounts: `"usageColumn": true` starts the picker with
+the token-usage column on (what `Ctrl+K` toggles), `"usageHours": 24` sets its window (default 5),
+and `"limits": false` stops the picker asking the accounts for their usage limits.
 A `ccr.json` with only those keys does not turn multi-account mode on.
 
 ## What the picker shows
 
 An **account column** appears between the tool and the age (magenta), for both tools, the
-default account in parentheses; above the rows, a legend lists the accounts (see
-[Space](#opening-a-conversation-under-another-account--space) below):
+default account in parentheses; above the rows, the account table lists the accounts (see
+[Space](#opening-a-conversation-under-another-account--space) below) with each one's usage limits:
 
 ```
 filter>                                                 88/121 · 2 marked
 Multi-account mode active.
-  claude  1 (default)  ~\.claude       me@gmail.com
-          2 work       ~\.claude-work  me@company.com
-  codex   3 (default)  ~\.codex        me@gmail.com
-          4 work       ~\.codex-work   me@company.com
+  claude  1 (default)  ~\.claude       me@gmail.com    5h 9% → 00:19 · week 50% → Wed 7 09:59 · Fable 40%
+          2 work       ~\.claude-work  me@company.com  no limits reported
+  codex   3 (default)  ~\.codex        me@gmail.com    5h 0% · week 2%  → Wed 7 07:57
+          4 work       ~\.codex-work   me@company.com  week 27% → Sun 4 21:02
 ↑↓ move · Space cycles the account (dot = as is) · Enter open · Ctrl+N new · Ctrl+A accounts · Del delete · Esc cancel
 ● claude work       1h  Billing API pagination          D:\repos\api-server
   claude (default)  3h  Home automation bridge          D:\repos\home
@@ -141,6 +142,19 @@ Multi-account mode active.
 ● claude (default)  1d  Physics simulation viral videos D:\repos\sim-shorts
   codex  (default)  2d  sono affidabili i nebulizzatori ~
 ```
+
+The table is there with a single account per tool too (one line per tool, without the
+numbers and labels). Its last column is how far each account is into its usage limits, as the
+tool itself reports them, asked live in the background when the picker opens: Claude Code's
+`/usage` (`claude -p "/usage"` under the account's dir — a local command, no model call, no
+cost) and Codex's app-server (`codex app-server`, `account/rateLimits/read`, under the
+account's `CODEX_HOME`). ccr reads no credential for it. The answers are kept for 5 minutes in
+`limits.json` next to ccr's state file, so a picker opened again soon asks nothing; `Ctrl+L`
+asks every account again. `…` marks an account still being asked, `(as of HH:mm)` figures a
+later ask could not refresh; an account with no subscription limits (an API key, or access
+turned off by its organisation) shows *no limits reported*. When the lines would not fit, the
+dirs go first, then the emails. `CCR_LIMITS=0` or `"limits": false` in `ccr.json` turns the
+asking off.
 
 The label is part of the filter text, so typing `work` narrows to that account, exactly like
 typing a title or a folder.
@@ -292,6 +306,7 @@ Every account feature exists for both tools. Where a concept has no counterpart,
 | Open on another PC (`@host`)              | the registry's `pidDomain` host, when the dir is synced  | **not applicable** — Codex writes no per-process registry, and `~/.codex` is normally not synced |
 | Background session (`bg`)                 | registry `kind=bg` (`claude --bg`)                       | **not applicable** — Codex has no background kind                |
 | Close a running conversation (`Ctrl+X`)   | `claude stop <jobId>` for a background session, else the process | the process (Codex has no `stop` command); only sessions started as `codex resume <id>` expose a pid |
+| Usage limits (the table above the picker) | `claude -p "/usage" --no-session-persistence --output-format json` with `CLAUDE_CONFIG_DIR` set: a local command, no model call; the text lines `Current session` / `Current week (all models)` / `Current week (<model>)` | `codex app-server` with `CODEX_HOME` set: `initialize`, then `account/rateLimits/read` (JSON); each window named by its length (300 min = 5h, 10080 = week), not by its slot — on prolite the week is `primary` |
 | MAP: every agent ([docs/panel.md](panel.md)) | like the CLI in auto mode: `claude -p --permission-mode auto` when settings.json's default mode is `auto` (else `acceptEdits` for the master, `default` for a reviewer) `--permission-prompts none --allowedTools WebSearch,WebFetch`; settings, hooks, MCP servers and `CLAUDE.md` load as usual; stream-json, so ccr checks the mode and tools it really got | `codex exec` with the account's config, plugins, apps, rules and `AGENTS.md`, plus `-c web_search=live` (`exec` takes no `--search`) unless `config.toml` sets `web_search` |
 | MAP: reviewer (no file changes)           | `--disallowedTools Edit,Write,MultiEdit,NotebookEdit`; it may still run commands, judged by auto mode's classifier; a reviewer that reports an edit tool fails | `-s read-only`: commands run sandboxed, writes refused |
 | MAP: master                               | the edit tools too; a model without auto mode runs in `default`, so ccr switches it to `acceptEdits` (a reviewer to `default`) after its first turn | `-s workspace-write`                                             |

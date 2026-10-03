@@ -14,6 +14,7 @@ import argparse
 import base64
 import ctypes
 import json
+import math
 import os
 import re
 import shlex
@@ -24,6 +25,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -33,7 +35,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.71"
+VERSION = "0.72"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -1128,9 +1130,10 @@ INFO_CMD = (r'printf "%s" "$FZF_MATCH_COUNT/$FZF_TOTAL_COUNT"; '
             r'printf " \033[32m·\033[0m \033[1;32m%s marked\033[0m" "$FZF_SELECT_COUNT"; :')
 
 
-def run_fzf(rows, header, query="", multi=True, expect=None, preview=True, prompt="filter> "):
+def run_fzf(rows, header, query="", multi=True, expect=None, preview=True, prompt="filter> ", listen=0):
     """Rows are '<id>\\t<display>\\t<preview>'. Returns (key, [ids]) or None on
-    Esc/Ctrl-C; key is '' for Enter or one of `expect`."""
+    Esc/Ctrl-C; key is '' for Enter or one of `expect`. listen: a port for
+    fzf --listen (actions sent while it runs, see Limits)."""
     if not shutil.which(FZF[0]):
         sys.exit("ccr: fzf not found - install it first (brew install fzf)")
     ver = fzf_version()
@@ -1152,6 +1155,8 @@ def run_fzf(rows, header, query="", multi=True, expect=None, preview=True, promp
         args += ["--query", query]
     if expect:
         args += ["--expect", ",".join(expect)]
+    if listen:
+        args.append(f"--listen=127.0.0.1:{listen}")
     if preview:
         args += ["--preview", "printf '%b\\n' {3}", "--preview-window=down,5,wrap"]
     p = subprocess.run(args, input="\n".join(rows) + "\n", text=True, stdout=subprocess.PIPE)
@@ -1211,35 +1216,392 @@ class Ctx:
         """The env var to set for a launch, or None when the tool has one dir."""
         return ROOT_VAR[tool] if self.multi[tool] else None
 
-    def legend(self) -> list:
-        """One line per tool and account: the tool (once per group), the
-        number in the tool's colour, the label, the dir and the email logged
-        in there. Dirs are dropped when the lines would not fit."""
-        width = shutil.get_terminal_size((100, 24)).columns - 4
-        lbl_w = max(len(acct_label(r.label, r.default)) for _, _, r in self.entries)
-        n_w = len(str(len(self.entries)))
-        cells = {}
-        for n, t, r in self.entries:
+
+# ----------------------------------------------------------------------------
+# account limits: the table above the picker
+# ----------------------------------------------------------------------------
+# How far each account is into its usage limits, as its own tool reports them
+# live: Claude Code's /usage (claude -p "/usage" - a local command: no model
+# call, no session, no cost) and Codex's app-server (account/rateLimits/read,
+# JSON). Neither needs ccr to read a credential. The picker asks the accounts
+# whose answer is older than LIMITS_TTL seconds in background threads and,
+# with fzf 0.45 or later, rewrites fzf's header when an answer lands (fzf
+# --listen); answers are kept in limits.json next to the state file, so a
+# picker opened again soon asks nothing. Ctrl-L asks again. CCR_LIMITS=0 or
+# ccr.json "limits": false turns the asking off.
+LIMITS_TTL = 300
+MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+_limits_lock = threading.Lock()
+
+
+def limits_on() -> bool:
+    if os.environ.get("CCR_LIMITS") == "0":
+        return False
+    return (load_config() or {}).get("limits") is not False
+
+
+def limits_path() -> Path:
+    return state_path().parent / "limits.json"
+
+
+def load_limits() -> dict:
+    """"tool|dir" -> the last answer: ok, note, plan, windows (name, pct,
+    reset = unix seconds or None), at (when it came), tried / error (a later
+    failed ask)."""
+    try:
+        c = json.loads(limits_path().read_text(encoding="utf-8"))
+        return c if isinstance(c, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_limit(key: str, entry: dict):
+    with _limits_lock:
+        try:
+            c = load_limits()
+            c[key] = entry
+            limits_path().parent.mkdir(parents=True, exist_ok=True)
+            limits_path().write_text(json.dumps(c, indent=2) + "\n", encoding="utf-8")
+        except OSError:
+            pass
+
+
+def short_note(text: str) -> str:
+    """The first non-empty line, at most 60 characters."""
+    lines = [l for l in re.split(r"\r?\n", text or "") if l.strip()]
+    t = lines[0].strip() if lines else ""
+    return t[:59] + "…" if len(t) > 60 else t
+
+
+def reset_epoch(text: str, now: int):
+    """A reset time as /usage prints it ("Oct 7, 9:59am (Europe/Rome)",
+    "12:19am") -> unix seconds. The time is this computer's local time (the
+    zone in parentheses is the one Claude Code runs in, i.e. this
+    computer's); the year is the one that puts the date in the coming days.
+    None when it cannot be read."""
+    m = re.match(r"\s*(?:([A-Za-z]{3})[A-Za-z]*\.?\s+(\d{1,2}),?\s+(?:at\s+)?)?(\d{1,2})(?::(\d{2}))?\s*([ap]m)?\b",
+                 text or "", re.I)
+    if not m:
+        return None
+    now_l = datetime.fromtimestamp(now)
+    h, mi = int(m.group(3)), int(m.group(4) or 0)
+    if m.group(5):
+        if not 1 <= h <= 12:
+            return None
+        h = (0 if h == 12 else h) + (12 if m.group(5).lower().startswith("p") else 0)
+    if h > 23 or mi > 59:
+        return None
+    try:
+        if m.group(1):
+            mon = MONTHS.index(m.group(1).lower()) + 1 if m.group(1).lower() in MONTHS else 0
+            if not mon:
+                return None
+            t = datetime(now_l.year, mon, int(m.group(2)), h, mi)
+            if t < now_l - timedelta(days=1):
+                try:
+                    t = t.replace(year=t.year + 1)
+                except ValueError:   # 29 February: .NET's AddYears gives the 28th
+                    t = t.replace(year=t.year + 1, day=28)
+        else:
+            t = datetime(now_l.year, now_l.month, now_l.day, h, mi)
+            if t < now_l - timedelta(minutes=1):
+                t += timedelta(days=1)
+    except ValueError:
+        return None
+    return int(t.timestamp())
+
+
+def _round_pct(x) -> int:
+    return int(math.floor(float(x) + 0.5))
+
+
+def parse_claude_limits(text: str, is_error: bool, now: int) -> dict:
+    """claude -p "/usage" (its result text) -> limits. The lines read:
+      Current session: 8% used · resets Oct 4, 12:20am (Europe/Rome)
+      Current week (all models): 50% used · resets Oct 7, 10am (Europe/Rome)
+      Current week (Fable): 40% used · resets Oct 7, 10am (Europe/Rome)
+    An account without subscription limits (an API key, access turned off by
+    its organisation) prints none of them."""
+    wins = []
+    if not is_error:
+        for l in re.split(r"\r?\n", text or ""):
+            m = re.match(r"^\s*Current session\s*:\s*(\d+(?:\.\d+)?)\s*%\s*used(?:.*?\bresets\s+(.+?))?\s*$", l, re.I)
+            if m:
+                name, pct, rs = "5h", m.group(1), m.group(2) or ""
+            else:
+                m = re.match(r"^\s*Current week\s*\(([^)]*)\)\s*:\s*(\d+(?:\.\d+)?)\s*%\s*used(?:.*?\bresets\s+(.+?))?\s*$",
+                             l, re.I)
+                if not m:
+                    continue
+                n = m.group(1).strip()
+                name = "week" if re.match(r"^all\s+models$", n, re.I) else re.sub(r"\s+only$", "", n)
+                pct, rs = m.group(2), m.group(3) or ""
+            wins.append({"name": name, "pct": _round_pct(pct), "reset": reset_epoch(rs, now) if rs else None})
+    if wins:
+        return {"ok": True, "note": "", "plan": "", "windows": wins}
+    note = short_note(text) if is_error else "no limits reported"
+    return {"ok": False, "note": note or "no answer", "plan": "", "windows": []}
+
+
+def parse_codex_limits(line: str, now: int) -> dict:
+    """codex app-server's reply to account/rateLimits/read (one JSON-RPC
+    line) -> limits. A window is named by its length, not its slot: on a plan
+    without the 5-hour window (prolite) the week is "primary"."""
+    def none(n):
+        return {"ok": False, "note": n, "plan": "", "windows": []}
+    try:
+        j = json.loads(line or "")
+    except ValueError:
+        return none("no answer")
+    if not isinstance(j, dict):
+        return none("no limits reported")
+    if j.get("error"):
+        err = j["error"]
+        return none(short_note(str(err.get("message") or "") if isinstance(err, dict) else "") or "no answer")
+    rl = (j.get("result") or {}).get("rateLimits") if isinstance(j.get("result"), dict) else None
+    if not isinstance(rl, dict):
+        return none("no limits reported")
+    found = []
+    for w in (rl.get("primary"), rl.get("secondary")):
+        if not isinstance(w, dict):
+            continue
+        mins = _as_int(w.get("windowDurationMins"))
+        name = ("5h" if mins == 300 else "week" if mins == 10080 else f"{mins // 1440}d" if mins > 0 and mins % 1440 == 0
+                else f"{int(math.floor(mins / 60 + 0.5))}h")
+        pct = _round_pct(w.get("usedPercent") or 0)
+        reset = int(w["resetsAt"]) if w.get("resetsAt") else None
+        found.append({"name": name, "pct": pct, "reset": reset})
+    wins = ([w for w in found if w["name"] == "5h"] + [w for w in found if w["name"] == "week"]
+            + [w for w in found if w["name"] not in ("5h", "week")])
+    if not wins:
+        return none("no limits reported")
+    return {"ok": True, "note": "", "plan": str(rl.get("planType") or ""), "windows": wins}
+
+
+def limits_from_fetch(tool: str, res: dict, now: int) -> dict:
+    """What one background ask brought back (text / error / fail) -> limits."""
+    if not res or res.get("fail"):
+        n = short_note(str(res.get("fail") or "")) if res else ""
+        return {"ok": False, "note": n or "no answer", "plan": "", "windows": []}
+    if tool == "claude":
+        return parse_claude_limits(str(res.get("text") or ""), bool(res.get("error")), now)
+    return parse_codex_limits(str(res.get("text") or ""), now)
+
+
+def fmt_reset(epoch: int, now: int) -> str:
+    """A reset in the coming hours as 09:59, a later one as Wed 7 09:59."""
+    t = datetime.fromtimestamp(epoch)
+    return f"{t:%H:%M}" if epoch - now < 20 * 3600 else f"{WEEKDAYS[t.weekday()]} {t.day} {t:%H:%M}"
+
+
+def fmt_limits(e, now: int, pending: bool = False) -> str:
+    """The table's limits cell: "5h 9% → 00:19 · week 50% → Wed 7 09:59 ·
+    Fable 40%". Percentages from 70 yellow, from 90 red; a window whose reset
+    has passed reads 0%; at 0% the reset is left out (nothing to wait for - and
+    codex gives a window nobody has used a reset of its own making); a per-model week shows its reset only when it differs
+    from the week's. Old figures say since when; "…" = an ask is under way."""
+    more = f" {DIM}…{RESET}" if pending else ""
+    if not isinstance(e, dict):
+        return f"{DIM}limits…{RESET}" if pending else ""
+    if not e.get("ok"):
+        return f"{DIM}{e.get('note') or 'no answer'}{RESET}{more}"
+    wins = e.get("windows") or []
+    week = next((w for w in wins if w.get("name") == "week"), None)
+    parts = []
+    for w in wins:
+        pct, reset = _as_int(w.get("pct")), w.get("reset")
+        if reset is not None and int(reset) <= now:
+            pct, reset = 0, None
+        if pct == 0:
+            reset = None
+        c = RED if pct >= 90 else YELLOW if pct >= 70 else ""
+        s = f"{w.get('name')} {c}{pct}%{RESET if c else ''}"
+        same = (w.get("name") not in ("5h", "week") and week and week.get("reset") is not None and reset is not None
+                and abs(int(reset) - int(week["reset"])) <= 300)
+        if reset is not None and not same:
+            s += f" {DIM}→ {fmt_reset(int(reset), now)}{RESET}"
+        parts.append(s)
+    out = " · ".join(parts)
+    at = _as_int(e.get("at"))
+    if now - at > LIMITS_TTL + 60:
+        out += f" {DIM}(as of {datetime.fromtimestamp(at):%H:%M}){RESET}"
+    return out + more
+
+
+def fetch_limits(tool: str, path: str, exe: str) -> dict:
+    """One background ask under one account. Returns {text, error, fail}."""
+    env = tool_env(tool, path)
+    cwd = tempfile.gettempdir()
+    try:
+        if tool == "claude":
+            # /usage is a local command: no model call. Haiku only in case it
+            # ever reached a model.
+            p = subprocess.run([exe, "-p", "/usage", "--no-session-persistence", "--output-format", "json",
+                                "--model", "haiku"], stdin=subprocess.DEVNULL, capture_output=True, env=env, cwd=cwd,
+                               timeout=60)
+            try:
+                j = json.loads(p.stdout.decode("utf-8", "replace"))
+            except ValueError:
+                return {"text": "", "error": False, "fail": "no answer"}
+            return {"text": str(j.get("result") or ""), "error": bool(j.get("is_error")), "fail": ""}
+        p = subprocess.Popen([exe, "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, env=env, cwd=cwd)
+        found = []
+
+        def pump():
+            for raw in p.stdout:
+                line = raw.decode("utf-8", "replace")
+                if re.search(r'"id"\s*:\s*2\b', line):
+                    found.append(line.strip())
+                    return
+
+        th = threading.Thread(target=pump, daemon=True)
+        th.start()
+        try:
+            p.stdin.write(b'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"ccr","version":"1"}}}\n'
+                          b'{"jsonrpc":"2.0","method":"initialized"}\n'
+                          b'{"jsonrpc":"2.0","id":2,"method":"account/rateLimits/read","params":null}\n')
+            p.stdin.flush()
+        except OSError:
+            pass
+        th.join(30)
+        try:
+            p.stdin.close()
+        except OSError:
+            pass
+        try:
+            p.wait(3)
+        except subprocess.TimeoutExpired:
+            p.kill()
+        if found:
+            return {"text": found[0], "error": False, "fail": ""}
+        return {"text": "", "error": False, "fail": "no answer in 30 s" if p.returncode is None or th.is_alive()
+                else "codex app-server ended"}
+    except subprocess.TimeoutExpired:
+        return {"text": "", "error": False, "fail": "no answer in 60 s"}
+    except OSError as e:
+        return {"text": "", "error": False, "fail": str(e)}
+
+
+def fzf_post(port: int, action: str) -> bool:
+    """Send an action to a running fzf (--listen). False when it is not there."""
+    req = urllib.request.Request(f"http://127.0.0.1:{port}", data=action.encode("utf-8"), method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=3) as r:
+            return r.status == 200
+    except OSError:
+        return False
+
+
+def free_port() -> int:
+    s = socket.socket()
+    try:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+    finally:
+        s.close()
+
+
+class Limits:
+    """The picker's account limits: the cache, the asks under way, and the
+    fzf to tell when an answer lands (the port of the fzf showing the table,
+    and the header to give it)."""
+
+    def __init__(self, ctx):
+        self.ctx = ctx
+        self.on = limits_on()
+        self.cache = load_limits() if self.on else {}
+        self.pending = set()
+        self.port = 0
+        self.header = None   # () -> the picker's header, for change-header
+
+    def refresh(self, force: bool = False):
+        """Ask the accounts whose answer is old (all of them with force)."""
+        if not self.on:
+            return
+        now = int(time.time())
+        for t in ("claude", "codex"):
+            for r in self.ctx.roots(t):
+                key = f"{t}|{r.path}"
+                if key in self.pending:
+                    continue
+                old = self.cache.get(key)
+                if (not force and isinstance(old, dict)
+                        and now - max(_as_int(old.get("at")), _as_int(old.get("tried"))) < LIMITS_TTL):
+                    continue
+                exe = tool_path(t)
+                if not exe or not os.path.isdir(r.path):
+                    continue
+                self.pending.add(key)
+                threading.Thread(target=self._ask, args=(t, r.path, exe, key), daemon=True).start()
+
+    def _ask(self, tool: str, path: str, exe: str, key: str):
+        res = fetch_limits(tool, path, exe)
+        now = int(time.time())
+        e = limits_from_fetch(tool, res, now)
+        old = self.cache.get(key)
+        if e["ok"] or not (isinstance(old, dict) and old.get("ok")):
+            e["at"] = now
+            self.cache[key] = e
+        else:   # keep the last good figures
+            old["tried"], old["error"] = now, e["note"]
+        save_limit(key, self.cache[key])
+        self.pending.discard(key)
+        port = self.port
+        if port and self.header:
+            # fzf may still be starting: a few tries
+            for _ in range(10):
+                if self.port != port or fzf_post(port, "change-header:" + self.header()):
+                    break
+                time.sleep(0.3)
+
+
+def account_table(ctx, lim: Limits = None) -> list:
+    """The table above the list: one line per tool and account - the tool
+    (once per group), in multi-account mode the number Ctrl-O offers and the
+    label, the dir, who is logged in there and how far it is into its usage
+    limits. Dirs go first, then the emails, when the lines would not fit."""
+    width = shutil.get_terminal_size((100, 24)).columns - 4
+    now = int(time.time())
+    rows = []
+    for t in ("claude", "codex"):
+        for r in ctx.roots(t):
             qk = f"{t}|{r.label}"
-            if qk not in self.quick:
-                self.quick[qk] = quick_identity(t, r.path)
-            cells[n] = (fmt_cwd(r.path, 28), self.quick[qk] or who_at(t, r.path))
-        dir_w = max(len(c[0]) for c in cells.values())
-        who_w = max(len(c[1]) for c in cells.values())
-        with_dirs = 2 + 6 + 2 + n_w + 1 + lbl_w + 2 + dir_w + 2 + who_w <= width
-        lines = [f"{BOLD}{MAGENTA}Multi-account mode active.{RESET}"]
-        prev = ""
-        for n, t, r in self.entries:
-            d, who = cells[n]
-            tool_txt = f"{t:<6}" if t != prev else " " * 6
-            prev = t
-            line = (f"  {TOOL_COLOR[t]}{tool_txt}{RESET}  {TOOL_COLOR[t]}{BOLD}{n:>{n_w}}{RESET} "
-                    f"{MAGENTA}{acct_label(r.label, r.default):<{lbl_w}}{RESET}")
-            if with_dirs:
-                line += f"  {d:<{dir_w}}"
+            if qk not in ctx.quick:
+                ctx.quick[qk] = quick_identity(t, r.path)
+            n = next((str(k) for k, tt, rr in ctx.entries if tt == t and rr.label == r.label), "") \
+                if ctx.multi_root and r.label else ""
+            lbl = acct_label(r.label, r.default) if ctx.multi_root and r.label else ""
+            key = f"{t}|{r.path}"
+            cell = fmt_limits(lim.cache.get(key), now, key in lim.pending) if lim and lim.on else ""
+            rows.append((t, n, lbl, fmt_cwd(r.path, 28), ctx.quick[qk] or who_at(t, r.path), cell))
+    plain = lambda s: len(re.sub(r"\x1b\[[0-9;]*m", "", s))
+    n_w = max((len(x[1]) for x in rows), default=0)
+    lbl_w = max((len(x[2]) for x in rows), default=0)
+    dir_w = max((len(x[3]) for x in rows), default=0)
+    who_w = max((len(x[4]) for x in rows), default=0)
+    lim_w = max((plain(x[5]) for x in rows), default=0)
+    base = 2 + 6 + (2 + n_w + 1 + lbl_w if ctx.multi_root else 0)
+    lim_part = 2 + lim_w if lim_w else 0
+    with_dirs = base + 2 + dir_w + 2 + who_w + lim_part <= width
+    with_who = with_dirs or base + 2 + who_w + lim_part <= width
+    lines = [f"{BOLD}{MAGENTA}Multi-account mode active.{RESET}"] if ctx.multi_root else []
+    prev = ""
+    for t, n, lbl, d, who, cell in rows:
+        tool_txt = f"{t:<6}" if t != prev else " " * 6
+        prev = t
+        line = f"  {TOOL_COLOR[t]}{tool_txt}{RESET}"
+        if ctx.multi_root:
+            line += f"  {TOOL_COLOR[t]}{BOLD}{n:>{n_w}}{RESET} {MAGENTA}{lbl:<{lbl_w}}{RESET}"
+        if with_dirs:
+            line += f"  {d:<{dir_w}}"
+        if with_who:
             line += f"  {DIM}{who:<{who_w}}{RESET}"
-            lines.append(line)
-        return lines
+        if cell:
+            line += f"  {cell}"
+        lines.append(line)
+    return lines
 
 
 def session_rows(sessions, index, ctx: Ctx, usage: dict = None):
@@ -1295,17 +1657,19 @@ def session_rows(sessions, index, ctx: Ctx, usage: dict = None):
     return rows
 
 
-def picker_hint(ctx: Ctx, upd_note: str = "") -> str:
+def picker_hint(ctx: Ctx, upd_note: str = "", lim: Limits = None) -> str:
     lines = []
     if ">" in upd_note:
         f, t = upd_note.split(">", 1)
         lines.append(f"{BOLD}{GREEN}ccr updated v{f} -> v{t}{RESET}")
-    lines += ctx.legend() if ctx.multi_root else []
+    lines += account_table(ctx, lim)
     keys = [("↑↓", "move"), ("Tab", "mark"), ("Enter", "open"), ("Ctrl-E", "model/effort")]
     if ctx.multi_root:
         keys.append(("Ctrl-O", "open under another account"))
-    keys += [("Ctrl-N", "new"), ("Ctrl-P", "MAP"), ("Ctrl-A", "accounts"), ("Ctrl-K", "usage"), ("Ctrl-J", "details"),
-             ("Ctrl-X", "close"), ("Ctrl-T", "install"), ("Del", "delete"), ("Esc", "cancel")]
+    keys += [("Ctrl-N", "new"), ("Ctrl-P", "MAP"), ("Ctrl-A", "accounts"), ("Ctrl-K", "usage"), ("Ctrl-J", "details")]
+    if lim and lim.on:
+        keys.append(("Ctrl-L", "limits"))
+    keys += [("Ctrl-X", "close"), ("Ctrl-T", "install"), ("Del", "delete"), ("Esc", "cancel")]
     lines += hint_wrapped(keys)
     words = f"{DIM},{RESET} ".join(f"{CYAN}{w}{RESET}" for w in ("run", "cleared", "app"))
     filters = f"{DIM}type to filter — {RESET}{words}{DIM} match as words{RESET}"
@@ -1522,12 +1886,12 @@ def run_account_action(act: dict, dry: bool):
 # the rate-limit meter it saw. Full streaming reads, so only on demand.
 class Usage:
     __slots__ = ("turns", "input", "cache_write", "cache_read", "output", "thinking", "total",
-                 "models", "buckets", "limit_5h", "limit_7d", "reset_5h")
+                 "models", "buckets", "limit_5h", "limit_7d", "reset_5h", "reset_7d")
 
     def __init__(self):
         self.turns = self.input = self.cache_write = self.cache_read = self.output = self.thinking = self.total = 0
         self.models, self.buckets = {}, {}
-        self.limit_5h = self.limit_7d = self.reset_5h = None
+        self.limit_5h = self.limit_7d = self.reset_5h = self.reset_7d = None
 
     def add(self, ts: datetime, model: str, inp: int, cw: int, cr: int, out: int, think: int):
         self.turns += 1
@@ -1592,12 +1956,16 @@ def read_codex_usage(path: Path, since: datetime, u: Usage):
             cached = _num(rest, "cached_input_tokens")
             u.add(ts, model, _num(rest, "input_tokens") - cached, _num(rest, "cache_write_input_tokens"), cached,
                   _num(rest, "output_tokens"), _num(rest, "reasoning_output_tokens"))
-            m = re.search(r'"primary":\{"used_percent":([0-9.]+),"window_minutes":\d+,"resets_at":(\d+)', line)
-            if m:
-                u.limit_5h, u.reset_5h = float(m.group(1)), int(m.group(2))
-            m = re.search(r'"secondary":\{"used_percent":([0-9.]+)', line)
-            if m:
-                u.limit_7d = float(m.group(1))
+            # The meter: each window by its length, not its slot - on a plan
+            # without the 5-hour window (prolite) the week is "primary".
+            for slot in ("primary", "secondary"):
+                m = re.search(r'"' + slot + r'":\{"used_percent":([0-9.]+),"window_minutes":(\d+),"resets_at":(\d+)', line)
+                if not m:
+                    continue
+                if int(m.group(2)) <= 360:
+                    u.limit_5h, u.reset_5h = float(m.group(1)), int(m.group(3))
+                else:
+                    u.limit_7d, u.reset_7d = float(m.group(1)), int(m.group(3))
 
 
 def session_usage(s: Session, since: datetime):
@@ -1670,10 +2038,13 @@ def usage_page(s: Session, u, hours: int, since: datetime, all_: list = None):
         print(f"  {t:%H:%M}  {YELLOW}{bar}{RESET} {fmt_tokens(u.buckets[b])}")
     print()
     if s.tool == "codex":
-        if u.limit_5h is not None:
-            reset = f" (resets {datetime.fromtimestamp(u.reset_5h, tz=timezone.utc).astimezone():%H:%M})" if u.reset_5h else ""
-            seven = f"{u.limit_7d:.0f}%" if u.limit_7d is not None else "?"
-            print(f"  rate limit seen at the last turn: 5 h {u.limit_5h:.0f}%{reset} · 7 d {seven}")
+        if u.limit_5h is not None or u.limit_7d is not None:
+            parts = []
+            if u.limit_5h is not None:
+                parts.append(f"5 h {u.limit_5h:.0f}%" + (f" (resets {datetime.fromtimestamp(u.reset_5h):%H:%M})" if u.reset_5h else ""))
+            if u.limit_7d is not None:
+                parts.append(f"7 d {u.limit_7d:.0f}%" + (f" (resets {fmt_reset(u.reset_7d, 0)})" if u.reset_7d else ""))
+            print(f"  rate limit seen at the last turn: {' · '.join(parts)}")
         else:
             print(f"  {DIM}rate limit: not recorded in this rollout{RESET}")
     else:
@@ -5006,18 +5377,31 @@ def main():
 
         if usage_on:
             usage_fill()
+        # Account limits (the table above the list): the stale accounts are
+        # asked in the background; with fzf 0.45+ an answer rewrites the
+        # header of the fzf on screen, else it shows at the next redraw.
+        lim = Limits(ctx)
+        lim.refresh()
         restart = False
         while not restart:
             index = {}
             rows = session_rows(sessions, index, ctx, usage_of if usage_on else None)
-            res = run_fzf(rows, picker_hint(ctx, upd_note), query=query,
+            note = upd_note
+            lim.header = lambda: picker_hint(ctx, note, lim)
+            lim.port = free_port() if lim.pending and fzf_version() >= (0, 45) else 0
+            res = run_fzf(rows, picker_hint(ctx, upd_note, lim), query=query,
                           expect=["del", "ctrl-n", "ctrl-p", "ctrl-a", "ctrl-o", "ctrl-k", "ctrl-j", "ctrl-x", "ctrl-e",
-                                  "ctrl-t"])
+                                  "ctrl-t", "ctrl-l"], listen=lim.port)
+            lim.port = 0
             if res is None:
                 print("ccr: cancelled.")
                 return
             key, ids = res
             picked = [index[i] for i in ids if i in index]
+            if key == "ctrl-l":
+                # Ask every account for its usage limits again.
+                lim.refresh(force=True)
+                continue
             if key == "ctrl-k":
                 # The usage column on/off. Turning it on reads the transcripts
                 # written inside the window (once per picker).
