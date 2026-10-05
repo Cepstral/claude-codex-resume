@@ -35,7 +35,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.73"
+VERSION = "0.74"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -2535,6 +2535,35 @@ def account_missing(tool: str, root) -> str:
     return f"ccr: {tool} account '{root.label}' is not on this PC - {root.path} does not exist. Fix: {fix}"
 
 
+def add_user_path(d: str, key_path: str = "Environment") -> bool:
+    """Windows: a folder on the User PATH, so new windows and tabs find what is
+    in it. Written to the registry as it is (an expandable string keeps its
+    %VARS%), then Windows is told the environment changed. True when it was
+    added. Claude Code's installer puts claude.exe in ~/.local/bin and only
+    says so when that folder is not on the PATH (codex's installer adds its
+    own folder)."""
+    if os.name != "nt":
+        return False
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_READ | winreg.KEY_WRITE) as k:
+            try:
+                raw, kind = winreg.QueryValueEx(k, "Path")
+            except FileNotFoundError:
+                raw, kind = "", winreg.REG_EXPAND_SZ
+            raw = str(raw or "")
+            have = [os.path.expandvars(x).rstrip("\\").lower() for x in raw.split(";") if x]
+            if d.rstrip("\\").lower() in have:
+                return False
+            winreg.SetValueEx(k, "Path", 0, kind, ";".join(x for x in (raw.rstrip(";"), d) if x))
+    except OSError:
+        return False
+    if key_path == "Environment":
+        res = ctypes.c_size_t()
+        ctypes.windll.user32.SendMessageTimeoutW(0xFFFF, 0x1A, 0, "Environment", 2, 5000, ctypes.byref(res))
+    return True
+
+
 def run_install(tool: str, dry: bool) -> bool:
     """Install or update one tool. The installer runs as a child process with
     the tool's data dir set to the default account's (codex keeps its package
@@ -2561,6 +2590,9 @@ def run_install(tool: str, dry: bool) -> bool:
     except OSError as e:
         print(f"ccr: cannot run {argv[0]}: {e}", file=sys.stderr)
         return False
+    lb = HOME / ".local" / "bin"
+    if tool == "claude" and os.name == "nt" and (lb / "claude.exe").is_file() and add_user_path(str(lb)):
+        print(f"{YELLOW}ccr: {lb} added to your PATH (claude's installer does not add it) - new windows find claude{RESET}")
     after = tool_install(tool)
     if after["path"]:
         was = f" (was {before['version']})" if before["version"] and after["version"] and before["version"] != after["version"] else ""

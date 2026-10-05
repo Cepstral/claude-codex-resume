@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.73'
+$script:CcrVersion = '0.74'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -2168,6 +2168,31 @@ function Get-CcrAccountMissing([string]$Tool, [object]$Root) {
 # process - both call `exit` and Set-StrictMode, which would end or change
 # this shell - with the tool's data dir set to the default account's, since
 # codex keeps its package there.
+# Windows: a folder on the User PATH, so new windows and tabs find what is in
+# it. Written to the registry as it is (an expandable string keeps its
+# %VARS%); a no-op variable change then tells Windows the environment
+# changed. $true when it was added. Claude Code's installer puts claude.exe in
+# ~\.local\bin and only says so when that folder is not on the PATH (codex's
+# installer adds its own folder).
+function Add-CcrUserPath([string]$Dir, [string]$KeyPath = 'Environment') {
+    if (-not $IsWindows) { return $false }
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($KeyPath, $true)
+    if (-not $key) { return $false }
+    try {
+        $raw = "$($key.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames))"
+        $have = @($raw -split ';' | Where-Object { $_ } | ForEach-Object { [Environment]::ExpandEnvironmentVariables($_).TrimEnd('\') })
+        if ($have -contains $Dir.TrimEnd('\')) { return $false }
+        $kind = if ($key.GetValueNames() -contains 'Path') { $key.GetValueKind('Path') } else { [Microsoft.Win32.RegistryValueKind]::ExpandString }
+        $key.SetValue('Path', ((@($raw.TrimEnd(';'), $Dir) | Where-Object { $_ }) -join ';'), $kind)
+    }
+    finally { $key.Close() }
+    if ($KeyPath -eq 'Environment') {
+        [Environment]::SetEnvironmentVariable('CCR_PATH_PING', '1', 'User')
+        [Environment]::SetEnvironmentVariable('CCR_PATH_PING', $null, 'User')
+    }
+    $true
+}
+
 function Invoke-CcrInstall {
     [CmdletBinding(SupportsShouldProcess)]
     param([Parameter(Mandatory)][ValidateSet('claude', 'codex')][string]$Tool)
@@ -2203,6 +2228,10 @@ function Invoke-CcrInstall {
     }
     catch { Write-Warning "ccr: $($plan.Verb) $Tool failed: $_" }
     finally { $env:Path = $prevPath; [Environment]::SetEnvironmentVariable($var, $prev) }
+    $lb = Join-Path $HOME '.local\bin'
+    if ($Tool -eq 'claude' -and (Test-Path -LiteralPath (Join-Path $lb 'claude.exe')) -and (Add-CcrUserPath $lb)) {
+        Write-Host "ccr: $lb added to your PATH (claude's installer does not add it) - new windows find claude" -ForegroundColor Yellow
+    }
     Update-CcrSessionPath
     $after = Get-CcrToolInstall -Tool $Tool
     if ($after.Path) {

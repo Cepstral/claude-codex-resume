@@ -200,6 +200,14 @@ pane, which shows the full title and folder of the highlighted row.
   - `$null | ForEach-Object { }` runs the block once: filter with
     `Where-Object { $_ }` before turning a list that may be absent into
     strings.
+- Claude Code's Windows installer (`claude.exe install`) puts claude.exe in
+  `~\.local\bin` and only prints a note when that folder is not on the PATH;
+  codex's installer adds its own folder. So since v0.74 ccr's install adds
+  `~\.local\bin` to the User PATH (Add-CcrUserPath / add_user_path: the
+  registry value keeps its kind, REG_EXPAND_SZ and its %VARS%, and Windows is
+  told the environment changed - never [Environment]::SetEnvironmentVariable
+  on PATH, which writes REG_SZ). Found on a new PC where `codex` ran and
+  `claude` was "not recognized".
 - Codex names (v0.73): codex 0.159 names every thread by itself and keeps
   the name (that one or a /rename) only in its local catalog and
   session_index.jsonl, never in the rollout. With `sessions` linked into
