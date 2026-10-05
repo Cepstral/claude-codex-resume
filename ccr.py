@@ -35,7 +35,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.72"
+VERSION = "0.73"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -968,6 +968,76 @@ def codex_running() -> dict:
     return m
 
 
+def codex_prompt(text: str) -> str:
+    """The user's own words in a codex user message, '' when codex wrote it:
+    the <environment_context> wrapper and other <tag> blocks, the project
+    instructions (codex 0.159: "# AGENTS.md instructions for <dir>"). The IDE
+    extension wraps the request itself: "# Context from my IDE setup: ... ##
+    My request for Codex: <the request>"."""
+    if text.startswith("<") or re.match(r"\s*#\s*AGENTS\.md instructions\b", text):
+        return ""
+    if re.match(r"\s*#\s*Context from my IDE setup\b", text):
+        m = re.search(r"##\s*My request for Codex:?\s*([\s\S]*)$", text, re.I)
+        return m.group(1).strip() if m else ""
+    return text
+
+
+def ts_key(raw: str) -> str:
+    """An ISO time as codex writes it ("2026-09-22T08:28:53.704516Z") -> a key
+    that sorts by time whatever the digits of the fraction; '' when unreadable."""
+    m = re.match(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?", raw or "")
+    return f"{m.group(1)}.{(m.group(2) or '').ljust(6, '0')[:6]}" if m else ""
+
+
+def read_codex_names(paths) -> dict:
+    """Names in session_index.jsonl-style files: id -> {name, ts, raw}. In one
+    file the last line of an id wins (codex's rule); across files the newest."""
+    out = {}
+    for p in paths:
+        one = {}
+        try:
+            with open(p, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.rstrip("\r\n")
+                    if not line:
+                        continue
+                    try:
+                        o = json.loads(line)
+                    except ValueError:
+                        continue
+                    if not isinstance(o, dict) or not o.get("id") or not str(o.get("thread_name") or ""):
+                        continue
+                    m = re.search(r'"updated_at"\s*:\s*"([^"]*)"', line)
+                    raw = m.group(1) if m else ""
+                    one[str(o["id"])] = {"name": str(o["thread_name"]), "ts": ts_key(raw), "raw": raw}
+        except OSError:
+            continue
+        for k, v in one.items():
+            if k not in out or v["ts"] > out[k]["ts"]:
+                out[k] = v
+    return out
+
+
+def codex_shared_names_path(root_path: str):
+    """Codex keeps a conversation's name - the /rename one, or the one it gives
+    by itself - in its local catalog and session_index.jsonl, never in the
+    rollout. With the sessions folder linked into a synced folder (OneDrive), a
+    name given on one computer would never reach the other: ccr carries it in
+    <synced folder>.names.jsonl, next to the folder, never inside codex's
+    tree. None when the sessions folder is not a link."""
+    s = Path(root_path) / "sessions"
+    try:
+        t = os.readlink(s)
+    except (OSError, ValueError, NotImplementedError, AttributeError):
+        return None
+    t = re.sub(r"^\\\\\?\\", "", str(t))
+    if not t:
+        return None
+    if not os.path.isabs(t):
+        t = os.path.join(root_path, t)
+    return t.rstrip("\\/") + ".names.jsonl"
+
+
 def codex_title_map(root_path: str) -> dict:
     """Best-effort curated titles: codex catalog (state_N.sqlite: /rename
     name, or a title distinct from the first message) plus the legacy
@@ -998,20 +1068,41 @@ def codex_title_map(root_path: str) -> dict:
     except Exception as e:
         if os.environ.get("CCR_DEBUG"):
             print(f"ccr: codex title overlay unavailable: {e}", file=sys.stderr)
-    try:
-        idx = {}
-        with open(root / "session_index.jsonl", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                try:
-                    o = json.loads(line)
-                except Exception:
-                    continue
-                if o.get("id") and o.get("thread_name"):
-                    idx[o["id"]] = o["thread_name"]  # last wins
-        for k, v in idx.items():
-            m.setdefault(k, v)
-    except OSError:
-        pass
+    local_idx = root / "session_index.jsonl"
+    idx = read_codex_names([local_idx])
+    for k, v in idx.items():
+        m.setdefault(k, v["name"])
+
+    # Names from the other computer (codex_shared_names_path): the newest name
+    # of a conversation wins, wherever it was given. This computer's names go
+    # to the shared file; a newer one from there also goes into the local
+    # session_index.jsonl, which codex honours too.
+    shared = codex_shared_names_path(root_path)
+    if shared:
+        try:
+            sp = Path(shared)
+            leaf = sp.stem
+            remote = read_codex_names(sorted(str(x) for x in sp.parent.glob(leaf + "*.jsonl") if x.is_file()))
+            mine = {k: (idx[k] if k in idx and idx[k]["name"] == v else {"ts": "", "raw": ""}) for k, v in m.items()}
+            out = [json.dumps({"id": k, "thread_name": v, "updated_at": mine[k]["raw"]}, ensure_ascii=False,
+                              separators=(",", ":"))
+                   for k, v in m.items() if k not in remote or mine[k]["ts"] > remote[k]["ts"]]
+            inn = []
+            for k, r in remote.items():
+                if k not in mine or r["ts"] > mine[k]["ts"]:
+                    m[k] = r["name"]
+                    if r["raw"]:   # into codex's own index only with a time, as codex writes it
+                            inn.append(json.dumps({"id": k, "thread_name": r["name"], "updated_at": r["raw"]},
+                                              ensure_ascii=False, separators=(",", ":")))
+            if out:
+                with open(sp, "a", encoding="utf-8", newline="\n") as f:
+                    f.write("\n".join(out) + "\n")
+            if inn:
+                with open(local_idx, "a", encoding="utf-8", newline="\n") as f:
+                    f.write("\n".join(inn) + "\n")
+        except OSError as e:
+            if os.environ.get("CCR_DEBUG"):
+                print(f"ccr: codex names not shared: {e}", file=sys.stderr)
     return m
 
 
@@ -1074,8 +1165,9 @@ def codex_sessions(root: Root = None) -> list:
                             if p.get("type") == "message" and p.get("role") == "user":
                                 for c in p.get("content") or []:
                                     if isinstance(c, dict) and c.get("text"):
-                                        if not c["text"].startswith("<"):
-                                            title = clean_title(c["text"])
+                                        own = codex_prompt(c["text"])
+                                        if own:
+                                            title = clean_title(own)
                                         break
                                 if title:
                                     break

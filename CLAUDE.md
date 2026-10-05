@@ -200,6 +200,18 @@ pane, which shows the full title and folder of the highlighted row.
   - `$null | ForEach-Object { }` runs the block once: filter with
     `Where-Object { $_ }` before turning a list that may be absent into
     strings.
+- Codex names (v0.73): codex 0.159 names every thread by itself and keeps
+  the name (that one or a /rename) only in its local catalog and
+  session_index.jsonl, never in the rollout. With `sessions` linked into
+  OneDrive the rollouts travel and the names do not: ccr carries them in
+  `<link target>.names.jsonl` beside the linked folder (newest wins; a newer
+  one is also appended to the local session_index.jsonl, only with a time -
+  never a line with an empty updated_at in codex's own file). Times compare
+  through ConvertTo-CcrTsKey / ts_key (fractions of 6 or 7 digits). The
+  fallback title skips codex's own user messages: `<...>` blocks and
+  `# AGENTS.md instructions for <dir>`; the IDE extension's `# Context from
+  my IDE setup` block yields the request after `## My request for Codex:`
+  (Get-CcrCodexPrompt / codex_prompt).
 - Usage limits (v0.72, the account table above the picker): claude
   `-p "/usage"` is a local command (0 turns, $0) and prints text lines,
   parsed by ConvertFrom-CcrClaudeLimits / parse_claude_limits; codex

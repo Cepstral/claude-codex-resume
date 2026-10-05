@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.72'
+$script:CcrVersion = '0.73'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -815,6 +815,68 @@ public static class CcrSqlite {
 '@ -replace '__CCRSQLITELIB__', $lib)
 }
 
+# The user's own words in a codex user message, '' when codex wrote it: the
+# <environment_context> wrapper and other <tag> blocks, the project
+# instructions (codex 0.159: "# AGENTS.md instructions for <dir>"). The IDE
+# extension wraps the request itself: "# Context from my IDE setup: ... ##
+# My request for Codex: <the request>".
+function Get-CcrCodexPrompt([string]$Text) {
+    if ($Text.StartsWith('<') -or $Text -match '^\s*#\s*AGENTS\.md instructions\b') { return '' }
+    if ($Text -match '^\s*#\s*Context from my IDE setup\b') {
+        $m = [regex]::Match($Text, '##\s*My request for Codex:?\s*([\s\S]*)$', 'IgnoreCase')
+        return $(if ($m.Success) { $m.Groups[1].Value.Trim() } else { '' })
+    }
+    $Text
+}
+
+# An ISO time as codex writes it ("2026-09-22T08:28:53.704516Z") -> a key
+# that sorts by time whatever the digits of the fraction; '' when unreadable.
+function ConvertTo-CcrTsKey([string]$Raw) {
+    $m = [regex]::Match("$Raw", '^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?')
+    if (-not $m.Success) { return '' }
+    "$($m.Groups[1].Value).$($m.Groups[2].Value.PadRight(6, '0').Substring(0, 6))"
+}
+
+# Names in session_index.jsonl-style files: id -> @{ Name; Ts; Raw }. In one
+# file the last line of an id wins (codex's rule); across files the newest.
+function Read-CcrCodexNameFile([string[]]$Paths) {
+    $all = @{}
+    foreach ($p in @($Paths)) {
+        if (-not $p -or -not (Test-Path -LiteralPath $p)) { continue }
+        $one = @{}
+        try {
+            foreach ($line in (Read-CcrHeadLines -Path $p)) {
+                if (-not $line) { continue }
+                try { $o = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+                if (-not $o.id -or -not "$($o.thread_name)") { continue }
+                # the time as written (ConvertFrom-Json would turn it into a local DateTime)
+                $raw = [regex]::Match($line, '"updated_at"\s*:\s*"([^"]*)"').Groups[1].Value
+                $one["$($o.id)"] = @{ Name = "$($o.thread_name)"; Ts = (ConvertTo-CcrTsKey $raw); Raw = $raw }
+            }
+        }
+        catch { continue }
+        foreach ($k in $one.Keys) {
+            if (-not $all.ContainsKey($k) -or [string]::CompareOrdinal($one[$k].Ts, $all[$k].Ts) -gt 0) { $all[$k] = $one[$k] }
+        }
+    }
+    $all
+}
+
+# Codex keeps a conversation's name - the /rename one, or the one it gives by
+# itself - in its local catalog and session_index.jsonl, never in the
+# rollout. With the sessions folder linked into a synced folder (OneDrive), a
+# name given on one PC would never reach the other: ccr carries it in
+# <synced folder>.names.jsonl, next to the folder, never inside codex's
+# tree. $null when the sessions folder is not a link.
+function Get-CcrCodexSharedNamesPath([string]$RootPath) {
+    try { $it = Get-Item -LiteralPath (Join-Path $RootPath 'sessions') -Force -ErrorAction Stop } catch { return $null }
+    if (-not $it.LinkType) { return $null }
+    $t = "$(@($it.Target)[0])" -replace '^\\\\\?\\', ''
+    if (-not $t) { return $null }
+    if (-not [IO.Path]::IsPathRooted($t)) { $t = Join-Path $RootPath $t }
+    $t.TrimEnd('\', '/') + '.names.jsonl'
+}
+
 function Get-CcrCodexTitleMap {
     param([string]$RootPath = (Get-CcrCodexRoot))
     $map = @{}
@@ -867,16 +929,43 @@ function Get-CcrCodexTitleMap {
     # Historical rename names: codex <= 0.14x wrote them to session_index.jsonl
     # and current versions still honor them, but never migrated them into the
     # catalog. Catalog values win; the index fills the gaps (last entry per id).
-    try {
-        $idx = @{}
-        foreach ($line in (Read-CcrHeadLines -Path (Join-Path $RootPath 'session_index.jsonl'))) {
-            if (-not $line) { continue }
-            try { $o = $line | ConvertFrom-Json } catch { continue }
-            if ($o.id -and $o.thread_name) { $idx[$o.id] = $o.thread_name }
+    $localIdx = Join-Path $RootPath 'session_index.jsonl'
+    $idx = Read-CcrCodexNameFile $localIdx
+    foreach ($k in $idx.Keys) { if (-not $map.ContainsKey($k)) { $map[$k] = $idx[$k].Name } }
+
+    # Names from the other PC (Get-CcrCodexSharedNamesPath): the newest name
+    # of a conversation wins, wherever it was given. This PC's names go to the
+    # shared file; a newer one from there also goes into the local
+    # session_index.jsonl, which codex honours too.
+    $shared = Get-CcrCodexSharedNamesPath $RootPath
+    if ($shared) {
+        try {
+            $leaf = [IO.Path]::GetFileNameWithoutExtension($shared)
+            $files = @(Get-ChildItem -LiteralPath (Split-Path -Parent $shared) -Filter "$leaf*.jsonl" -File -ErrorAction SilentlyContinue | ForEach-Object FullName)
+            $remote = Read-CcrCodexNameFile $files
+            $mine = @{}   # id -> the time of this PC's name ('' = catalog only, no time)
+            foreach ($k in $map.Keys) { $mine[$k] = if ($idx.ContainsKey($k) -and $idx[$k].Name -eq $map[$k]) { $idx[$k] } else { @{ Ts = ''; Raw = '' } } }
+            $out = [System.Text.StringBuilder]::new()
+            foreach ($k in @($map.Keys)) {
+                if (-not $remote.ContainsKey($k) -or [string]::CompareOrdinal($mine[$k].Ts, $remote[$k].Ts) -gt 0) {
+                    [void]$out.Append(([ordered]@{ id = $k; thread_name = $map[$k]; updated_at = $mine[$k].Raw } | ConvertTo-Json -Compress)).Append("`n")
+                }
+            }
+            $in = [System.Text.StringBuilder]::new()
+            foreach ($k in $remote.Keys) {
+                $have = if ($mine.ContainsKey($k)) { $mine[$k].Ts } else { $null }
+                if ($null -eq $have -or [string]::CompareOrdinal($remote[$k].Ts, $have) -gt 0) {
+                    $map[$k] = $remote[$k].Name
+                    # into codex's own index only with a time, as codex writes it
+                    if ($remote[$k].Raw) { [void]$in.Append(([ordered]@{ id = $k; thread_name = $remote[$k].Name; updated_at = $remote[$k].Raw } | ConvertTo-Json -Compress)).Append("`n") }
+                }
+            }
+            $utf8 = [Text.UTF8Encoding]::new($false)
+            if ($out.Length) { [IO.File]::AppendAllText($shared, $out.ToString(), $utf8) }
+            if ($in.Length) { [IO.File]::AppendAllText($localIdx, $in.ToString(), $utf8) }
         }
-        foreach ($k in $idx.Keys) { if (-not $map.ContainsKey($k)) { $map[$k] = $idx[$k] } }
+        catch { Write-Verbose "ccr: codex names not shared: $_" }
     }
-    catch { }
     $map
 }
 
@@ -924,14 +1013,15 @@ function Get-CcrCodexSession {
                         catch { }
                     }
                     elseif ($line.Contains('"response_item"') -and $line.Contains('"role":"user"')) {
-                        # First real user prompt = title; the first user message is an
-                        # <environment_context> wrapper, so skip anything starting with '<'.
+                        # First real user prompt = title; codex's own user messages
+                        # (the environment wrapper, AGENTS.md) are skipped.
                         try {
                             $p = ($line | ConvertFrom-Json).payload
                             if ($p.type -eq 'message' -and $p.role -eq 'user') {
                                 foreach ($c in @($p.content)) {
                                     if ($c.text) {
-                                        if (-not $c.text.StartsWith('<')) { $title = ConvertTo-CcrTitle $c.text }
+                                        $own = Get-CcrCodexPrompt $c.text
+                                        if ($own) { $title = ConvertTo-CcrTitle $own }
                                         break
                                     }
                                 }

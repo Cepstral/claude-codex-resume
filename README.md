@@ -137,7 +137,9 @@ No database, no index: the picker enumerates the same on-disk session files the 
 
 ### A note on Codex titles
 
-Current Codex versions do **not** auto-generate conversation titles — what its own picker shows *is* the first user message. If you `/rename` a thread inside Codex, ccr picks the name up: it reads a private snapshot of Codex's catalog (`state_N.sqlite`, `threads.name` / distinct `title`) via Windows' built-in `winsqlite3.dll`, plus the legacy `session_index.jsonl` where older Codex versions stored thread names, and overlays those on the file-derived title — falling back silently whenever neither is readable. Renaming the Windows Terminal *tab* is invisible to Codex and to ccr; rename the thread inside Codex.
+A Codex conversation's name — the one `/rename` gives it, or the one Codex 0.159 gives by itself — lives in Codex's local catalog (`state_N.sqlite`, `threads.name` / distinct `title`) and in `session_index.jsonl`. ccr reads both (a private snapshot of the catalog via Windows' built-in `winsqlite3.dll`) and shows the name; without one, the conversation's first message of yours — never the text Codex puts there itself (the environment block, the `# AGENTS.md instructions` block; from the IDE extension, the request inside its `# Context from my IDE setup` block). Renaming the Windows Terminal *tab* is invisible to Codex and to ccr; rename the thread inside Codex.
+
+**On several PCs.** The name is never in the conversation's file, so with Codex's `sessions` folder synced between PCs (a link into OneDrive, say) a name given on one PC would not reach the other, which would show the first message instead. When `sessions` is a link, ccr keeps `<synced folder>.names.jsonl` next to it (`OneDrive\.codex-sessions\work.names.jsonl` for `...\work`), in the format of `session_index.jsonl`: every PC's ccr adds the names it knows, the newest name of a conversation wins wherever it was given, and a newer one from the other PC also goes into the local `session_index.jsonl`, so Codex itself shows it too. A PC passes its names on when ccr runs there.
 
 ## macOS / Linux — native version
 
