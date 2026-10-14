@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.74'
+$script:CcrVersion = '0.75'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -977,12 +977,16 @@ function Get-CcrCodexSession {
     )
     if (-not $Root) { $Root = [pscustomobject]@{ Label = ''; Path = (Get-CcrCodexRoot); Default = $true } }
     $sessRoot = Join-Path $Root.Path 'sessions'
-    if (-not (Test-Path -LiteralPath $sessRoot)) { return @() }
+    # codex archive moves a rollout here (see Restore-CcrCodexArchived)
+    $archRoot = Join-Path $Root.Path 'archived_sessions'
+    if (-not (Test-Path -LiteralPath $sessRoot) -and -not (Test-Path -LiteralPath $archRoot)) { return @() }
     $hist = $null   # <root>\history.jsonl, loaded lazily only if a fallback is needed
     $running = Get-CcrCodexRunningMap
     $curated = Get-CcrCodexTitleMap -RootPath $Root.Path
 
-    $files = Get-ChildItem -LiteralPath $sessRoot -Recurse -Filter 'rollout-*.jsonl' -File -ErrorAction SilentlyContinue
+    $files = @(Get-ChildItem -LiteralPath $sessRoot -Recurse -Filter 'rollout-*.jsonl' -File -ErrorAction SilentlyContinue) +
+    @(Get-ChildItem -LiteralPath $archRoot -Recurse -Filter 'rollout-*.jsonl' -File -ErrorAction SilentlyContinue)
+    $archPrefix = $archRoot.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
     $out = foreach ($file in $files) {
         $m = [regex]::Match($file.Name, '-([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.jsonl$')
         if (-not $m.Success) { continue }
@@ -1065,6 +1069,7 @@ function Get-CcrCodexSession {
             Source       = $file.FullName
             Root         = $Root.Label
             RootPath     = $Root.Path
+            Archived     = $file.FullName.StartsWith($archPrefix, [StringComparison]::OrdinalIgnoreCase)
         }
     }
     @($out)
@@ -1415,6 +1420,24 @@ function Show-CcrElsewhereConfirm {
 # Re-home a conversation: move its files into another account's data dir.
 # Transcripts are not account-bound and both tools resume a moved file (a
 # codex home indexes it on first resume). Returns the new transcript path.
+# Codex refuses to resume an archived conversation ("session <id> is
+# archived. Run `codex unarchive <id>` to unarchive it first"), and `codex
+# archive` moves its rollout out of sessions\ into archived_sessions\. ccr
+# lists those too and unarchives one, under its own account, before opening or
+# moving it; the rollout goes back to sessions\YYYY\MM\DD and Source follows.
+function Restore-CcrCodexArchived([object]$Session) {
+    $exe = "$(@(Get-Command codex -CommandType Application -ErrorAction SilentlyContinue)[0].Source)"
+    if (-not $exe) { throw 'codex is not installed here' }
+    $prev = [Environment]::GetEnvironmentVariable('CODEX_HOME')
+    [Environment]::SetEnvironmentVariable('CODEX_HOME', $Session.RootPath)
+    try { $out = @(& $exe unarchive $Session.SessionId 2>&1 | ForEach-Object { "$_" }); $code = $LASTEXITCODE }
+    finally { [Environment]::SetEnvironmentVariable('CODEX_HOME', $prev) }
+    if ($code) { throw "$(@($out | Where-Object { $_.Trim() })[-1])" }
+    $f = @(Get-ChildItem -LiteralPath (Join-Path $Session.RootPath 'sessions') -Recurse -Filter "*$($Session.SessionId).jsonl" -File -ErrorAction SilentlyContinue)[0]
+    if ($f) { $Session.Source = $f.FullName }
+    $Session.Archived = $false
+}
+
 function Move-CcrSessionToRoot {
     param([Parameter(Mandatory)][object]$Session, [Parameter(Mandatory)][object]$TargetRoot)
     $src = Get-Item -LiteralPath $Session.Source
@@ -4805,7 +4828,7 @@ function Select-CcrSession {
             # --- refilter (recomputed every pass; cheap at <= 500 rows) ---
             $view = if ($filter) {
                 @($Sessions | Where-Object {
-                        ("$($_.Tool) $($_.Root) $($_.Title) $($_.Cwd)$(if ($_.Cleared) { ' cleared' })$(if ($_.Running) { ' run' })$(if ($_.Running -and $_.RunKind -eq 'bg') { ' bg' })$(if ($_.RunningOn) { " elsewhere @$($_.RunningOn)" })").IndexOf($filter, [StringComparison]::OrdinalIgnoreCase) -ge 0
+                        ("$($_.Tool) $($_.Root) $($_.Title) $($_.Cwd)$(if ($_.Cleared) { ' cleared' })$(if ($_.Archived) { ' archived' })$(if ($_.Running) { ' run' })$(if ($_.Running -and $_.RunKind -eq 'bg') { ' bg' })$(if ($_.RunningOn) { " elsewhere @$($_.RunningOn)" })").IndexOf($filter, [StringComparison]::OrdinalIgnoreCase) -ge 0
                     })
             }
             else { $Sessions }
@@ -4865,7 +4888,7 @@ function Select-CcrSession {
                 ($loop + $loop).Substring($scroll % $loop.Length, $width)
             }
             function Test-CcrRowOverflow([object]$s) {
-                $room = $titleW - $(if ($s.Cleared -and $titleW -ge 20) { 10 } else { 0 })
+                $room = $titleW - $(if ($titleW -ge 20) { $(if ($s.Cleared) { 10 } else { 0 }) + $(if ($s.Archived) { 11 } else { 0 }) } else { 0 })
                 ($s.Title.Length -gt $room) -or ((Format-CcrCwd $s.Cwd 100000).Length -gt $cwdW)
             }
             function Format-CcrPickerRow([object]$s, [int]$scroll) {
@@ -4892,10 +4915,16 @@ function Select-CcrSession {
                 }
                 else { '' }
                 # "(cleared)" in yellow after the title when a /clear replaced
-                # this conversation; the title is shortened to make room.
-                $suffix = if ($s.Cleared -and $titleW -ge 20) { ' (cleared)' } else { '' }
+                # this conversation, "(archived)" dimmed for a codex one that
+                # `codex archive` put away (opening it unarchives it); the
+                # title is shortened to make room.
+                $suffix = ''; $suffixTxt = ''
+                if ($titleW -ge 20) {
+                    if ($s.Cleared) { $suffix += ' (cleared)'; $suffixTxt += " `e[33m(cleared)`e[39m" }
+                    if ($s.Archived) { $suffix += ' (archived)'; $suffixTxt += " `e[2m(archived)`e[22m" }
+                }
                 $titleTxt = Get-CcrCell $s.Title ($titleW - $suffix.Length) $scroll
-                if ($suffix) { $titleTxt += " `e[33m(cleared)`e[39m" }
+                if ($suffix) { $titleTxt += $suffixTxt }
                 # Static: the "…\last\two" shortening; rotating: the whole path.
                 $cwdTxt = if ($scroll -ge 0) { Get-CcrCell (Format-CcrCwd $s.Cwd 100000) $cwdW $scroll } else { (Format-CcrCwd $s.Cwd $cwdW).PadRight($cwdW) }
                 # Account column (multi-root only): the config dir this claude
@@ -5935,6 +5964,12 @@ function Resume-CcSessions {
     $what = ($launch | ForEach-Object { "$($_.Tool):$($_.Title)$(if ($_.MoveTo) { " -> account $($_.MoveTo.Label)" })" }) -join ', '
     $go = $PSCmdlet.ShouldProcess($what, "open as terminal tabs$(if ($moves.Count) { ", re-homing $($moves.Count)" })")
     if ($go) {
+        # Archived codex conversations first: codex will not resume (or ccr
+        # move) one that is still in archived_sessions.
+        foreach ($l in @($launch | Where-Object { $_.Session.PSObject.Properties['Archived'] -and $_.Session.Archived })) {
+            try { Restore-CcrCodexArchived $l.Session; Write-Host "ccr: unarchived '$($l.Title)'" }
+            catch { Write-Warning "ccr: could not unarchive '$($l.Title)': $_" }
+        }
         # Re-home first, so the resume finds the transcript in its new dir. A
         # failed move leaves the transcript where it was, so the launch falls
         # back to the source account instead of resuming in a dir without it.

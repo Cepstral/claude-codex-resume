@@ -35,7 +35,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.74"
+VERSION = "0.75"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -262,6 +262,8 @@ def user_text(obj):
 class Session:
     __slots__ = ("tool", "id", "title", "cwd", "last", "running", "pid", "source",
                  "started_at", "started_by_clear", "head_bridge", "tail_bridge", "cleared",
+                 # codex: put away with `codex archive` (in archived_sessions/)
+                 "archived",
                  "origin", "root", "root_path", "target_root",
                  # claude registry: open on another PC (host, "" otherwise), and the
                  # kind ("bg" = a background session) / status / last update of the run
@@ -273,6 +275,7 @@ class Session:
         for k in self.__slots__:
             setattr(self, k, kw.get(k))
         self.cleared = bool(self.cleared)
+        self.archived = bool(self.archived)
         self.origin = self.origin or "cli"
         self.root = self.root or ""
         self.running_on = self.running_on or ""
@@ -692,6 +695,27 @@ def disable_multi_account():
     else:
         CONFIG_PATH.unlink(missing_ok=True)
     print(f"{GREEN}ccr: multi-account mode is off - claude and codex are back to their single default dirs.{RESET}")
+
+
+def unarchive_codex(s: Session) -> None:
+    """Codex refuses to resume an archived conversation ("session <id> is
+    archived. Run `codex unarchive <id>` to unarchive it first"), and `codex
+    archive` moves its rollout out of sessions/ into archived_sessions/. ccr
+    lists those too and unarchives one, under its own account, before opening
+    or moving it; the rollout goes back to sessions/YYYY/MM/DD and s.source
+    follows."""
+    exe = tool_path("codex")
+    if not exe:
+        raise RuntimeError("codex is not installed here")
+    r = subprocess.run([exe, "unarchive", s.id], capture_output=True, text=True, errors="replace",
+                       env=tool_env("codex", s.root_path), stdin=subprocess.DEVNULL, timeout=120)
+    if r.returncode != 0:
+        lines = [l for l in ((r.stderr or "") + "\n" + (r.stdout or "")).splitlines() if l.strip()]
+        raise RuntimeError(lines[-1] if lines else f"exit {r.returncode}")
+    hit = next(Path(s.root_path, "sessions").rglob(f"*{s.id}.jsonl"), None)
+    if hit:
+        s.source = str(hit)
+    s.archived = False
 
 
 def move_session_to_root(s: Session, target: Root) -> str:
@@ -1122,7 +1146,9 @@ def codex_origin(originator) -> str:
 def codex_sessions(root: Root = None) -> list:
     root = root or Root("", str(codex_root()), True)
     sess_root = Path(root.path) / "sessions"
-    if not sess_root.is_dir():
+    # codex archive moves a rollout here (see unarchive_codex)
+    arch_root = Path(root.path) / "archived_sessions"
+    if not sess_root.is_dir() and not arch_root.is_dir():
         return []
     running = codex_running()
     curated = codex_title_map(root.path)
@@ -1134,7 +1160,9 @@ def codex_sessions(root: Root = None) -> list:
         return cache["t"]
 
     out = []
-    for f in sess_root.rglob("rollout-*.jsonl"):
+    files = [(f, False) for f in sess_root.rglob("rollout-*.jsonl")]
+    files += [(f, True) for f in arch_root.rglob("rollout-*.jsonl")]
+    for f, archived in files:
         mm = re.search(r"-(" + UUID_IN + r")\.jsonl$", f.name)
         if not mm:
             continue
@@ -1190,7 +1218,7 @@ def codex_sessions(root: Root = None) -> list:
             title = "(session)"
         out.append(Session(tool="codex", id=sid, title=title, cwd=cwd, last=mtime_utc(f),
                            running=sid in running, pid=running.get(sid), source=str(f),
-                           origin=origin, root=root.label, root_path=root.path))
+                           origin=origin, root=root.label, root_path=root.path, archived=archived))
     return out
 
 
@@ -1714,7 +1742,7 @@ def session_rows(sessions, index, ctx: Ctx, usage: dict = None):
         else:
             age = f"{fmt_age(s.last):>6}"
         title = s.title if len(s.title) <= 50 else s.title[:49] + "…"
-        tag = f" {YELLOW}(cleared){RESET}" if s.cleared else ""
+        tag = (f" {YELLOW}(cleared){RESET}" if s.cleared else "") + (f" {DIM}(archived){RESET}" if s.archived else "")
         # Tool column, padded on the plain text (the colors are zero-width).
         app = s.origin == "app"
         tool = f"{color}{s.tool}{RESET}" + (f"{DIM} app{RESET}" if app else "")
@@ -1733,7 +1761,7 @@ def session_rows(sessions, index, ctx: Ctx, usage: dict = None):
             u = usage.get(s.key)
             use = f" {YELLOW}{fmt_tokens(u.total):>6} {fmt_share(u.total, usage_sum):>6}{RESET}" if u else " " * 14
         disp = f"{tool}{acct}{age}{use}  {title}{tag}  {DIM}{fmt_cwd(s.cwd, 50)}{RESET}"
-        extra = ((" cleared" if s.cleared else "") + (" run" if s.running else "")
+        extra = ((" cleared" if s.cleared else "") + (" archived" if s.archived else "") + (" run" if s.running else "")
                  + (" bg" if s.running and s.run_kind == "bg" else "")
                  + (f" elsewhere @{s.running_on}" if s.running_on else "")
                  + (" app" if app else ""))  # filter words
@@ -1763,7 +1791,7 @@ def picker_hint(ctx: Ctx, upd_note: str = "", lim: Limits = None) -> str:
         keys.append(("Ctrl-L", "limits"))
     keys += [("Ctrl-X", "close"), ("Ctrl-T", "install"), ("Del", "delete"), ("Esc", "cancel")]
     lines += hint_wrapped(keys)
-    words = f"{DIM},{RESET} ".join(f"{CYAN}{w}{RESET}" for w in ("run", "cleared", "app"))
+    words = f"{DIM},{RESET} ".join(f"{CYAN}{w}{RESET}" for w in ("run", "cleared", "archived", "app"))
     filters = f"{DIM}type to filter — {RESET}{words}{DIM} match as words{RESET}"
     lines.append(right_align(filters, f"{DIM}ccr v{VERSION}{RESET}"))
     return "\n".join(lines)
@@ -2956,6 +2984,19 @@ def launch(picked: list, new_window: bool, dry: bool, ctx: Ctx, terminal: bool =
     if not app_list and not launch_list:
         print("ccr: nothing to open.")
         return
+    # Archived codex conversations first: codex will not resume (or ccr
+    # move) one that is still in archived_sessions.
+    for s in app_list + [e["s"] for e in launch_list]:
+        if not s.archived:
+            continue
+        if dry:
+            print(f"unarchive: codex · {s.title}  (codex unarchive {s.id})")
+            continue
+        try:
+            unarchive_codex(s)
+            print(f"ccr: unarchived '{s.title}'")
+        except Exception as ex:
+            print(f"ccr: could not unarchive '{s.title}': {ex}", file=sys.stderr)
     # Deeplinks first: exec_inline below never returns.
     for s in app_list:
         open_in_codex_app(s, opener, dry)

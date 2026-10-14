@@ -29,6 +29,15 @@ record it in the parity table in `docs/multi-account.md`. Known cases so far:
   a background session, and close one with `claude stop <jobId>`. Codex has
   no registry, no background kind and no `stop`: its running flag is a
   process scan, `@host` and `bg` never apply, and Ctrl+X ends the process.
+- Archived conversations (v0.75): `codex archive` moves a rollout from
+  `sessions/YYYY/MM/DD` to a flat `archived_sessions/`, and codex refuses to
+  resume it there ("session <id> is archived. Run `codex unarchive <id>`");
+  `codex delete --force` works on it. ccr lists both folders, tags the row
+  `(archived)` (filter word `archived`) and unarchives one before opening or
+  moving it (Restore-CcrCodexArchived / unarchive_codex). Claude Code has no
+  archive: not applicable. With `sessions` linked into OneDrive,
+  `archived_sessions` stays local, so an archived conversation leaves the
+  other PCs.
 - Token usage (Ctrl+K / Ctrl+J): both tools record per-turn token counts in
   their transcripts (claude: `message.usage` per assistant line, deduplicated
   by message id; codex: `token_count` events, `last_token_usage`). Codex also
