@@ -35,7 +35,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.75"
+VERSION = "0.76"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -1777,23 +1777,82 @@ def session_rows(sessions, index, ctx: Ctx, usage: dict = None):
     return rows
 
 
+def picker_guide(ctx, lim=None, width: int = 0) -> list:
+    """The picker's guide (Ctrl-G): every key with a short explanation, then
+    what the signs on a row and the table on top mean. Lines for a terminal
+    `width` wide: the explanations wrap under themselves."""
+    width = width or shutil.get_terminal_size((100, 24)).columns
+    multi = ctx.multi_root
+    sections = [
+        ("Moving and opening", [
+            ("↑ ↓  PgUp PgDn", "move"),
+            ("Tab", "mark / unmark a row"),
+            ("Enter", "open the marked rows, or the highlighted one: the first here, the others as tabs "
+                      "(iTerm2, tmux) or windows (Terminal.app)"),
+            ("Ctrl-E", "the same, with a model and an effort you pick first"),
+        ] + ([("Ctrl-O", "open the marked rows under another account: the conversations move there first")] if multi else []) + [
+            ("type", "fuzzy filter by tool, account, title and folder; the words run, cleared, archived and app "
+                     "list those rows"),
+            ("Esc", "leave"),
+        ]),
+        ("New", [
+            ("Ctrl-N", "a new conversation: the folder, then claude, codex (or the codex app) or MAP"),
+            ("Ctrl-P", "MAP: 2-4 agents discuss one question in a folder until they agree, each in a tab of its own"),
+        ]),
+        ("Looking", [
+            ("Ctrl-K", "token-usage column: the tokens of each session in the last hours, and its share"),
+            ("Ctrl-J", "the usage details of the highlighted row"),
+        ] + ([("Ctrl-L", "ask every account for its usage limits again (otherwise those of the last 5 minutes)")]
+             if lim and lim.on else [])),
+        ("Managing", [
+            ("Ctrl-A", "accounts: add one, log in, copy settings, remove, turn multi-account mode off"),
+            ("Ctrl-X", "close the running conversation of the highlighted row (it is kept)"),
+            ("Ctrl-T", "install or update Claude Code and Codex with their official installers"),
+            ("Del", "delete the highlighted conversation for good, after a confirmation"),
+            ("Ctrl-G", "this guide"),
+        ]),
+        ("Signs on a row", [
+            ("●", "marked"),
+            ("run  bg  @host", "the age column: running here · a Claude background session · open on another computer"),
+            ("(cleared)", "a Claude conversation a /clear replaced"),
+            ("(archived)", "a Codex conversation put away with codex archive: opening it unarchives it"),
+            ("app", "a conversation of the Codex desktop app: it opens there"),
+        ]),
+        ("The table on top", [
+            ("one line per account", "its folder, who is logged in there and its usage limits: 5h and week used, "
+                                     "the reset after →; yellow from 70%, red from 90%"),
+        ]),
+    ]
+    key_w = 26
+    text_w = max(20, width - key_w - 5)
+    out = [f"{BOLD}ccr · keys{RESET}  {DIM}v{VERSION}{RESET}"]
+    for title, entries in sections:
+        out += ["", f"{BOLD}{title}{RESET}"]
+        for key, text in entries:
+            rows, line = [], ""
+            for w in text.split(" "):
+                if line and len(line) + 1 + len(w) > text_w:
+                    rows.append(line)
+                    line = w
+                else:
+                    line = f"{line} {w}" if line else w
+            if line:
+                rows.append(line)
+            out.append(f"  {CYAN}{key:<{key_w}}{RESET} {rows[0]}")
+            out += [f"  {' ' * key_w} {r}" for r in rows[1:]]
+    return out
+
+
 def picker_hint(ctx: Ctx, upd_note: str = "", lim: Limits = None) -> str:
     lines = []
     if ">" in upd_note:
         f, t = upd_note.split(">", 1)
         lines.append(f"{BOLD}{GREEN}ccr updated v{f} -> v{t}{RESET}")
     lines += account_table(ctx, lim)
-    keys = [("↑↓", "move"), ("Tab", "mark"), ("Enter", "open"), ("Ctrl-E", "model/effort")]
-    if ctx.multi_root:
-        keys.append(("Ctrl-O", "open under another account"))
-    keys += [("Ctrl-N", "new"), ("Ctrl-P", "MAP"), ("Ctrl-A", "accounts"), ("Ctrl-K", "usage"), ("Ctrl-J", "details")]
-    if lim and lim.on:
-        keys.append(("Ctrl-L", "limits"))
-    keys += [("Ctrl-X", "close"), ("Ctrl-T", "install"), ("Del", "delete"), ("Esc", "cancel")]
-    lines += hint_wrapped(keys)
-    words = f"{DIM},{RESET} ".join(f"{CYAN}{w}{RESET}" for w in ("run", "cleared", "archived", "app"))
-    filters = f"{DIM}type to filter — {RESET}{words}{DIM} match as words{RESET}"
-    lines.append(right_align(filters, f"{DIM}ccr v{VERSION}{RESET}"))
+    # The essentials; every other key is in the guide (Ctrl-G).
+    keys = [("↑↓", "move"), ("Tab", "mark"), ("Enter", "open"), ("Ctrl-N", "new"), ("Ctrl-G", "guide: all the keys"),
+            ("Esc", "cancel")]
+    lines.append(right_align(hint(*keys) + f"{DIM}  ·  type to filter{RESET}", f"{DIM}ccr v{VERSION}{RESET}"))
     return "\n".join(lines)
 
 
@@ -5556,13 +5615,18 @@ def main():
             lim.port = free_port() if lim.pending and fzf_version() >= (0, 45) else 0
             res = run_fzf(rows, picker_hint(ctx, upd_note, lim), query=query,
                           expect=["del", "ctrl-n", "ctrl-p", "ctrl-a", "ctrl-o", "ctrl-k", "ctrl-j", "ctrl-x", "ctrl-e",
-                                  "ctrl-t", "ctrl-l"], listen=lim.port)
+                                  "ctrl-t", "ctrl-l", "ctrl-g"], listen=lim.port)
             lim.port = 0
             if res is None:
                 print("ccr: cancelled.")
                 return
             key, ids = res
             picked = [index[i] for i in ids if i in index]
+            if key == "ctrl-g":
+                # The guide: every key, the signs on a row, the table on top.
+                print("\033[H\033[2J" + "\n".join(picker_guide(ctx, lim)))
+                pause("\n(Enter: back to the list)")
+                continue
             if key == "ctrl-l":
                 # Ask every account for its usage limits again.
                 lim.refresh(force=True)

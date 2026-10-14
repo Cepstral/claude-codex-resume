@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.75'
+$script:CcrVersion = '0.76'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -4358,6 +4358,86 @@ function Show-CcrLaunchOptions {
 
 # The picker's key legend, broken at its separators into as many lines as
 # the window needs: cut at the window's edge, it hid the keys at its end.
+# The picker's guide (Ctrl+G): every key with a short explanation, then what
+# the signs on a row and the table on top mean. Lines for a window $Width
+# wide: the explanations wrap under themselves.
+function Get-CcrPickerGuide([int]$Width, [bool]$AcctMode, [bool]$LimitsOn) {
+    $d = [char]0x00B7
+    $sections = @(
+        , @('Moving and opening',
+            @("$([char]0x2191) $([char]0x2193)  PgUp PgDn  Home End", 'move'),
+            @('Space', $(if ($AcctMode) { 'cycle the account the row opens under: its own (green dot), another one (its number in the table on top: the conversation moves there first), none' } else { 'mark / unmark a row' })),
+            @('Enter', 'open the marked rows, or the highlighted one: the first in this tab, the others as new tabs'),
+            @('Shift+Enter  or  Ctrl+E', 'the same, with a model and an effort you pick first'),
+            @('type', "filter by tool, account, title and folder; the words run, bg, cleared, archived, elsewhere and @host list those rows"),
+            @('Esc', 'clear the filter, then leave'))
+        , @('New',
+            @('Ctrl+N', 'a new conversation: the folder, then claude, codex or MAP'),
+            @('Ctrl+P', 'MAP: 2-4 agents discuss one question in a folder until they agree, each in a tab of its own'))
+        , @('Looking',
+            @('Ctrl+K', 'token-usage column: the tokens of each session in the last hours, and its share'),
+            @('Ctrl+J', 'the usage details of the highlighted row'))
+        , @('Managing',
+            @('Ctrl+A', 'accounts: add one, log in, copy settings, remove, turn multi-account mode off'),
+            @('Ctrl+X', 'close the running conversation of the highlighted row (it is kept)'),
+            @('Ctrl+I  or  Ctrl+T', 'install or update Claude Code and Codex with their official installers'),
+            @('Del', 'delete the highlighted conversation for good, after a confirmation'),
+            @('Ctrl+G', 'this guide'))
+        , @('Signs on a row',
+            @("$([char]0x25CF)  1 2 $([char]0x2026)", 'marked; a number: it opens under that account of the table on top'),
+            @('run  bg  @host', "the age column: running here $d a Claude background session $d open on another PC"),
+            @('(cleared)', 'a Claude conversation a /clear replaced'),
+            @('(archived)', 'a Codex conversation put away with codex archive: opening it unarchives it'))
+        , @('The table on top',
+            @('one line per account', "its folder, who is logged in there and its usage limits: 5h and week used, the reset after $([char]0x2192); yellow from 70%, red from 90%"))
+    )
+    if ($LimitsOn) { $sections[2] += , @('Ctrl+L', 'ask every account for its usage limits again (otherwise those of the last 5 minutes)') }
+    $keyW = 26
+    $textW = [Math]::Max(20, $Width - $keyW - 5)
+    $out = [System.Collections.Generic.List[string]]::new()
+    $out.Add("`e[1mccr $d keys`e[22m  `e[2mv$script:CcrVersion`e[22m")
+    foreach ($sec in $sections) {
+        $out.Add('')
+        $out.Add("`e[1m$($sec[0])`e[22m")
+        foreach ($e in @($sec | Select-Object -Skip 1)) {
+            $words = "$($e[1])" -split ' '
+            $rows = [System.Collections.Generic.List[string]]::new()
+            $line = ''
+            foreach ($w in $words) {
+                if ($line -and ($line.Length + 1 + $w.Length) -gt $textW) { $rows.Add($line); $line = $w }
+                else { $line = if ($line) { "$line $w" } else { $w } }
+            }
+            if ($line) { $rows.Add($line) }
+            $out.Add("  `e[36m$("$($e[0])".PadRight($keyW))`e[39m $($rows[0])")
+            foreach ($r in @($rows | Select-Object -Skip 1)) { $out.Add("  $(' ' * $keyW) $r") }
+        }
+    }
+    # one line per element: the caller collects them with @()
+    $out.ToArray()
+}
+
+# The guide as a page: it scrolls when the window is lower than it.
+function Show-CcrPickerGuide([bool]$AcctMode, [bool]$LimitsOn) {
+    $top = 0
+    while ($true) {
+        $lines = @(Get-CcrPickerGuide ([Console]::WindowWidth) $AcctMode $LimitsOn)
+        $room = [Math]::Max(3, [Console]::WindowHeight - 2)
+        $top = [Math]::Max(0, [Math]::Min($top, $lines.Count - $room))
+        $shown = [System.Collections.Generic.List[string]]::new()
+        foreach ($l in @($lines | Select-Object -Skip $top -First $room)) { $shown.Add($l) }
+        $more = $lines.Count -gt $room
+        $shown.Add('')
+        $shown.Add("`e[2m$(if ($more) { "$([char]0x2191)$([char]0x2193) scroll $([char]0x00B7) " })any other key: back to the list`e[22m")
+        Write-CcrScreen $shown
+        $k = [Console]::ReadKey($true)
+        if ($more -and $k.Key -eq [ConsoleKey]::DownArrow) { $top++; continue }
+        if ($more -and $k.Key -eq [ConsoleKey]::UpArrow) { $top--; continue }
+        if ($more -and $k.Key -eq [ConsoleKey]::PageDown) { $top += $room; continue }
+        if ($more -and $k.Key -eq [ConsoleKey]::PageUp) { $top -= $room; continue }
+        return
+    }
+}
+
 function Split-CcrHint([string]$Hint, [int]$Width) {
     $sep = " $([char]0x00B7) "
     $out = [System.Collections.Generic.List[string]]::new()
@@ -4837,8 +4917,8 @@ function Select-CcrSession {
             $w = [Console]::WindowWidth
             $h = [Console]::WindowHeight
             # The key legend wraps onto as many lines as the window needs.
-            $hint = if ($acctMode) { "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space cycles the account (dot = as is) $([char]0x00B7) Enter open $([char]0x00B7) Shift+Enter model/effort $([char]0x00B7) Ctrl+N new $([char]0x00B7) Ctrl+P MAP $([char]0x00B7) Ctrl+A accounts $([char]0x00B7) Ctrl+K usage $([char]0x00B7) Ctrl+J details $([char]0x00B7) $(if ($limitsOn) { "Ctrl+L limits $([char]0x00B7) " })Ctrl+X close $([char]0x00B7) Ctrl+I install $([char]0x00B7) Del delete $([char]0x00B7) Esc cancel $([char]0x00B7) v$script:CcrVersion" }
-            else { "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space mark $([char]0x00B7) Enter open $([char]0x00B7) Shift+Enter model/effort $([char]0x00B7) Ctrl+N new $([char]0x00B7) Ctrl+P MAP $([char]0x00B7) Del delete $([char]0x00B7) Ctrl+A accounts $([char]0x00B7) Ctrl+K usage $([char]0x00B7) Ctrl+J details $([char]0x00B7) $(if ($limitsOn) { "Ctrl+L limits $([char]0x00B7) " })Ctrl+X close $([char]0x00B7) Ctrl+I install $([char]0x00B7) Esc cancel $([char]0x00B7) type to filter $([char]0x00B7) v$script:CcrVersion" }
+            # The essentials; every other key is in the guide (Ctrl+G).
+            $hint = "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space $(if ($acctMode) { 'account' } else { 'mark' }) $([char]0x00B7) Enter open $([char]0x00B7) Ctrl+N new $([char]0x00B7) Ctrl+G guide: all the keys $([char]0x00B7) Esc cancel $([char]0x00B7) type to filter $([char]0x00B7) v$script:CcrVersion"
             $hintLines = @(Split-CcrHint $hint ($w - 1))
             $tableLines = @(Get-CcrAccountTable $w)
             $viewH = [Math]::Max(1, $h - 1 - $hintLines.Count - $tableLines.Count - $(if ($updNote) { 1 } else { 0 }))
@@ -5057,6 +5137,11 @@ function Select-CcrSession {
                         }
                     }
                 }
+                continue
+            }
+            # Ctrl+G: the guide - every key, the signs on a row, the table on top.
+            if ($k.Key -eq [ConsoleKey]::G -and $ctrl) {
+                Show-CcrPickerGuide $acctMode $limitsOn
                 continue
             }
             # Ctrl+L: ask every account for its usage limits again.
