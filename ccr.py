@@ -8,8 +8,8 @@ as the launch backend. Python 3.9+, stdlib only; fzf for UI.
 
 Keys in the picker (fzf conventions): type to fuzzy-filter, Tab marks,
 Enter opens, Ctrl-E opens with a model / effort, Ctrl-N new conversation, Ctrl-P MAP (multi-agent panel), Ctrl-A accounts, Ctrl-O open the
-marked rows under another account, Ctrl-T installs or updates claude / codex, Del (or Ctrl-Backspace) deletes
-the marked rows or the highlighted one, Esc cancels.
+marked rows under another account, Ctrl-T installs or updates claude / codex, Del (or Ctrl-D) deletes the
+marked rows or the highlighted one, Esc cancels.
 """
 import argparse
 import base64
@@ -36,7 +36,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.83"
+VERSION = "0.84"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -1866,8 +1866,9 @@ def picker_guide(ctx, lim=None, width: int = 0) -> list:
                        "with its tab selected, and it blinks (iTerm2, Terminal.app, tmux)"),
             ("Ctrl-X", "close the running conversation of the highlighted row (it is kept)"),
             ("Ctrl-T", "install or update Claude Code and Codex with their official installers"),
-            ("Del  or  Ctrl-Backspace", "delete the marked conversations, or the highlighted one, for good, "
-                                        "after a confirmation (fn+⌫ is Del on a Mac keyboard)"),
+            ("Del  or  Ctrl-D", "delete the marked conversations, or the highlighted one, for good, after a "
+                                "confirmation (fn+⌫ is Del on a Mac keyboard; Ctrl-Backspace too where the "
+                                "terminal tells it from Backspace - Terminal.app does not)"),
             ("Ctrl-G  or  F1", "this guide (F1, fn+F1 on a Mac keyboard, for when another app takes Ctrl-G: "
                                "Grammarly's AI Chat does on a Mac)"),
         ]),
@@ -2528,18 +2529,20 @@ def remove_session_data(s: Session) -> bool:
 
 
 def delete_keys() -> list:
-    """The picker's delete keys: Del, and Ctrl+Backspace for keyboards
-    without a Del key. Terminals send Ctrl+Backspace as ^H, which fzf reads
-    as ctrl-h - unless Backspace itself sends ^H here (stty erase ^H): then
-    ctrl-h is left to fzf, as the filter's backspace."""
+    """The picker's delete keys: Del, and Ctrl-D for keyboards without a
+    Del key - every terminal sends it (^D). Ctrl+Backspace too where the
+    terminal tells it from Backspace: it sends ^H, which fzf reads as
+    ctrl-h. Terminal.app sends the same byte for both, so there it is just
+    Backspace. Where Backspace itself sends ^H (stty erase ^H), ctrl-h is
+    left to fzf, as the filter's backspace."""
     try:
         import termios
         with open("/dev/tty") as tty:
             if termios.tcgetattr(tty)[6][termios.VERASE] in (b"\x08", 8):
-                return ["del"]
+                return ["del", "ctrl-d"]
     except Exception:
         pass
-    return ["del", "ctrl-h"]
+    return ["del", "ctrl-d", "ctrl-h"]
 
 
 def fmt_size(n: int) -> str:
@@ -2555,7 +2558,7 @@ def session_size(s: Session) -> int:
 
 
 def confirm_delete_many(victims: list, kept: list) -> bool:
-    """Del / Ctrl-Backspace on several marked rows: one confirmation for all
+    """Del / Ctrl-D on several marked rows: one confirmation for all
     of them. The rows still open (running here, or on another computer) are
     named apart and kept."""
     print(f"\n{RED}Delete these {len(victims)} conversations permanently?{RESET}\n")
@@ -5935,9 +5938,9 @@ def main():
                             print(f"ccr: could not close '{s.title}' (pid {s.pid}).", file=sys.stderr)
                             pause("(Enter to continue)")
                 continue
-            if key in ("del", "ctrl-h"):
-                # Del, or Ctrl-Backspace (^H, fzf's ctrl-h): the marked rows,
-                # or the highlighted one. Rows still open are kept.
+            if key in ("del", "ctrl-d", "ctrl-h"):
+                # Del, Ctrl-D, or Ctrl-Backspace (^H, fzf's ctrl-h): the marked
+                # rows, or the highlighted one. Rows still open are kept.
                 if not picked:
                     continue
                 kept = [x for x in picked if x.running or x.running_on]

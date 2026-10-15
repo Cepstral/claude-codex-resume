@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.83'
+$script:CcrVersion = '0.84'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -1700,7 +1700,7 @@ function Get-CcrSessionSize([object]$Session) {
     $n
 }
 
-# Del / Ctrl+Backspace on several marked rows: one confirmation for all of
+# Del / Ctrl+D on several marked rows: one confirmation for all of
 # them; returns $true on yes. The rows still open (running here, or on
 # another PC) are named apart and kept. A list longer than the screen ends
 # with "... and N more".
@@ -4633,7 +4633,7 @@ function Get-CcrPickerGuide([int]$Width, [bool]$AcctMode, [bool]$LimitsOn) {
             @('Ctrl+F', 'find the window of the running conversation of the highlighted row: it comes to the front with its tab selected, and its title blinks'),
             @('Ctrl+X', 'close the running conversation of the highlighted row (it is kept)'),
             @('Ctrl+I  or  Ctrl+T', 'install or update Claude Code and Codex with their official installers'),
-            @('Del  or  Ctrl+Backspace', 'delete the marked conversations, or the highlighted one, for good, after a confirmation'),
+            @('Del  or  Ctrl+D', 'delete the marked conversations, or the highlighted one, for good, after a confirmation (Ctrl+Backspace too)'),
             @('Ctrl+G  or  F1', 'this guide (F1 for when another program takes Ctrl+G: Grammarly does on a Mac)'))
         , @('Signs on a row',
             @("$([char]0x25CF)  1 2 $([char]0x2026)", 'marked; a number: it opens under that account of the table on top'),
@@ -5455,9 +5455,10 @@ function Select-CcrSession {
                 if ($newPick) { return [pscustomobject]@{ NewSessionPath = $newPick.Path; NewSessionTool = 'panel'; NewSessionName = ''; NewSessionRoot = $null; NewSessionPanel = $newPick.Panel; NewSessionQuestion = $newPick.Question; NewSessionResume = $newPick.Resume; NewSessionMessage = $newPick.Message } }
                 continue
             }
-            # Ctrl+Backspace deletes like Del, for keyboards without a Del key;
-            # Ctrl+H too, the ^H a terminal sends for it (ccr.py: fzf's ctrl-h).
-            $keyName = if ($ctrl -and ($k.Key -eq [ConsoleKey]::Backspace -or $k.Key -eq [ConsoleKey]::H)) { 'Delete' } else { "$($k.Key)" }
+            # Ctrl+D deletes like Del, for keyboards without a Del key (every
+            # terminal sends it; ccr.py's key too). Ctrl+Backspace as well, and
+            # Ctrl+H, the ^H a terminal sends for it (ccr.py: fzf's ctrl-h).
+            $keyName = if ($ctrl -and ($k.Key -eq [ConsoleKey]::D -or $k.Key -eq [ConsoleKey]::Backspace -or $k.Key -eq [ConsoleKey]::H)) { 'Delete' } else { "$($k.Key)" }
             switch ($keyName) {
                 'UpArrow' { if ($cursor -gt 0) { $cursor-- } }
                 'DownArrow' { if ($cursor -lt $view.Count - 1) { $cursor++ } }
@@ -5757,7 +5758,7 @@ function Resume-CcSessions {
         chosen on a page - one section for the claude rows (--model,
         --effort), one for the codex rows (-m, -c model_reasoning_effort),
         each shown only when the selection has such rows, all starting at
-        "no override" - Del (or Ctrl+Backspace, for keyboards without Del)
+        "no override" - Del (or Ctrl+D or Ctrl+Backspace, for keyboards without Del)
         PERMANENTLY deletes the marked conversations, or the highlighted one,
         after a full-screen confirmation (one row: title, folder, dates, size,
         last prompt or reply; several: one list with the total size; codex
