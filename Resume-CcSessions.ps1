@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.77'
+$script:CcrVersion = '0.78'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -1056,7 +1056,7 @@ function Get-CcrCodexSession {
             SessionId    = $id
             Title        = $title
             Cwd          = $cwd
-            LastActivity = $file.LastWriteTimeUtc   # resume appends to the original file
+            LastActivity = Get-CcrCodexLastActivity $file
             Running      = $running.ContainsKey($id)
             ProcessId    = $running[$id]
             # Same fields as claude rows; codex writes no per-process registry,
@@ -1103,6 +1103,26 @@ function Add-CcrUsageTurn([object]$u, [datetime]$ts, [string]$model, [long]$in, 
 
 function ConvertTo-CcrUtc([string]$Iso) {
     try { [datetime]::Parse($Iso, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal) } catch { $null }
+}
+
+# When a codex conversation was last written to: the time on the last line of
+# its rollout (every line starts with {"timestamp":...}). Not the file's own
+# time: codex appends from the desktop app, the IDE extension and subagents
+# without moving LastWriteTime, which stays at the conversation's start - a
+# conversation used in the app this morning read "22h". The file's time is
+# the fallback, for a last line longer than the window.
+function Get-CcrCodexLastActivity([System.IO.FileInfo]$File) {
+    foreach ($n in 64KB, 1MB) {
+        try { $tail = Read-CcrFileWindow -Path $File.FullName -Bytes $n -From Tail } catch { break }
+        $tm = [regex]::Matches($tail, '(?m)^\{"timestamp":"([^"]+)"')
+        if ($tm.Count -gt 0) {
+            $ts = ConvertTo-CcrUtc $tm[$tm.Count - 1].Groups[1].Value
+            if ($ts) { return $ts }
+            break
+        }
+        if ($File.Length -le $n) { break }
+    }
+    $File.LastWriteTimeUtc
 }
 
 function Read-CcrClaudeUsage([string]$Path, [datetime]$SinceUtc, [object]$u) {
@@ -1187,7 +1207,8 @@ function Get-CcrSessionUsage {
         $side = Join-Path (Split-Path -Parent $Session.Source) $Session.SessionId
         if (Test-Path -LiteralPath $side) { $files += @(Get-ChildItem -LiteralPath $side -Recurse -Filter *.jsonl -File -ErrorAction SilentlyContinue) }
     }
-    $files = @($files | Where-Object { $_.LastWriteTimeUtc -ge $SinceUtc })
+    # A codex rollout's own time can be stale (Get-CcrCodexLastActivity).
+    $files = @($files | Where-Object { $(if ($Session.Tool -eq 'codex') { $Session.LastActivity } else { $_.LastWriteTimeUtc }) -ge $SinceUtc })
     if ($files.Count -eq 0) { return $null }
     $u = New-CcrUsage
     foreach ($f in $files) {

@@ -236,6 +236,14 @@ pane, which shows the full title and folder of the highlighted row.
   `# AGENTS.md instructions for <dir>`; the IDE extension's `# Context from
   my IDE setup` block yields the request after `## My request for Codex:`
   (Get-CcrCodexPrompt / codex_prompt).
+- A codex row's age (last activity, the sort key) is the time on the
+  rollout's last line, not the file's mtime (v0.78; Get-CcrCodexLastActivity
+  / codex_last; the file time is only the fallback). Verified with codex
+  0.160 on 2026-10-15: turns appended from the desktop app, the IDE extension
+  and subagents leave the mtime at the conversation's start (a rollout with
+  lines of 15:00Z kept an mtime of 07:48Z), while `codex resume` in a
+  terminal moves it. A colleague's app conversation of the same morning read
+  "22h". The Ctrl+K window filter uses the same time for codex rows.
 - Usage limits (v0.72, the account table above the picker): claude
   `-p "/usage"` is a local command (0 turns, $0) and prints text lines,
   parsed by ConvertFrom-CcrClaudeLimits / parse_claude_limits; codex

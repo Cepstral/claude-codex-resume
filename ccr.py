@@ -35,7 +35,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.77"
+VERSION = "0.78"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -1143,6 +1143,32 @@ def codex_origin(originator) -> str:
     return "app" if any(k in o for k in APP_ORIGINATORS) else "cli"
 
 
+def codex_last(f: Path):
+    """When a codex conversation was last written to: the time on the last
+    line of its rollout (every line starts with {"timestamp":...}). Not the
+    file's own time: codex appends from the desktop app, the IDE extension
+    and subagents without moving the mtime, which stays at the conversation's
+    start - a conversation used in the app this morning read "22h". The
+    mtime is the fallback, for a last line longer than the window."""
+    for n in (64 * 1024, 1024 * 1024):
+        try:
+            tail = read_window(f, n, tail=True)
+        except OSError:
+            break
+        tm = re.findall(r'(?m)^\{"timestamp":"([^"]+)"', tail)
+        if tm:
+            t = parse_ts(tm[-1])
+            if t:
+                return t
+            break
+        try:
+            if f.stat().st_size <= n:
+                break
+        except OSError:
+            break
+    return mtime_utc(f)
+
+
 def codex_sessions(root: Root = None) -> list:
     root = root or Root("", str(codex_root()), True)
     sess_root = Path(root.path) / "sessions"
@@ -1216,7 +1242,7 @@ def codex_sessions(root: Root = None) -> list:
             title = clean_title((history().get(sid) or {}).get("text"))
         if not title:
             title = "(session)"
-        out.append(Session(tool="codex", id=sid, title=title, cwd=cwd, last=mtime_utc(f),
+        out.append(Session(tool="codex", id=sid, title=title, cwd=cwd, last=codex_last(f),
                            running=sid in running, pid=running.get(sid), source=str(f),
                            origin=origin, root=root.label, root_path=root.path, archived=archived))
     return out
@@ -2159,7 +2185,8 @@ def session_usage(s: Session, since: datetime):
         side = Path(s.source).parent / s.id
         if side.is_dir():
             files += [p for p in side.rglob("*.jsonl") if p.is_file()]
-    files = [p for p in files if mtime_utc(p) >= since]
+    # A codex rollout's own mtime can be stale (codex_last).
+    files = [p for p in files if (s.last if s.tool == "codex" else mtime_utc(p)) >= since]
     if not files:
         return None
     u = Usage()
