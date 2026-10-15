@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.79'
+$script:CcrVersion = '0.80'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -485,9 +485,9 @@ function Add-CcrAccount {
 
 # Forget an account: every session it holds moves into the tool's default
 # account first (claude: transcript + sidecar into the same project slug;
-# codex: rollout into the same sessions/YYYY/MM/DD path), then the entry
-# leaves ccr.json. The dir and its login stay on disk. Refused while one of
-# its sessions is running, and for the default account itself.
+# codex: every rollout page into the same sessions/YYYY/MM/DD path), then
+# the entry leaves ccr.json. The dir and its login stay on disk. Refused
+# while one of its sessions is running, and for the default account itself.
 function Remove-CcrAccount {
     param(
         [Parameter(Mandatory)][string]$Label,
@@ -969,6 +969,30 @@ function Get-CcrCodexTitleMap {
     $map
 }
 
+# Rollout files grouped by thread id, oldest page first. A thread can span
+# several files: with paginated history (the desktop app) an edited message
+# starts a new page, rollout-<ts>-<thread id>_<page id>.jsonl, and the
+# thread goes on there.
+function Get-CcrCodexPages([object[]]$Files) {
+    $uuid = '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+    $out = [ordered]@{}
+    foreach ($f in $Files) {
+        $m = [regex]::Match($f.Name, "-($uuid)(?:_$uuid)?\.jsonl$")
+        if (-not $m.Success) { continue }
+        $tid = $m.Groups[1].Value
+        if (-not $out.Contains($tid)) { $out[$tid] = [System.Collections.Generic.List[object]]::new() }
+        $out[$tid].Add($f)
+    }
+    foreach ($tid in @($out.Keys)) { $out[$tid] = @($out[$tid] | Sort-Object Name) }
+    $out
+}
+
+# The page without a suffix: session meta and first prompt.
+function Get-CcrCodexHead([string]$ThreadId, [object[]]$Pages) {
+    $h = @($Pages | Where-Object { $_.Name.EndsWith("-$ThreadId.jsonl", [StringComparison]::OrdinalIgnoreCase) })
+    if ($h.Count) { $h[0] } else { $Pages[0] }
+}
+
 function Get-CcrCodexSession {
     [CmdletBinding()]
     param(
@@ -984,13 +1008,18 @@ function Get-CcrCodexSession {
     $running = Get-CcrCodexRunningMap
     $curated = Get-CcrCodexTitleMap -RootPath $Root.Path
 
-    $files = @(Get-ChildItem -LiteralPath $sessRoot -Recurse -Filter 'rollout-*.jsonl' -File -ErrorAction SilentlyContinue) +
-    @(Get-ChildItem -LiteralPath $archRoot -Recurse -Filter 'rollout-*.jsonl' -File -ErrorAction SilentlyContinue)
+    # One row per thread: title and folder from its head page, last activity
+    # from its newest one.
+    $threads = [System.Collections.Generic.List[object]]::new()
+    foreach ($dir in $sessRoot, $archRoot) {
+        $byId = Get-CcrCodexPages @(Get-ChildItem -LiteralPath $dir -Recurse -Filter 'rollout-*.jsonl' -File -ErrorAction SilentlyContinue)
+        foreach ($tid in $byId.Keys) { $threads.Add([pscustomobject]@{ Id = $tid; Pages = $byId[$tid] }) }
+    }
     $archPrefix = $archRoot.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
-    $out = foreach ($file in $files) {
-        $m = [regex]::Match($file.Name, '-([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.jsonl$')
-        if (-not $m.Success) { continue }
-        $id = $m.Groups[1].Value
+    $out = foreach ($thread in $threads) {
+        $pages = @($thread.Pages)
+        $file = Get-CcrCodexHead $thread.Id $pages
+        $id = $thread.Id
         $cwd = $null
         $title = $null
         $skip = $false
@@ -1056,7 +1085,7 @@ function Get-CcrCodexSession {
             SessionId    = $id
             Title        = $title
             Cwd          = $cwd
-            LastActivity = Get-CcrCodexLastActivity $file
+            LastActivity = @($pages | ForEach-Object { Get-CcrCodexLastActivity $_ } | Sort-Object)[-1]
             Running      = $running.ContainsKey($id)
             ProcessId    = $running[$id]
             # Same fields as claude rows; codex writes no per-process registry,
@@ -1067,6 +1096,7 @@ function Get-CcrCodexSession {
             RunUpdated   = $null
             RunJobId     = ''
             Source       = $file.FullName
+            Parts        = @($pages | ForEach-Object FullName)
             Root         = $Root.Label
             RootPath     = $Root.Path
             Archived     = $file.FullName.StartsWith($archPrefix, [StringComparison]::OrdinalIgnoreCase)
@@ -1196,13 +1226,22 @@ function Read-CcrCodexUsage([string]$Path, [datetime]$SinceUtc, [object]$u) {
     finally { $fs.Dispose() }
 }
 
+# Every file a conversation lives in that is still on disk: the pages of a
+# codex thread (see Get-CcrCodexPages), else just the transcript.
+function Get-CcrSessionParts([object]$Session) {
+    $parts = if ($Session.PSObject.Properties['Parts'] -and $Session.Parts) { @($Session.Parts) }
+    elseif ($Session.Source) { @($Session.Source) }
+    else { @() }
+    @($parts | Where-Object { Test-Path -LiteralPath $_ })
+}
+
 # Usage of one session since $SinceUtc, or $null when it had no turn in the
 # window. Only files written inside the window are read (claude: the
-# transcript and the subagent transcripts in its sidecar dir).
+# transcript and the subagent transcripts in its sidecar dir; codex: every
+# page of the thread).
 function Get-CcrSessionUsage {
     param([Parameter(Mandatory)][object]$Session, [Parameter(Mandatory)][datetime]$SinceUtc)
-    $files = @()
-    if ($Session.Source -and (Test-Path -LiteralPath $Session.Source)) { $files += Get-Item -LiteralPath $Session.Source }
+    $files = @(Get-CcrSessionParts $Session | ForEach-Object { Get-Item -LiteralPath $_ })
     if ($Session.Tool -eq 'claude' -and $Session.Source) {
         $side = Join-Path (Split-Path -Parent $Session.Source) $Session.SessionId
         if (Test-Path -LiteralPath $side) { $files += @(Get-ChildItem -LiteralPath $side -Recurse -Filter *.jsonl -File -ErrorAction SilentlyContinue) }
@@ -1323,7 +1362,7 @@ function Remove-CcrSessionData {
     param([Parameter(Mandatory)][object]$Session)
     if ($Session.Tool -eq 'codex') {
         # Codex keeps a catalog besides the rollout file, so let its own CLI do
-        # the delete; fall back to removing the rollout directly.
+        # the delete; fall back to removing every rollout page directly.
         # The session's own account dir must be CODEX_HOME for the call, or
         # codex looks in the default dir and misses it (leaving the account's
         # catalog stale).
@@ -1345,9 +1384,10 @@ function Remove-CcrSessionData {
         }
         catch { $ok = $false }
         finally { $env:CODEX_HOME = $prevHome }
-        if (-not $ok -and $Session.Source -and (Test-Path -LiteralPath $Session.Source)) {
-            Remove-Item -LiteralPath $Session.Source -Force
-            $ok = $true
+        if (-not $ok) {
+            $pages = @(Get-CcrSessionParts $Session)
+            foreach ($p in $pages) { Remove-Item -LiteralPath $p -Force }
+            $ok = $pages.Count -gt 0
         }
         return $ok
     }
@@ -1583,8 +1623,11 @@ function Restore-CcrCodexArchived([object]$Session) {
     try { $out = @(& $exe unarchive $Session.SessionId 2>&1 | ForEach-Object { "$_" }); $code = $LASTEXITCODE }
     finally { [Environment]::SetEnvironmentVariable('CODEX_HOME', $prev) }
     if ($code) { throw "$(@($out | Where-Object { $_.Trim() })[-1])" }
-    $f = @(Get-ChildItem -LiteralPath (Join-Path $Session.RootPath 'sessions') -Recurse -Filter "*$($Session.SessionId).jsonl" -File -ErrorAction SilentlyContinue)[0]
-    if ($f) { $Session.Source = $f.FullName }
+    $pages = (Get-CcrCodexPages @(Get-ChildItem -LiteralPath (Join-Path $Session.RootPath 'sessions') -Recurse -Filter "rollout-*$($Session.SessionId)*.jsonl" -File -ErrorAction SilentlyContinue))[$Session.SessionId]
+    if ($pages) {
+        $Session.Source = (Get-CcrCodexHead $Session.SessionId $pages).FullName
+        $Session.Parts = @($pages | ForEach-Object FullName)
+    }
     $Session.Archived = $false
 }
 
@@ -1600,12 +1643,17 @@ function Move-CcrSessionToRoot {
         if (Test-Path -LiteralPath $side) { Move-Item -LiteralPath $side -Destination $dstDir -Force }
         return (Join-Path $dstDir $src.Name)
     }
-    # codex: keep the sessions/YYYY/MM/DD layout relative to the source root.
+    # codex: every page of the thread, keeping the sessions/YYYY/MM/DD
+    # layout relative to the source root.
     $srcSessions = Join-Path $Session.RootPath 'sessions'
-    $rel = $src.FullName.Substring($srcSessions.Length).TrimStart('\', '/')
-    $dst = Join-Path (Join-Path $TargetRoot.Path 'sessions') $rel
-    New-Item -ItemType Directory -Path (Split-Path -Parent $dst) -Force | Out-Null
-    Move-Item -LiteralPath $src.FullName -Destination $dst -Force
+    $dst = $null
+    foreach ($p in @(Get-CcrSessionParts $Session)) {
+        $rel = $p.Substring($srcSessions.Length).TrimStart('\', '/')
+        $to = Join-Path (Join-Path $TargetRoot.Path 'sessions') $rel
+        New-Item -ItemType Directory -Path (Split-Path -Parent $to) -Force | Out-Null
+        Move-Item -LiteralPath $p -Destination $to -Force
+        if ($p -eq $src.FullName) { $dst = $to }
+    }
     # A /rename name lives in the source account's catalog, not in the
     # rollout. Carry it over through session_index.jsonl - the legacy index
     # codex still honours - rather than writing into its sqlite catalog.
@@ -1651,12 +1699,13 @@ function Show-CcrDeleteConfirm {
     $size = ''
     $preview = $null
     try {
-        if ($Session.Source -and (Test-Path -LiteralPath $Session.Source)) {
-            $item = Get-Item -LiteralPath $Session.Source
-            $size = if ($item.Length -ge 1MB) { '{0:n1} MB' -f ($item.Length / 1MB) }
-            elseif ($item.Length -ge 1KB) { '{0:n0} KB' -f ($item.Length / 1KB) }
-            else { "$($item.Length) B" }
-            $tail = Read-CcrFileWindow -Path $item.FullName -Bytes 64KB -From Tail
+        $items = @(Get-CcrSessionParts $Session | ForEach-Object { Get-Item -LiteralPath $_ })
+        if ($items.Count) {
+            $len = ($items | Measure-Object Length -Sum).Sum
+            $size = if ($len -ge 1MB) { '{0:n1} MB' -f ($len / 1MB) }
+            elseif ($len -ge 1KB) { '{0:n0} KB' -f ($len / 1KB) }
+            else { "$len B" }
+            $tail = Read-CcrFileWindow -Path $items[-1].FullName -Bytes 64KB -From Tail   # codex: the newest page
             $pat = if ($Session.Tool -eq 'claude') { '"lastPrompt":"((?:[^"\\]|\\.)*)"' }
             else { '"last_agent_message":"((?:[^"\\]|\\.)*)"' }
             $mm = [regex]::Matches($tail, $pat)

@@ -38,6 +38,18 @@ record it in the parity table in `docs/multi-account.md`. Known cases so far:
   archive: not applicable. With `sessions` linked into OneDrive,
   `archived_sessions` stays local, so an archived conversation leaves the
   other PCs.
+- Codex paginated history (v0.79): one thread can span several rollout files.
+  The desktop app writes `history_mode: paginated`; editing a message starts
+  a new page `rollout-<ts>-<id>_<page id>.jsonl` (its session_meta carries
+  `history_base`, the previous page and the byte offset it continues from)
+  and the thread goes on there, while the head page stops. Before v0.79 ccr
+  matched only `-<id>.jsonl` and dropped the pages: an app conversation used
+  this morning read "19h" and its Ctrl+K tokens were missing. ccr groups the
+  files by thread id (Get-CcrCodexPages / codex_pages), takes meta and title
+  from the head page (Get-CcrCodexHead / codex_head), last activity = the
+  newest of the pages' last lines, and usage, move, unarchive and the delete
+  fallback cover every page (`Parts` / `parts`). Claude has no counterpart:
+  an edit or `/rewind` branches inside the same transcript.
 - Token usage (Ctrl+K / Ctrl+J): both tools record per-turn token counts in
   their transcripts (claude: `message.usage` per assistant line, deduplicated
   by message id; codex: `token_count` events, `last_token_usage`). Codex also
@@ -236,7 +248,7 @@ pane, which shows the full title and folder of the highlighted row.
   `# AGENTS.md instructions for <dir>`; the IDE extension's `# Context from
   my IDE setup` block yields the request after `## My request for Codex:`
   (Get-CcrCodexPrompt / codex_prompt).
-- Ctrl+F (v0.79) finds the window of a running conversation, both tools
+- Ctrl+F (v0.80) finds the window of a running conversation, both tools
   alike (claude's pid from its registry, codex's from the process scan).
   Windows (Show-CcrSessionWindow): a hidden child PowerShell does the work,
   because a pwsh host attached to another console breaks (BufferCell errors,

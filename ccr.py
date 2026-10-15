@@ -35,7 +35,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.79"
+VERSION = "0.80"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -261,6 +261,9 @@ def user_text(obj):
 
 class Session:
     __slots__ = ("tool", "id", "title", "cwd", "last", "running", "pid", "source",
+                 # every file the conversation lives in: the pages of a codex
+                 # thread (see codex_sessions), else just the transcript
+                 "parts",
                  "started_at", "started_by_clear", "head_bridge", "tail_bridge", "cleared",
                  # codex: put away with `codex archive` (in archived_sessions/)
                  "archived",
@@ -274,6 +277,7 @@ class Session:
     def __init__(self, **kw):
         for k in self.__slots__:
             setattr(self, k, kw.get(k))
+        self.parts = self.parts or ([self.source] if self.source else [])
         self.cleared = bool(self.cleared)
         self.archived = bool(self.archived)
         self.origin = self.origin or "cli"
@@ -634,8 +638,8 @@ def add_account(label: str, tool: str = "all", copy: bool = False):
 def remove_account(label: str, tool: str = "all"):
     """Forget an account: every session it holds moves into the tool's
     default account first (claude: transcript + sidecar into the same
-    project slug; codex: rollout into the same sessions/YYYY/MM/DD path),
-    then the entry leaves ccr.json. The dir and its login stay on disk.
+    project slug; codex: every rollout page into the same sessions/YYYY/MM/DD
+    path), then the entry leaves ccr.json. The dir and its login stay on disk.
     Refused while one of its sessions is running, and for the default."""
     cfg = load_config()
     if not cfg:
@@ -712,9 +716,9 @@ def unarchive_codex(s: Session) -> None:
     if r.returncode != 0:
         lines = [l for l in ((r.stderr or "") + "\n" + (r.stdout or "")).splitlines() if l.strip()]
         raise RuntimeError(lines[-1] if lines else f"exit {r.returncode}")
-    hit = next(Path(s.root_path, "sessions").rglob(f"*{s.id}.jsonl"), None)
-    if hit:
-        s.source = str(hit)
+    pages = codex_pages(Path(s.root_path, "sessions").rglob(f"rollout-*{s.id}*.jsonl")).get(s.id)
+    if pages:
+        s.source, s.parts = str(codex_head(s.id, pages)), [str(p) for p in pages]
     s.archived = False
 
 
@@ -731,11 +735,15 @@ def move_session_to_root(s: Session, target: Root) -> str:
         if side.exists():
             shutil.move(str(side), str(dst_dir / side.name))
         return str(dst_dir / src.name)
-    # codex: keep the sessions/YYYY/MM/DD layout relative to the source root.
-    rel = src.relative_to(Path(s.root_path) / "sessions")
-    dst = Path(target.path) / "sessions" / rel
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(src), str(dst))
+    # codex: every page of the thread, keeping the sessions/YYYY/MM/DD
+    # layout relative to the source root.
+    dst = None
+    for p in map(Path, s.parts):
+        to = Path(target.path) / "sessions" / p.relative_to(Path(s.root_path) / "sessions")
+        to.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(p), str(to))
+        if p == src:
+            dst = to
     # A /rename name lives in the source account's catalog, not in the
     # rollout. Carry it over through session_index.jsonl - the legacy index
     # codex still honours - rather than writing into its sqlite catalog.
@@ -1169,6 +1177,26 @@ def codex_last(f: Path):
     return mtime_utc(f)
 
 
+def codex_pages(files) -> dict:
+    """Rollout files grouped by thread id, oldest page first. A thread can
+    span several files: with paginated history (the desktop app) an edited
+    message starts a new page, rollout-<ts>-<thread id>_<page id>.jsonl,
+    and the thread goes on there."""
+    out = {}
+    for f in files:
+        mm = re.search(r"-(" + UUID_IN + r")(?:_" + UUID_IN + r")?\.jsonl$", f.name)
+        if mm:
+            out.setdefault(mm.group(1), []).append(f)
+    for pages in out.values():
+        pages.sort(key=lambda p: p.name)
+    return out
+
+
+def codex_head(tid: str, pages: list) -> Path:
+    """The page without a suffix: session meta and first prompt."""
+    return next((p for p in pages if p.name.lower().endswith(f"-{tid.lower()}.jsonl")), pages[0])
+
+
 def codex_sessions(root: Root = None) -> list:
     root = root or Root("", str(codex_root()), True)
     sess_root = Path(root.path) / "sessions"
@@ -1186,13 +1214,13 @@ def codex_sessions(root: Root = None) -> list:
         return cache["t"]
 
     out = []
-    files = [(f, False) for f in sess_root.rglob("rollout-*.jsonl")]
-    files += [(f, True) for f in arch_root.rglob("rollout-*.jsonl")]
-    for f, archived in files:
-        mm = re.search(r"-(" + UUID_IN + r")\.jsonl$", f.name)
-        if not mm:
-            continue
-        sid, cwd, title, skip, origin = mm.group(1), None, None, False, "cli"
+    # One row per thread: title and folder from its head page, last activity
+    # from its newest one.
+    threads = [(tid, pages, False) for tid, pages in codex_pages(sess_root.rglob("rollout-*.jsonl")).items()]
+    threads += [(tid, pages, True) for tid, pages in codex_pages(arch_root.rglob("rollout-*.jsonl")).items()]
+    for tid, pages, archived in threads:
+        f = codex_head(tid, pages)
+        sid, cwd, title, skip, origin = tid, None, None, False, "cli"
         try:
             # Bounded streaming head read: rollouts reach hundreds of MB.
             with open(f, encoding="utf-8", errors="replace") as fh:
@@ -1242,8 +1270,9 @@ def codex_sessions(root: Root = None) -> list:
             title = clean_title((history().get(sid) or {}).get("text"))
         if not title:
             title = "(session)"
-        out.append(Session(tool="codex", id=sid, title=title, cwd=cwd, last=codex_last(f),
+        out.append(Session(tool="codex", id=sid, title=title, cwd=cwd, last=max(codex_last(p) for p in pages),
                            running=sid in running, pid=running.get(sid), source=str(f),
+                           parts=[str(p) for p in pages],
                            origin=origin, root=root.label, root_path=root.path, archived=archived))
     return out
 
@@ -2179,10 +2208,9 @@ def read_codex_usage(path: Path, since: datetime, u: Usage):
 def session_usage(s: Session, since: datetime):
     """Usage of one session since `since`, or None when it had no turn in the
     window. Only files written inside the window are read (claude: the
-    transcript and the subagent transcripts in its sidecar dir)."""
-    files = []
-    if s.source and Path(s.source).exists():
-        files.append(Path(s.source))
+    transcript and the subagent transcripts in its sidecar dir; codex: every
+    page of the thread)."""
+    files = [Path(p) for p in s.parts if Path(p).exists()]
     if s.tool == "claude" and s.source:
         side = Path(s.source).parent / s.id
         if side.is_dir():
@@ -2455,7 +2483,7 @@ def remove_session_data(s: Session) -> bool:
         # Codex keeps a catalog besides the rollout file, so let its own CLI
         # do the delete, with the session's own account dir as CODEX_HOME
         # (or codex looks in the default dir and misses it, leaving the
-        # account's catalog stale); fall back to removing the rollout.
+        # account's catalog stale); fall back to removing every rollout page.
         # Since codex 0.159 `codex delete <id>` asks for a confirmation and,
         # with its output captured, refuses ("cannot confirm session deletion
         # without an interactive terminal"): --force skips it, and ccr has
@@ -2469,10 +2497,10 @@ def remove_session_data(s: Session) -> bool:
                     return True
         except Exception:
             pass
-        if s.source and Path(s.source).exists():
-            Path(s.source).unlink()
-            return True
-        return False
+        pages = [Path(p) for p in s.parts if Path(p).exists()]
+        for p in pages:
+            p.unlink()
+        return bool(pages)
     p = Path(s.source)
     if not p.exists():
         return False
@@ -2486,10 +2514,10 @@ def remove_session_data(s: Session) -> bool:
 def confirm_delete(s: Session) -> bool:
     size, preview = "", None
     try:
-        p = Path(s.source)
-        n = p.stat().st_size
+        pages = [Path(p) for p in s.parts if Path(p).exists()]
+        n = sum(p.stat().st_size for p in pages)
         size = f"{n/1048576:.1f} MB" if n >= 1048576 else (f"{n//1024} KB" if n >= 1024 else f"{n} B")
-        tail = read_window(p, 64 * 1024, tail=True)
+        tail = read_window(pages[-1], 64 * 1024, tail=True)   # codex: the newest page
         pat = r'"lastPrompt":"((?:[^"\\]|\\.)*)"' if s.tool == "claude" else r'"last_agent_message":"((?:[^"\\]|\\.)*)"'
         mm = re.findall(pat, tail)
         if mm:
