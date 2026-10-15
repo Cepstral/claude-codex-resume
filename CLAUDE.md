@@ -259,7 +259,12 @@ pane, which shows the full title and folder of the highlighted row.
   AttachThreadInput lets the background helper SetForegroundWindow. Verified
   on a test window with two tabs. ccr.py (find_window): `ps -o tty=` ->
   tmux pane (select-window/pane, then a client's tty) -> the iTerm2 session or
-  Terminal.app tab with that tty (AppleScript); not verified on a Mac yet.
+  Terminal.app tab with that tty (AppleScript). Verified on a Mac in
+  Terminal.app on 2026-10-15 (v0.81): macOS `pgrep` leaves out its own
+  ancestors, and Terminal.app is the parent of every tab's `login`, so
+  `pgrep -x Terminal` from inside it found nothing ("neither iTerm2 nor
+  Terminal.app is running"); `pgrep -a -x` includes them. Terminal.app
+  sending Apple events to itself asks for no Automation rights.
 - A codex row's age (last activity, the sort key) is the time on the
   rollout's last line, not the file's mtime (v0.78; Get-CcrCodexLastActivity
   / codex_last; the file time is only the fallback). Verified with codex

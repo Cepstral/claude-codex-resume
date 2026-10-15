@@ -35,7 +35,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.80"
+VERSION = "0.81"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -2436,8 +2436,10 @@ def find_window(s: Session, dry: bool = False) -> str:
                 break
     if sys.platform != "darwin":
         return "" if in_tmux else f"Ctrl-F needs iTerm2, Terminal.app or tmux (no tmux pane shows {tty})"
+    # -a: macOS pgrep leaves out its own ancestors, and the terminal ccr runs
+    # in is one (Terminal.app is the parent of the tab's login).
     apps = [a for a in ("iTerm2", "Terminal")
-            if subprocess.run(["pgrep", "-x", a], capture_output=True).returncode == 0]
+            if subprocess.run(["pgrep", "-a", "-x", a], capture_output=True).returncode == 0]
     if os.environ.get("TERM_PROGRAM") == "Apple_Terminal":
         apps.reverse()
     msg = "neither iTerm2 nor Terminal.app is running"
