@@ -137,7 +137,7 @@ What travels with the synced script folder: the script, `ccr.json` (dirs under t
 No database, no index: the picker enumerates the same on-disk session files the tools' own resume features read.
 
 - **Claude Code** — `<config>\projects\<slug>\<uuid>.jsonl`. Reads a 16 KB head window (cwd, exclusion markers) and a 128 KB tail window (title lines, last timestamp) per file. Sidechain/daemon transcripts are excluded, matching the built-in picker.
-- **Codex** — `~\.codex\sessions\YYYY\MM\DD\rollout-*.jsonl`. Session id from the filename, cwd and title from a bounded streaming read of the first lines, last activity from the time on the file's last line (every rollout line carries one). Not from the file's modified time: Codex appends turns from the desktop app, the IDE extension and subagents without moving it, so it stays at the conversation's start; it is only the fallback.
+- **Codex** — `~\.codex\sessions\YYYY\MM\DD\rollout-*.jsonl`. Session id from the filename, cwd and title from a bounded streaming read of the first lines, last activity from the time on the file's last line (every rollout line carries one). Not from the file's modified time: Codex appends turns from the desktop app, the IDE extension and subagents without moving it, so it stays at the conversation's start; it is only the fallback. A conversation can span several files: with paginated history (the Codex desktop app), editing a message starts a new page `rollout-<ts>-<id>_<page>.jsonl` and the conversation goes on there. ccr shows the pages as one row, takes title and folder from the first page and last activity from the newest one, and reads (Ctrl+K), moves and deletes all of them together.
 
 ### A note on Codex titles
 
