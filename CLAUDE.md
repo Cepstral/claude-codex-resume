@@ -236,6 +236,18 @@ pane, which shows the full title and folder of the highlighted row.
   `# AGENTS.md instructions for <dir>`; the IDE extension's `# Context from
   my IDE setup` block yields the request after `## My request for Codex:`
   (Get-CcrCodexPrompt / codex_prompt).
+- Ctrl+F (v0.79) finds the window of a running conversation, both tools
+  alike (claude's pid from its registry, codex's from the process scan).
+  Windows (Show-CcrSessionWindow): a hidden child PowerShell does the work,
+  because a pwsh host attached to another console breaks (BufferCell errors,
+  2026-10-15). AttachConsole(pid) -> GetConsoleWindow is Windows Terminal's
+  pseudo window, owned by the WT window (GA_ROOTOWNER), or a conhost window;
+  the tab: SetConsoleTitle to a unique marker, UI Automation finds the
+  TabItem whose name holds it and selects it, the title goes back;
+  AttachThreadInput lets the background helper SetForegroundWindow. Verified
+  on a test window with two tabs. ccr.py (find_window): `ps -o tty=` ->
+  tmux pane (select-window/pane, then a client's tty) -> the iTerm2 session or
+  Terminal.app tab with that tty (AppleScript); not verified on a Mac yet.
 - A codex row's age (last activity, the sort key) is the time on the
   rollout's last line, not the file's mtime (v0.78; Get-CcrCodexLastActivity
   / codex_last; the file time is only the fallback). Verified with codex

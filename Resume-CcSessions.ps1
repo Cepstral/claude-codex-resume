@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.78'
+$script:CcrVersion = '0.79'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -1391,6 +1391,135 @@ function Stop-CcrSession {
     if (($LASTEXITCODE -eq 0) -and (Wait-CcrGone $procId 3000)) { return $true }
     if ($IsWindows) { $null = & taskkill /PID $procId /T /F 2>&1 } else { $null = & kill -KILL $procId 2>&1 }
     Wait-CcrGone $procId 3000
+}
+
+# Ctrl+F: bring the window of a conversation running here to the front,
+# select its tab and make it blink. Returns '' when done, else why not.
+# The work runs in a separate hidden PowerShell: it attaches to the
+# conversation's console, and a pwsh host attached to another console breaks
+# (verified 2026-10-15). From that console: its window - Windows Terminal's
+# pseudo window, owned by the WT window, or a conhost window - and its title.
+# The tab: the console gets a title nobody else has for a moment, UI
+# Automation finds the WT tab showing it and selects it, the title goes back.
+# Then the window comes to the front (restored if minimized; AttachThreadInput
+# lets a background process do it), flashes in the taskbar, and the tab's
+# title blinks three times.
+function Show-CcrSessionWindow {
+    param([Parameter(Mandatory)][object]$Session)
+    $result = Join-Path ([IO.Path]::GetTempPath()) "ccr-find-$([guid]::NewGuid().ToString('N')).txt"
+    $child = @'
+$ErrorActionPreference = 'Stop'
+$target = [uint32]__PID__
+$resultFile = '__RESULT__'
+Add-Type -TypeDefinition @"
+using System; using System.Text; using System.Runtime.InteropServices;
+public static class CcrWin {
+  [DllImport("kernel32.dll")] static extern bool FreeConsole();
+  [DllImport("kernel32.dll")] static extern bool AttachConsole(uint pid);
+  [DllImport("kernel32.dll")] static extern IntPtr GetConsoleWindow();
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode)] static extern uint GetConsoleTitle(StringBuilder t, uint n);
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode)] static extern bool SetConsoleTitle(string t);
+  [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr h, uint flags);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder s, int n);
+  [DllImport("user32.dll")] static extern bool IsIconic(IntPtr h);
+  [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int cmd);
+  [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, IntPtr pid);
+  [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+  [DllImport("user32.dll")] static extern bool AttachThreadInput(uint a, uint b, bool attach);
+  [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr h);
+  [StructLayout(LayoutKind.Sequential)] struct FLASHWINFO { public uint cbSize; public IntPtr hwnd; public uint dwFlags; public uint uCount; public uint dwTimeout; }
+  [DllImport("user32.dll")] static extern bool FlashWindowEx(ref FLASHWINFO f);
+  public static string ClassOf(IntPtr h) { var s = new StringBuilder(256); GetClassName(h, s, 256); return s.ToString(); }
+  public static IntPtr Console(uint pid, out string title) {
+    title = null;
+    FreeConsole();
+    if (!AttachConsole(pid)) return IntPtr.Zero;
+    try { var t = new StringBuilder(1024); GetConsoleTitle(t, 1024); title = t.ToString(); return GetConsoleWindow(); }
+    finally { FreeConsole(); }
+  }
+  public static bool Title(uint pid, string title) {
+    FreeConsole();
+    if (!AttachConsole(pid)) return false;
+    try { return SetConsoleTitle(title); } finally { FreeConsole(); }
+  }
+  public static IntPtr TopLevel(IntPtr con) { var h = GetAncestor(con, 3); return h != IntPtr.Zero ? h : con; }
+  public static bool Front(IntPtr h) {
+    if (IsIconic(h)) ShowWindow(h, 9);
+    uint me = GetCurrentThreadId(), them = GetWindowThreadProcessId(GetForegroundWindow(), IntPtr.Zero);
+    bool att = them != 0 && them != me && AttachThreadInput(me, them, true);
+    try { BringWindowToTop(h); return SetForegroundWindow(h); }
+    finally { if (att) AttachThreadInput(me, them, false); }
+  }
+  public static void Flash(IntPtr h, uint n) {
+    var f = new FLASHWINFO { hwnd = h, dwFlags = 3, uCount = n, dwTimeout = 0 };
+    f.cbSize = (uint)Marshal.SizeOf(f);
+    FlashWindowEx(ref f);
+  }
+}
+"@
+try {
+    $title = $null
+    $con = [CcrWin]::Console($target, [ref]$title)
+    if ($con -eq [IntPtr]::Zero) { [IO.File]::WriteAllText($resultFile, 'noconsole'); return }
+    $top = [CcrWin]::TopLevel($con)
+    $tab = $false
+    if ([CcrWin]::ClassOf($top) -eq 'CASCADIA_HOSTING_WINDOW_CLASS') {
+        $mark = "ccr-find-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+        try {
+            Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
+            [void][CcrWin]::Title($target, $mark)
+            $win = [Windows.Automation.AutomationElement]::FromHandle($top)
+            $isTab = [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ControlTypeProperty, [Windows.Automation.ControlType]::TabItem)
+            for ($i = 0; $i -lt 20 -and -not $tab; $i++) {
+                foreach ($el in $win.FindAll([Windows.Automation.TreeScope]::Descendants, $isTab)) {
+                    if ($el.Current.Name.Contains($mark)) {
+                        $el.GetCurrentPattern([Windows.Automation.SelectionItemPattern]::Pattern).Select()
+                        $tab = $true
+                        break
+                    }
+                }
+                if (-not $tab) { Start-Sleep -Milliseconds 100 }
+            }
+        }
+        finally { [void][CcrWin]::Title($target, $title) }
+    }
+    $front = [CcrWin]::Front($top)
+    [IO.File]::WriteAllText($resultFile, "$(if ($tab) { 'tab' } else { 'window' }) $front $([CcrWin]::ClassOf($top))")
+    [CcrWin]::Flash($top, 4)
+    $blink = "$([char]0x25B6)$([char]0x25B6)$([char]0x25B6) $title $([char]0x25C0)$([char]0x25C0)$([char]0x25C0)"
+    for ($i = 0; $i -lt 3; $i++) {
+        [void][CcrWin]::Title($target, $blink); Start-Sleep -Milliseconds 300
+        [void][CcrWin]::Title($target, $title); Start-Sleep -Milliseconds 300
+    }
+}
+catch { if (-not (Test-Path -LiteralPath $resultFile)) { [IO.File]::WriteAllText($resultFile, "error $_") } }
+finally {
+    # ccr reads the answer as soon as it is there
+    Start-Sleep -Milliseconds 1000
+    Remove-Item -LiteralPath $resultFile -ErrorAction SilentlyContinue
+}
+'@
+    $child = $child.Replace('__PID__', "$([int]$Session.ProcessId)").Replace('__RESULT__', $result.Replace("'", "''"))
+    $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($child))
+    $exe = (Get-Process -Id $PID).Path
+    try { $p = Start-Process -FilePath $exe -ArgumentList '-NoProfile', '-NonInteractive', '-EncodedCommand', $enc -WindowStyle Hidden -PassThru }
+    catch { return "ccr: could not start the helper that finds windows: $_" }
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while (-not (Test-Path -LiteralPath $result) -and -not $p.HasExited -and $sw.Elapsed.TotalSeconds -lt 10) { Start-Sleep -Milliseconds 100 }
+    Start-Sleep -Milliseconds 50
+    $r = try { [IO.File]::ReadAllText($result) } catch { '' }
+    $what = "'$($Session.Title)'"
+    if (-not $r) { return "ccr: no answer from the helper that finds windows ($what, pid $($Session.ProcessId))." }
+    if ($r -eq 'noconsole') { return "ccr: $what (pid $($Session.ProcessId)) has no console window here - closed meanwhile?" }
+    if ($r.StartsWith('error ')) { return "ccr: could not find the window of $what - $($r.Substring(6))" }
+    $f = $r -split ' '
+    if ($f[1] -ne 'True') { return "ccr: Windows did not let ccr bring $what to the front; its window flashes in the taskbar." }
+    if ($f[0] -eq 'window' -and $f[2] -eq 'CASCADIA_HOSTING_WINDOW_CLASS') {
+        return "ccr: brought the window of $what to the front, but could not tell its tab (a profile with suppressApplicationTitle, or a split pane): its title blinks."
+    }
+    ''
 }
 
 # Full-screen confirmation before closing a running conversation.
@@ -4400,6 +4529,7 @@ function Get-CcrPickerGuide([int]$Width, [bool]$AcctMode, [bool]$LimitsOn) {
             @('Ctrl+J', 'the usage details of the highlighted row'))
         , @('Managing',
             @('Ctrl+A', 'accounts: add one, log in, copy settings, remove, turn multi-account mode off'),
+            @('Ctrl+F', 'find the window of the running conversation of the highlighted row: it comes to the front with its tab selected, and its title blinks'),
             @('Ctrl+X', 'close the running conversation of the highlighted row (it is kept)'),
             @('Ctrl+I  or  Ctrl+T', 'install or update Claude Code and Codex with their official installers'),
             @('Del', 'delete the highlighted conversation for good, after a confirmation'),
@@ -5156,6 +5286,23 @@ function Select-CcrSession {
                             if (Stop-CcrSession -Session $s) { $s.Running = $false; $s.ProcessId = $null; $s.RunKind = '' }
                             else { Show-CcrNotice "ccr: could not close '$($s.Title)' (pid $($s.ProcessId))." }
                         }
+                    }
+                }
+                continue
+            }
+            # Ctrl+F: find the window of the running conversation of the
+            # highlighted row - to the front, its tab selected, blinking.
+            if ($k.Key -eq [ConsoleKey]::F -and $ctrl) {
+                if ($view.Count -gt 0) {
+                    $s = $view[$cursor]
+                    if ($s.RunningOn) { Show-CcrNotice "ccr: '$($s.Title)' is open on $($s.RunningOn) - its window is there." '33' }
+                    elseif (-not $s.Running) { Show-CcrNotice "ccr: '$($s.Title)' is not running - there is no window to find." '33' }
+                    elseif ($s.RunKind -eq 'bg') { Show-CcrNotice "ccr: '$($s.Title)' is a background session - it has no window." '33' }
+                    elseif ($WhatIfPreference) { Show-CcrNotice "WhatIf: would bring the window of '$($s.Title)' (pid $($s.ProcessId)) to the front." '33' }
+                    else {
+                        [Console]::Write("`e[H`e[33mccr: looking for the window of '$($s.Title)'...`e[39m`e[K")
+                        $why = Show-CcrSessionWindow -Session $s
+                        if ($why) { Show-CcrNotice $why '33' }
                     }
                 }
                 continue

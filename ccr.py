@@ -35,7 +35,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.78"
+VERSION = "0.79"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -1832,6 +1832,8 @@ def picker_guide(ctx, lim=None, width: int = 0) -> list:
              if lim and lim.on else [])),
         ("Managing", [
             ("Ctrl-A", "accounts: add one, log in, copy settings, remove, turn multi-account mode off"),
+            ("Ctrl-F", "find the window of the running conversation of the highlighted row: it comes to the front "
+                       "with its tab selected, and it blinks (iTerm2, Terminal.app, tmux)"),
             ("Ctrl-X", "close the running conversation of the highlighted row (it is kept)"),
             ("Ctrl-T", "install or update Claude Code and Codex with their official installers"),
             ("Del", "delete the highlighted conversation for good, after a confirmation"),
@@ -2322,6 +2324,100 @@ def stop_session(s: Session) -> bool:
     except (OSError, ProcessLookupError):
         pass
     return _gone(pid, 3)
+
+
+FIND_BLINK = "{65535, 45000, 0}"   # amber, for three blinks of the tab found
+
+
+def _find_script(app: str, tty: str) -> str:
+    """AppleScript: the tab of `app` whose tty is `tty` comes to the front,
+    selected, and its background blinks; an error when no tab has it. The
+    loop variables are references by position, and bringing a window to the
+    front reorders the windows: `contents of` pins them first (window id)."""
+    t = applescript_str(tty)
+
+    def blink(o):
+        return (f"set bc to background color of {o}\nrepeat 3 times\n"
+                f"set background color of {o} to {FIND_BLINK}\ndelay 0.25\n"
+                f"set background color of {o} to bc\ndelay 0.25\nend repeat\n")
+    if app == "iTerm2":
+        return ('tell application "iTerm2"\nrepeat with w in windows\nrepeat with t in tabs of w\n'
+                'repeat with s in sessions of t\n'
+                f'if tty of s is {t} then\n'
+                'set tw to contents of w\nset tt to contents of t\nset ts to contents of s\n'
+                'try\nif miniaturized of tw then set miniaturized of tw to false\nend try\n'
+                'select tw\nselect tt\nselect ts\nactivate\n'
+                + blink("ts") +
+                'return "ok"\nend if\nend repeat\nend repeat\nend repeat\nend tell\n'
+                f'error "no iTerm2 tab shows " & {t}')
+    return ('tell application "Terminal"\nrepeat with w in windows\nrepeat with t in tabs of w\n'
+            f'if tty of t is {t} then\n'
+            'set tw to contents of w\nset tt to contents of t\n'
+            'if miniaturized of tw then set miniaturized of tw to false\n'
+            'set selected of tt to true\nset index of tw to 1\n'
+            'try\nset frontmost of tw to true\nend try\nactivate\n'
+            + blink("tt") +
+            'return "ok"\nend if\nend repeat\nend repeat\nend tell\n'
+            f'error "no Terminal tab shows " & {t}')
+
+
+def find_window(s: Session, dry: bool = False) -> str:
+    """Ctrl-F: bring the terminal of a conversation running here to the
+    front, its tab selected, and make it blink. '' when done, else why not.
+    From the process to its tty (`ps -o tty=`); a tmux pane on that tty gets
+    its window and pane selected, and the terminal showing a client of that
+    session is the one to find; then the iTerm2 session or Terminal.app tab
+    whose tty matches. The PowerShell picker does the same with Windows
+    Terminal (Show-CcrSessionWindow)."""
+    if os.name == "nt":
+        return "Ctrl-F: on Windows the PowerShell ccr finds windows (Windows Terminal); ccr.py has no tab backend there"
+    try:
+        tty = subprocess.run(["ps", "-o", "tty=", "-p", str(s.pid)], capture_output=True, text=True,
+                             timeout=5).stdout.strip()
+    except Exception:
+        tty = ""
+    if not tty or tty.startswith("?"):
+        return f"'{s.title}' (pid {s.pid}) has no terminal"
+    if not tty.startswith("/dev/"):
+        tty = "/dev/" + tty
+    if dry:
+        return f"dry-run: would bring the terminal showing {tty} ('{s.title}', pid {s.pid}) to the front"
+    in_tmux = False
+    if shutil.which("tmux"):
+        try:
+            panes = subprocess.run(["tmux", "list-panes", "-a", "-F",
+                                    "#{pane_tty}\t#{session_name}\t#{window_id}\t#{pane_id}"],
+                                   capture_output=True, text=True, timeout=5).stdout.splitlines()
+        except Exception:
+            panes = []
+        for line in panes:
+            f = line.split("\t")
+            if len(f) == 4 and f[0] == tty:
+                _, sess, win, pane = f
+                in_tmux = True
+                subprocess.run(["tmux", "select-window", "-t", win], capture_output=True)
+                subprocess.run(["tmux", "select-pane", "-t", pane], capture_output=True)
+                for style in ("bg=colour130", "bg=default") * 3:
+                    subprocess.run(["tmux", "select-pane", "-t", pane, "-P", style], capture_output=True)
+                    time.sleep(0.25)
+                clients = subprocess.run(["tmux", "list-clients", "-t", sess, "-F", "#{client_tty}"],
+                                         capture_output=True, text=True).stdout.split()
+                if not clients:
+                    return f"'{s.title}' runs in tmux session '{sess}', which no terminal shows: tmux attach -t {sess}"
+                tty = clients[0]
+                break
+    if sys.platform != "darwin":
+        return "" if in_tmux else f"Ctrl-F needs iTerm2, Terminal.app or tmux (no tmux pane shows {tty})"
+    apps = [a for a in ("iTerm2", "Terminal")
+            if subprocess.run(["pgrep", "-x", a], capture_output=True).returncode == 0]
+    if os.environ.get("TERM_PROGRAM") == "Apple_Terminal":
+        apps.reverse()
+    msg = "neither iTerm2 nor Terminal.app is running"
+    for app in apps:
+        ok, msg = run_osascript(_find_script(app, tty))
+        if ok:
+            return ""
+    return f"could not find the window of '{s.title}' ({tty}): {msg}"
 
 
 def confirm_close(s: Session) -> bool:
@@ -5643,7 +5739,7 @@ def main():
             lim.port = free_port() if lim.pending and fzf_version() >= (0, 45) else 0
             res = run_fzf(rows, picker_hint(ctx, upd_note, lim), query=query,
                           expect=["del", "ctrl-n", "ctrl-p", "ctrl-a", "ctrl-o", "ctrl-k", "ctrl-j", "ctrl-x", "ctrl-e",
-                                  "ctrl-t", "ctrl-l", "ctrl-g", "f1"], listen=lim.port)
+                                  "ctrl-t", "ctrl-l", "ctrl-g", "f1", "ctrl-f"], listen=lim.port)
             lim.port = 0
             if res is None:
                 print("ccr: cancelled.")
@@ -5705,6 +5801,24 @@ def main():
                     pause()
                     restart = True
                     upd_note = ""   # the banner is for the first listing only
+                continue
+            if key == "ctrl-f":
+                # Find the window of the running conversation of the highlighted
+                # row: to the front, its tab selected, blinking.
+                if picked:
+                    s = picked[0]
+                    if s.running_on:
+                        why = f"'{s.title}' is open on {s.running_on} - its window is there."
+                    elif not s.running:
+                        why = f"'{s.title}' is not running - there is no window to find."
+                    elif s.run_kind == "bg":
+                        why = f"'{s.title}' is a background session - it has no window."
+                    else:
+                        print(f"{YELLOW}ccr: looking for the window of '{s.title}'...{RESET}")
+                        why = find_window(s, a.dry_run)
+                    if why:
+                        print(f"{YELLOW}ccr: {why}{RESET}")
+                        pause("(Enter to continue)")
                 continue
             if key == "ctrl-x":
                 # Close the running conversation of the highlighted row (a stray
