@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.76'
+$script:CcrVersion = '0.77'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -4358,7 +4358,7 @@ function Show-CcrLaunchOptions {
 
 # The picker's key legend, broken at its separators into as many lines as
 # the window needs: cut at the window's edge, it hid the keys at its end.
-# The picker's guide (Ctrl+G): every key with a short explanation, then what
+# The picker's guide (Ctrl+G or F1): every key with a short explanation, then what
 # the signs on a row and the table on top mean. Lines for a window $Width
 # wide: the explanations wrap under themselves.
 function Get-CcrPickerGuide([int]$Width, [bool]$AcctMode, [bool]$LimitsOn) {
@@ -4382,7 +4382,7 @@ function Get-CcrPickerGuide([int]$Width, [bool]$AcctMode, [bool]$LimitsOn) {
             @('Ctrl+X', 'close the running conversation of the highlighted row (it is kept)'),
             @('Ctrl+I  or  Ctrl+T', 'install or update Claude Code and Codex with their official installers'),
             @('Del', 'delete the highlighted conversation for good, after a confirmation'),
-            @('Ctrl+G', 'this guide'))
+            @('Ctrl+G  or  F1', 'this guide (F1 for when another program takes Ctrl+G: Grammarly does on a Mac)'))
         , @('Signs on a row',
             @("$([char]0x25CF)  1 2 $([char]0x2026)", 'marked; a number: it opens under that account of the table on top'),
             @('run  bg  @host', "the age column: running here $d a Claude background session $d open on another PC"),
@@ -4917,8 +4917,8 @@ function Select-CcrSession {
             $w = [Console]::WindowWidth
             $h = [Console]::WindowHeight
             # The key legend wraps onto as many lines as the window needs.
-            # The essentials; every other key is in the guide (Ctrl+G).
-            $hint = "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space $(if ($acctMode) { 'account' } else { 'mark' }) $([char]0x00B7) Enter open $([char]0x00B7) Ctrl+N new $([char]0x00B7) Ctrl+G guide: all the keys $([char]0x00B7) Esc cancel $([char]0x00B7) type to filter $([char]0x00B7) v$script:CcrVersion"
+            # The essentials; every other key is in the guide (Ctrl+G or F1).
+            $hint = "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space $(if ($acctMode) { 'account' } else { 'mark' }) $([char]0x00B7) Enter open $([char]0x00B7) Ctrl+N new $([char]0x00B7) Ctrl+G/F1 guide: all the keys $([char]0x00B7) Esc cancel $([char]0x00B7) type to filter $([char]0x00B7) v$script:CcrVersion"
             $hintLines = @(Split-CcrHint $hint ($w - 1))
             $tableLines = @(Get-CcrAccountTable $w)
             $viewH = [Math]::Max(1, $h - 1 - $hintLines.Count - $tableLines.Count - $(if ($updNote) { 1 } else { 0 }))
@@ -5140,7 +5140,8 @@ function Select-CcrSession {
                 continue
             }
             # Ctrl+G: the guide - every key, the signs on a row, the table on top.
-            if ($k.Key -eq [ConsoleKey]::G -and $ctrl) {
+            # F1 too: on a Mac, Grammarly's AI Chat takes Ctrl+G system-wide.
+            if (($k.Key -eq [ConsoleKey]::G -and $ctrl) -or $k.Key -eq [ConsoleKey]::F1) {
                 Show-CcrPickerGuide $acctMode $limitsOn
                 continue
             }

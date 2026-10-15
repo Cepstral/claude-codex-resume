@@ -114,7 +114,9 @@ The key line above the list names only the essentials plus Ctrl+G, the guide
 (Get-CcrPickerGuide / picker_guide): a full page with every key, the signs
 on a row and the table on top (v0.76, after a colleague found the old
 15-key line unreadable). A new key goes into both guides, not into the line.
-fzf's own ctrl-g (abort) is taken over by `--expect`.
+fzf's own ctrl-g (abort) is taken over by `--expect`. F1 opens it too
+(v0.77): on a Mac, Grammarly's AI Chat takes Ctrl+G system-wide, so the
+terminal never sees it, even when focused. Windows Terminal binds no F1.
 The install page is Ctrl+I on Windows as asked, plus Ctrl+T on both sides:
 fzf cannot take ctrl-i, the byte Tab sends too, so it would steal marking.
 

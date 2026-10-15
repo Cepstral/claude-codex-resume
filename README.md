@@ -97,7 +97,7 @@ ccr -WhatIf            # print the wt.exe command line, launch nothing
 ccr -Install codex     # install codex here - or update it - with its official installer (-Install all: both tools)
 ```
 
-The line above the list names only the essentials — move, mark, open, new, cancel — and **`Ctrl+G`**, the guide: a full page with every key and a short explanation of it, what the signs on a row mean (`run`, `@host`, `(cleared)`, `(archived)`…) and what the account table on top shows. Any key goes back to the list.
+The line above the list names only the essentials — move, mark, open, new, cancel — and **`Ctrl+G`** (or **`F1`**), the guide: a full page with every key and a short explanation of it, what the signs on a row mean (`run`, `@host`, `(cleared)`, `(archived)`…) and what the account table on top shows. Any key goes back to the list. `F1` is there for when another program takes `Ctrl+G` before the terminal sees it: on a Mac, Grammarly's AI Chat does.
 
 | Key | Action |
 |---|---|
@@ -116,7 +116,7 @@ The line above the list names only the essentials — move, mark, open, new, can
 | any character | filter (matches tool, title and path; also the words `run`, `bg`, `cleared`, `archived`, `elsewhere` and `@host`) |
 | `Backspace` | edit filter |
 | `Esc` | clear filter, then cancel |
-| `Ctrl+G` | the guide: every key with a short explanation, the signs on a row, the table on top (`↑` `↓` scroll it in a low window) |
+| `Ctrl+G` (or `F1`) | the guide: every key with a short explanation, the signs on a row, the table on top (`↑` `↓` scroll it in a low window) |
 
 The age column doubles as the running flag: red **`run`** = running on this PC, red **`bg`** = a Claude background session (`claude --bg`) running here, yellow **`@host`** = open on another PC that shares the data dir. Enter on an `@host` row asks first, because two processes would append to the same transcript; Del and moving it to another account are refused until it is closed there.
 
@@ -178,7 +178,7 @@ The installer puts `ccr` in `~/.local/bin` (tells you if that isn't on your PATH
 | `Ctrl-X` | close the running conversation of the highlighted row after a confirmation: `claude stop` for a Claude background session, else the process (SIGTERM, SIGKILL after 3 s). The conversation is kept. Same key and rules as the PowerShell picker; the age column shows `run`, `bg` or `@host` the same way |
 | `Del` | delete the highlighted conversation after a confirmation |
 | `Esc` | cancel |
-| `Ctrl-G` | the guide, as on Windows: printed in full, `Enter` goes back to the list (fzf's own Ctrl-G, abort, is taken over) |
+| `Ctrl-G` · `F1` | the guide, as on Windows: printed in full, `Enter` goes back to the list (fzf's own Ctrl-G, abort, is taken over). `F1` (`fn`+`F1` on a Mac keyboard) for when another app takes Ctrl-G system-wide, as Grammarly's AI Chat does |
 
 ### Codex app vs Codex CLI
 
@@ -210,7 +210,7 @@ folder as the thread's workspace root — registering it as a project when it is
 Codex conversation starts there with the project already set up. A first message typed at the prompt (or the trailing
 text of `ccr -n TEXT`) is prefilled in the composer; nothing is sent for you.
 
-The legend sits above the prompt rather than under it, one line of the essential keys with `Ctrl-G` for the
+The legend sits above the prompt rather than under it, one line of the essential keys with `Ctrl-G` / `F1` for the
 guide, the keys picked out in colour and the rest kept quiet — and the two-step new-conversation menu labels which step you are on
 and which folder you chose. A preview pane shows the full title, folder, how the row will open, last-used time and
 session id of the highlighted row. Everything beyond the plain picker is version-gated, so an older fzf loses the

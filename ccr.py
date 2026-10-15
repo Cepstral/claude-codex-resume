@@ -35,7 +35,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.76"
+VERSION = "0.77"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -1809,7 +1809,8 @@ def picker_guide(ctx, lim=None, width: int = 0) -> list:
             ("Ctrl-X", "close the running conversation of the highlighted row (it is kept)"),
             ("Ctrl-T", "install or update Claude Code and Codex with their official installers"),
             ("Del", "delete the highlighted conversation for good, after a confirmation"),
-            ("Ctrl-G", "this guide"),
+            ("Ctrl-G  or  F1", "this guide (F1, fn+F1 on a Mac keyboard, for when another app takes Ctrl-G: "
+                               "Grammarly's AI Chat does on a Mac)"),
         ]),
         ("Signs on a row", [
             ("●", "marked"),
@@ -1849,8 +1850,8 @@ def picker_hint(ctx: Ctx, upd_note: str = "", lim: Limits = None) -> str:
         f, t = upd_note.split(">", 1)
         lines.append(f"{BOLD}{GREEN}ccr updated v{f} -> v{t}{RESET}")
     lines += account_table(ctx, lim)
-    # The essentials; every other key is in the guide (Ctrl-G).
-    keys = [("↑↓", "move"), ("Tab", "mark"), ("Enter", "open"), ("Ctrl-N", "new"), ("Ctrl-G", "guide: all the keys"),
+    # The essentials; every other key is in the guide (Ctrl-G or F1).
+    keys = [("↑↓", "move"), ("Tab", "mark"), ("Enter", "open"), ("Ctrl-N", "new"), ("Ctrl-G/F1", "guide: all the keys"),
             ("Esc", "cancel")]
     lines.append(right_align(hint(*keys) + f"{DIM}  ·  type to filter{RESET}", f"{DIM}ccr v{VERSION}{RESET}"))
     return "\n".join(lines)
@@ -5615,15 +5616,16 @@ def main():
             lim.port = free_port() if lim.pending and fzf_version() >= (0, 45) else 0
             res = run_fzf(rows, picker_hint(ctx, upd_note, lim), query=query,
                           expect=["del", "ctrl-n", "ctrl-p", "ctrl-a", "ctrl-o", "ctrl-k", "ctrl-j", "ctrl-x", "ctrl-e",
-                                  "ctrl-t", "ctrl-l", "ctrl-g"], listen=lim.port)
+                                  "ctrl-t", "ctrl-l", "ctrl-g", "f1"], listen=lim.port)
             lim.port = 0
             if res is None:
                 print("ccr: cancelled.")
                 return
             key, ids = res
             picked = [index[i] for i in ids if i in index]
-            if key == "ctrl-g":
+            if key in ("ctrl-g", "f1"):
                 # The guide: every key, the signs on a row, the table on top.
+                # F1 too: on a Mac, Grammarly's AI Chat takes Ctrl-G system-wide.
                 print("\033[H\033[2J" + "\n".join(picker_guide(ctx, lim)))
                 pause("\n(Enter: back to the list)")
                 continue
