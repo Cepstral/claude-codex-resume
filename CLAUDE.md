@@ -131,6 +131,17 @@ fzf's own ctrl-g (abort) is taken over by `--expect`. F1 opens it too
 terminal never sees it, even when focused. Windows Terminal binds no F1.
 The install page is Ctrl+I on Windows as asked, plus Ctrl+T on both sides:
 fzf cannot take ctrl-i, the byte Tab sends too, so it would steal marking.
+Delete is Del or Ctrl+Backspace on both sides (v0.83), for keyboards
+without Del, and takes the marked rows (one list to confirm, the rows still
+open kept and named) or else the highlighted one (the detailed page).
+Terminals send Ctrl+Backspace as ^H, and fzf reads ^H as `ctrl-h` (verified
+with fzf 0.74 in a pty: 0x08 -> ctrl-h, 0x7f -> bspace, ESC[3~ -> del), so
+ccr.py expects ctrl-h, except where `stty erase` is ^H and Backspace itself
+sends it (delete_keys). Which byte a given terminal sends for Ctrl+Backspace
+was not checked with a real key press (macOS refuses System Events
+keystrokes from here); a terminal that sends 0x7f for it cannot tell it from
+Backspace, and there only Del (fn+⌫ on a Mac) deletes. The PowerShell picker
+takes Backspace or H with Ctrl; pwsh on macOS gets ^H as one of them (pty).
 
 Known asymmetries (2026-09-17): `ccr.py` has Codex desktop-app support
 (`codex app` rows, deeplinks, `--terminal`) and a `+ new folder` entry on

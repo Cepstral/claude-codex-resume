@@ -8,7 +8,8 @@ as the launch backend. Python 3.9+, stdlib only; fzf for UI.
 
 Keys in the picker (fzf conventions): type to fuzzy-filter, Tab marks,
 Enter opens, Ctrl-E opens with a model / effort, Ctrl-N new conversation, Ctrl-P MAP (multi-agent panel), Ctrl-A accounts, Ctrl-O open the
-marked rows under another account, Ctrl-T installs or updates claude / codex, Del deletes, Esc cancels.
+marked rows under another account, Ctrl-T installs or updates claude / codex, Del (or Ctrl-Backspace) deletes
+the marked rows or the highlighted one, Esc cancels.
 """
 import argparse
 import base64
@@ -35,7 +36,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.82"
+VERSION = "0.83"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -1865,7 +1866,8 @@ def picker_guide(ctx, lim=None, width: int = 0) -> list:
                        "with its tab selected, and it blinks (iTerm2, Terminal.app, tmux)"),
             ("Ctrl-X", "close the running conversation of the highlighted row (it is kept)"),
             ("Ctrl-T", "install or update Claude Code and Codex with their official installers"),
-            ("Del", "delete the highlighted conversation for good, after a confirmation"),
+            ("Del  or  Ctrl-Backspace", "delete the marked conversations, or the highlighted one, for good, "
+                                        "after a confirmation (fn+⌫ is Del on a Mac keyboard)"),
             ("Ctrl-G  or  F1", "this guide (F1, fn+F1 on a Mac keyboard, for when another app takes Ctrl-G: "
                                "Grammarly's AI Chat does on a Mac)"),
         ]),
@@ -2525,12 +2527,62 @@ def remove_session_data(s: Session) -> bool:
     return True
 
 
+def delete_keys() -> list:
+    """The picker's delete keys: Del, and Ctrl+Backspace for keyboards
+    without a Del key. Terminals send Ctrl+Backspace as ^H, which fzf reads
+    as ctrl-h - unless Backspace itself sends ^H here (stty erase ^H): then
+    ctrl-h is left to fzf, as the filter's backspace."""
+    try:
+        import termios
+        with open("/dev/tty") as tty:
+            if termios.tcgetattr(tty)[6][termios.VERASE] in (b"\x08", 8):
+                return ["del"]
+    except Exception:
+        pass
+    return ["del", "ctrl-h"]
+
+
+def fmt_size(n: int) -> str:
+    return f"{n/1048576:.1f} MB" if n >= 1048576 else (f"{n//1024} KB" if n >= 1024 else f"{n} B")
+
+
+def session_size(s: Session) -> int:
+    """Bytes on disk: the transcript, or every page of a codex thread."""
+    try:
+        return sum(Path(p).stat().st_size for p in s.parts if Path(p).exists())
+    except OSError:
+        return 0
+
+
+def confirm_delete_many(victims: list, kept: list) -> bool:
+    """Del / Ctrl-Backspace on several marked rows: one confirmation for all
+    of them. The rows still open (running here, or on another computer) are
+    named apart and kept."""
+    print(f"\n{RED}Delete these {len(victims)} conversations permanently?{RESET}\n")
+    total = 0
+    for s in victims:
+        n = session_size(s)
+        total += n
+        acct = f" {MAGENTA}{s.root}{RESET}" if s.root else ""
+        print(f"    {s.tool:<6}{acct} · {BOLD}{s.title}{RESET}  "
+              f"{DIM}{fmt_cwd(s.cwd, 40)} · {fmt_age(s.last)} · {fmt_size(n)}{RESET}")
+    print(f"\n    size:      {fmt_size(total)} in all")
+    if kept:
+        why = ", ".join(f"'{s.title}' ({'on ' + s.running_on if s.running_on else 'running'})" for s in kept)
+        print(f"\n  {YELLOW}kept, still open: {why} - close them first{RESET}")
+    print(f"\n  {DIM}removed from disk, no undo (codex: via 'codex delete'){RESET}")
+    if any(s.tool == "codex" and s.origin == "app" for s in victims) and not shutil.which("codex"):
+        print(f"  {YELLOW}the Codex app keeps its own copy: without the 'codex' CLI this only drops "
+              f"the transcript, the thread stays in the app{RESET}")
+    ans = ask(f"  {RED}[y]{RESET} delete {len(victims)}    {DIM}anything else: cancel{RESET} > ")
+    return bool(ans) and ans.strip().lower() == "y"
+
+
 def confirm_delete(s: Session) -> bool:
     size, preview = "", None
     try:
         pages = [Path(p) for p in s.parts if Path(p).exists()]
-        n = sum(p.stat().st_size for p in pages)
-        size = f"{n/1048576:.1f} MB" if n >= 1048576 else (f"{n//1024} KB" if n >= 1024 else f"{n} B")
+        size = fmt_size(sum(p.stat().st_size for p in pages))
         tail = read_window(pages[-1], 64 * 1024, tail=True)   # codex: the newest page
         pat = r'"lastPrompt":"((?:[^"\\]|\\.)*)"' if s.tool == "claude" else r'"last_agent_message":"((?:[^"\\]|\\.)*)"'
         mm = re.findall(pat, tail)
@@ -5780,7 +5832,7 @@ def main():
             lim.header = lambda: picker_hint(ctx, note, lim)
             lim.port = free_port() if lim.pending and fzf_version() >= (0, 45) else 0
             res = run_fzf(rows, picker_hint(ctx, upd_note, lim), query=query,
-                          expect=["del", "ctrl-n", "ctrl-p", "ctrl-a", "ctrl-o", "ctrl-k", "ctrl-j", "ctrl-x", "ctrl-e",
+                          expect=delete_keys() + ["ctrl-n", "ctrl-p", "ctrl-a", "ctrl-o", "ctrl-k", "ctrl-j", "ctrl-x", "ctrl-e",
                                   "ctrl-t", "ctrl-l", "ctrl-g", "f1", "ctrl-f"], listen=lim.port)
             lim.port = 0
             if res is None:
@@ -5883,29 +5935,41 @@ def main():
                             print(f"ccr: could not close '{s.title}' (pid {s.pid}).", file=sys.stderr)
                             pause("(Enter to continue)")
                 continue
-            if key == "del":
+            if key in ("del", "ctrl-h"):
+                # Del, or Ctrl-Backspace (^H, fzf's ctrl-h): the marked rows,
+                # or the highlighted one. Rows still open are kept.
                 if not picked:
                     continue
-                victim = picked[0]
-                if victim.running:
-                    print(f"ccr: '{victim.title}' is running right now - close it first (Ctrl-X).")
+                kept = [x for x in picked if x.running or x.running_on]
+                victims = [x for x in picked if x not in kept]
+                if len(picked) == 1 and kept:
+                    v = kept[0]
+                    print(f"ccr: '{v.title}' is open on {v.running_on} - close it there first." if v.running_on
+                          else f"ccr: '{v.title}' is running right now - close it first (Ctrl-X).")
                     pause("(Enter to continue)")
                     continue
-                if victim.running_on:
-                    print(f"ccr: '{victim.title}' is open on {victim.running_on} - close it there first.")
+                if not victims:
+                    print("ccr: every marked conversation is open right now - close them first (Ctrl-X).")
                     pause("(Enter to continue)")
                     continue
-                if confirm_delete(victim):
-                    if a.dry_run:
-                        print(f"dry-run: would delete '{victim.title}'")
-                    else:
+                if confirm_delete(victims[0]) if len(picked) == 1 else confirm_delete_many(victims, kept):
+                    failed = []
+                    for v in victims:
+                        if a.dry_run:
+                            print(f"dry-run: would delete '{v.title}'")
+                            continue
                         try:
-                            ok = remove_session_data(victim)
+                            ok = remove_session_data(v)
                         except Exception as e:
                             ok = False
-                            print(f"ccr: delete failed: {e}", file=sys.stderr)
+                            print(f"ccr: delete of '{v.title}' failed: {e}", file=sys.stderr)
                         if ok:
-                            sessions = [s for s in sessions if s.key != victim.key]
+                            sessions = [s for s in sessions if s.key != v.key]
+                        else:
+                            failed.append(v)
+                    if failed:
+                        print(f"ccr: could not delete {', '.join(repr(v.title) for v in failed)}.", file=sys.stderr)
+                        pause("(Enter to continue)")
                 query = ""
                 continue
             if key == "ctrl-e":

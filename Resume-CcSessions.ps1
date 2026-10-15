@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.82'
+$script:CcrVersion = '0.83'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -1689,6 +1689,61 @@ function Add-CcrCodexIndexName([string]$RootPath, [string]$SessionId, [string]$N
     if ($script:CcrCodexNames.ContainsKey($RootPath)) { $script:CcrCodexNames[$RootPath][$SessionId] = $Name }
 }
 
+function Format-CcrSize([long]$N) {
+    if ($N -ge 1MB) { '{0:n1} MB' -f ($N / 1MB) } elseif ($N -ge 1KB) { '{0:n0} KB' -f ($N / 1KB) } else { "$N B" }
+}
+
+# Bytes on disk: the transcript, or every page of a codex thread.
+function Get-CcrSessionSize([object]$Session) {
+    $n = [long]0
+    foreach ($p in @(Get-CcrSessionParts $Session)) { try { $n += (Get-Item -LiteralPath $p).Length } catch { } }
+    $n
+}
+
+# Del / Ctrl+Backspace on several marked rows: one confirmation for all of
+# them; returns $true on yes. The rows still open (running here, or on
+# another PC) are named apart and kept. A list longer than the screen ends
+# with "... and N more".
+function Show-CcrDeleteManyConfirm {
+    param([Parameter(Mandatory)][object[]]$Sessions, [object[]]$Kept = @())
+    $w = [Console]::WindowWidth
+    $d = [char]0x00B7
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $lines.Add('')
+    $lines.Add("  `e[31mDelete these $($Sessions.Count) conversations permanently?`e[39m")
+    $lines.Add('')
+    $room = [Math]::Max(3, [Console]::WindowHeight - 14)
+    $total = [long]0
+    $i = 0
+    foreach ($s in $Sessions) {
+        $n = Get-CcrSessionSize $s
+        $total += $n
+        $i++
+        if ($i -gt $room) { continue }
+        $acct = if ($s.Root) { " `e[35m$($s.Root)`e[39m" } else { '' }
+        $tail = "  $(Format-CcrCwd $s.Cwd 40) $d $(Format-CcrAge $s.LastActivity) $d $(Format-CcrSize $n)"
+        $title = $s.Title
+        $max = $w - 16 - $tail.Length - $(if ($s.Root) { $s.Root.Length + 1 } else { 0 })
+        if ($max -gt 3 -and $title.Length -gt $max) { $title = $title.Substring(0, $max - 1) + [char]0x2026 }
+        $lines.Add("    $($s.Tool.PadRight(6))$acct $d `e[1m$title`e[22m`e[2m$tail`e[22m")
+    }
+    if ($i -gt $room) { $lines.Add("    `e[2m$([char]0x2026) and $($i - $room) more`e[22m") }
+    $lines.Add('')
+    $lines.Add("    size:      $(Format-CcrSize $total) in all")
+    if ($Kept.Count) {
+        $why = ($Kept | ForEach-Object { "'$($_.Title)' ($(if ($_.RunningOn) { "on $($_.RunningOn)" } else { 'running' }))" }) -join ', '
+        $lines.Add('')
+        $lines.Add("  `e[33mkept, still open: $why - close them first`e[39m")
+    }
+    $lines.Add('')
+    $lines.Add("  `e[2mremoved from disk, no undo (codex: via 'codex delete')`e[22m")
+    $lines.Add('')
+    $lines.Add("  `e[31m[y]`e[39m delete $($Sessions.Count)    `e[2many other key: cancel`e[22m")
+    Write-CcrScreen $lines.ToArray()
+    $k = [Console]::ReadKey($true)
+    return ($k.KeyChar -eq 'y' -or $k.KeyChar -eq 'Y')
+}
+
 # Full-screen confirmation before deleting; returns $true when the user picked
 # yes. Runs inside the picker's alternate screen buffer. Shows what is cheaply
 # on hand: title, folder, dates, size on disk, and the last prompt (claude) or
@@ -1701,10 +1756,7 @@ function Show-CcrDeleteConfirm {
     try {
         $items = @(Get-CcrSessionParts $Session | ForEach-Object { Get-Item -LiteralPath $_ })
         if ($items.Count) {
-            $len = ($items | Measure-Object Length -Sum).Sum
-            $size = if ($len -ge 1MB) { '{0:n1} MB' -f ($len / 1MB) }
-            elseif ($len -ge 1KB) { '{0:n0} KB' -f ($len / 1KB) }
-            else { "$len B" }
+            $size = Format-CcrSize ($items | Measure-Object Length -Sum).Sum
             $tail = Read-CcrFileWindow -Path $items[-1].FullName -Bytes 64KB -From Tail   # codex: the newest page
             $pat = if ($Session.Tool -eq 'claude') { '"lastPrompt":"((?:[^"\\]|\\.)*)"' }
             else { '"last_agent_message":"((?:[^"\\]|\\.)*)"' }
@@ -4581,7 +4633,7 @@ function Get-CcrPickerGuide([int]$Width, [bool]$AcctMode, [bool]$LimitsOn) {
             @('Ctrl+F', 'find the window of the running conversation of the highlighted row: it comes to the front with its tab selected, and its title blinks'),
             @('Ctrl+X', 'close the running conversation of the highlighted row (it is kept)'),
             @('Ctrl+I  or  Ctrl+T', 'install or update Claude Code and Codex with their official installers'),
-            @('Del', 'delete the highlighted conversation for good, after a confirmation'),
+            @('Del  or  Ctrl+Backspace', 'delete the marked conversations, or the highlighted one, for good, after a confirmation'),
             @('Ctrl+G  or  F1', 'this guide (F1 for when another program takes Ctrl+G: Grammarly does on a Mac)'))
         , @('Signs on a row',
             @("$([char]0x25CF)  1 2 $([char]0x2026)", 'marked; a number: it opens under that account of the table on top'),
@@ -5403,7 +5455,10 @@ function Select-CcrSession {
                 if ($newPick) { return [pscustomobject]@{ NewSessionPath = $newPick.Path; NewSessionTool = 'panel'; NewSessionName = ''; NewSessionRoot = $null; NewSessionPanel = $newPick.Panel; NewSessionQuestion = $newPick.Question; NewSessionResume = $newPick.Resume; NewSessionMessage = $newPick.Message } }
                 continue
             }
-            switch ($k.Key) {
+            # Ctrl+Backspace deletes like Del, for keyboards without a Del key;
+            # Ctrl+H too, the ^H a terminal sends for it (ccr.py: fzf's ctrl-h).
+            $keyName = if ($ctrl -and ($k.Key -eq [ConsoleKey]::Backspace -or $k.Key -eq [ConsoleKey]::H)) { 'Delete' } else { "$($k.Key)" }
+            switch ($keyName) {
                 'UpArrow' { if ($cursor -gt 0) { $cursor-- } }
                 'DownArrow' { if ($cursor -lt $view.Count - 1) { $cursor++ } }
                 'PageUp' { $cursor = [Math]::Max(0, $cursor - $viewH) }
@@ -5442,31 +5497,37 @@ function Select-CcrSession {
                     if ($toOpen.Count -gt 0 -and ($elsewhere.Count -eq 0 -or (Show-CcrElsewhereConfirm -Sessions $elsewhere))) { return $toOpen }
                 }
                 'Delete' {
-                    if ($view.Count -gt 0) {
-                        $victim = $view[$cursor]
-                        if ($victim.Running) {
-                            Show-CcrNotice "ccr: '$($victim.Title)' is running right now - close it first (Ctrl+X)."
+                    # The marked rows, or the highlighted one; rows still open are kept.
+                    $rows = @(Get-CcrPickerSelection)
+                    $kept = @($rows | Where-Object { $_.Running -or $_.RunningOn })
+                    $victims = @($rows | Where-Object { -not ($_.Running -or $_.RunningOn) })
+                    if ($rows.Count -eq 0) { }
+                    elseif ($rows.Count -eq 1 -and $kept.Count) {
+                        if ($kept[0].RunningOn) { Show-CcrNotice "ccr: '$($kept[0].Title)' is open on $($kept[0].RunningOn) - close it there first." }
+                        else { Show-CcrNotice "ccr: '$($kept[0].Title)' is running right now - close it first (Ctrl+X)." }
+                    }
+                    elseif ($victims.Count -eq 0) {
+                        Show-CcrNotice 'ccr: every marked conversation is open right now - close them first (Ctrl+X).'
+                    }
+                    elseif ($(if ($rows.Count -eq 1) { Show-CcrDeleteConfirm -Session $victims[0] } else { Show-CcrDeleteManyConfirm -Sessions $victims -Kept $kept })) {
+                        if ($WhatIfPreference) {
+                            Show-CcrNotice "WhatIf: would delete $(($victims | ForEach-Object { "'$($_.Title)'" }) -join ', ')." '33'
                         }
-                        elseif ($victim.RunningOn) {
-                            Show-CcrNotice "ccr: '$($victim.Title)' is open on $($victim.RunningOn) - close it there first."
-                        }
-                        elseif (Show-CcrDeleteConfirm -Session $victim) {
-                            if ($WhatIfPreference) {
-                                Show-CcrNotice "WhatIf: would delete '$($victim.Title)'." '33'
-                            }
-                            else {
+                        else {
+                            $failed = @()
+                            foreach ($victim in $victims) {
                                 $err = $null
                                 try { $ok = Remove-CcrSessionData -Session $victim }
                                 catch { $ok = $false; $err = $_ }
+                                $key = "$($victim.Tool)|$($victim.SessionId)"
                                 if ($ok) {
-                                    $key = "$($victim.Tool)|$($victim.SessionId)"
                                     [void]$sel.Remove($key)
+                                    $acct.Remove($key)
                                     $Sessions = @($Sessions | Where-Object { "$($_.Tool)|$($_.SessionId)" -ne $key })
                                 }
-                                else {
-                                    Show-CcrNotice "ccr: delete failed$(if ($err) { ": $err" })."
-                                }
+                                else { $failed += "'$($victim.Title)'$(if ($err) { ": $err" })" }
                             }
+                            if ($failed.Count) { Show-CcrNotice "ccr: delete failed for $($failed -join ', ')." }
                         }
                     }
                 }
@@ -5696,10 +5757,12 @@ function Resume-CcSessions {
         chosen on a page - one section for the claude rows (--model,
         --effort), one for the codex rows (-m, -c model_reasoning_effort),
         each shown only when the selection has such rows, all starting at
-        "no override" - Del PERMANENTLY deletes the highlighted conversation after a
-        full-screen confirmation (title, folder, dates, size, last prompt or
-        reply; codex deletions go through 'codex delete' so its catalog stays
-        consistent; running sessions are refused), Esc clears the filter then
+        "no override" - Del (or Ctrl+Backspace, for keyboards without Del)
+        PERMANENTLY deletes the marked conversations, or the highlighted one,
+        after a full-screen confirmation (one row: title, folder, dates, size,
+        last prompt or reply; several: one list with the total size; codex
+        deletions go through 'codex delete' so its catalog stays consistent;
+        running sessions are refused, and kept when marked with others), Esc clears the filter then
         cancels, typing filters (spaces can't be typed into the filter -
         Space marks).
 
