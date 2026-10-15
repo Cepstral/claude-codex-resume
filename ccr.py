@@ -35,7 +35,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.81"
+VERSION = "0.82"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -2361,13 +2361,18 @@ def _find_script(app: str, tty: str) -> str:
     """AppleScript: the tab of `app` whose tty is `tty` comes to the front,
     selected, and its background blinks; an error when no tab has it. The
     loop variables are references by position, and bringing a window to the
-    front reorders the windows: `contents of` pins them first (window id)."""
+    front reorders the windows: `contents of` pins them first (window id).
+    Terminal.app reads the color of a profile that follows the system
+    appearance (Basic) as its dark variant even in light mode, so writing
+    the color read back pinned the tab to dark grey: there the tab gets its
+    profile back (and its font, which that resets), and only a tab that had
+    a color of its own gets that color back."""
     t = applescript_str(tty)
 
-    def blink(o):
+    def blink(o, restore):
         return (f"set bc to background color of {o}\nrepeat 3 times\n"
                 f"set background color of {o} to {FIND_BLINK}\ndelay 0.25\n"
-                f"set background color of {o} to bc\ndelay 0.25\nend repeat\n")
+                f"{restore}delay 0.25\nend repeat\n")
     if app == "iTerm2":
         return ('tell application "iTerm2"\nrepeat with w in windows\nrepeat with t in tabs of w\n'
                 'repeat with s in sessions of t\n'
@@ -2375,7 +2380,7 @@ def _find_script(app: str, tty: str) -> str:
                 'set tw to contents of w\nset tt to contents of t\nset ts to contents of s\n'
                 'try\nif miniaturized of tw then set miniaturized of tw to false\nend try\n'
                 'select tw\nselect tt\nselect ts\nactivate\n'
-                + blink("ts") +
+                + blink("ts", "set background color of ts to bc\n") +
                 'return "ok"\nend if\nend repeat\nend repeat\nend repeat\nend tell\n'
                 f'error "no iTerm2 tab shows " & {t}')
     return ('tell application "Terminal"\nrepeat with w in windows\nrepeat with t in tabs of w\n'
@@ -2384,7 +2389,14 @@ def _find_script(app: str, tty: str) -> str:
             'if miniaturized of tw then set miniaturized of tw to false\n'
             'set selected of tt to true\nset index of tw to 1\n'
             'try\nset frontmost of tw to true\nend try\nactivate\n'
-            + blink("tt") +
+            'set pn to name of current settings of tt\nset fnm to font name of tt\nset fs to font size of tt\n'
+            'try\nset own to (background color of tt) is not equal to (background color of settings set pn)\n'
+            'on error\nset own to true\nend try\n'
+            + blink("tt", 'if own then\nset background color of tt to bc\nelse\ntry\n'
+                          'set current settings of tt to settings set pn\n'
+                          'if font name of tt is not fnm then set font name of tt to fnm\n'
+                          'if font size of tt is not fs then set font size of tt to fs\n'
+                          'on error\nset background color of tt to bc\nend try\nend if\n') +
             'return "ok"\nend if\nend repeat\nend repeat\nend tell\n'
             f'error "no Terminal tab shows " & {t}')
 

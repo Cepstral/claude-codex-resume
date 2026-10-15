@@ -265,6 +265,16 @@ pane, which shows the full title and folder of the highlighted row.
   `pgrep -x Terminal` from inside it found nothing ("neither iTerm2 nor
   Terminal.app is running"); `pgrep -a -x` includes them. Terminal.app
   sending Apple events to itself asks for no Automation rights.
+  The blink must leave the tab as it was (v0.82): Terminal's AppleScript
+  reads the background of a profile that follows the system appearance
+  (Basic) as its dark variant (5866/65535 grey) even in light mode, and
+  writing that back pinned every found tab to dark grey. Setting the tab's
+  profile again by name (`settings set "<name>"`, not `current settings of
+  tab`, which is a reference to the tab itself) drops the tab's own colors,
+  keeps the window's size and resets a font changed with Cmd-+, so the font
+  is put back; a tab whose color differed from its profile's gets the RGB
+  back. iTerm2 keeps writing back the color it read: not verified, no
+  iTerm2 on the test Mac.
 - A codex row's age (last activity, the sort key) is the time on the
   rollout's last line, not the file's mtime (v0.78; Get-CcrCodexLastActivity
   / codex_last; the file time is only the fallback). Verified with codex
