@@ -102,9 +102,14 @@ Flags accept both spellings on both sides: the PowerShell one (`-Update`,
 Keys are the same on both sides wherever the terminal allows it, and when
 fzf cannot take a key the PowerShell picker adopts fzf's choice (the account
 page is Ctrl+A everywhere because fzf cannot tell Ctrl-M from Enter).
-Remaining differences, because Space types into fzf's filter: Space cycling
-the account per row ↔ `Tab` mark + `Ctrl-O` (one target account for the
-marked rows); `+`/`X` on the account page ↔ rows picked with Enter;
+Account per row (v0.85): in multi-account mode ccr.py's Tab cycles the
+account a row opens under like the PowerShell picker - none, its own (green
+dot), the other accounts of its tool (their legend number) - through a fzf
+`reload` of a small helper (TabMarks / TAB_HELPER) with `--track` keeping
+the cursor, fzf without --multi (the marked rows are those with a target).
+Verified with fzf 0.74 driven over --listen. fzf older than 0.39 keeps Tab
+mark + `Ctrl-O` (one target account for the marked rows).
+Remaining differences: `+`/`X` on the account page ↔ rows picked with Enter;
 `S` ↔ `Ctrl-S`; the Shift+Enter model/effort page ↔ `Ctrl-E` with fzf
 menus in sequence (model, then effort, per tool) — fzf has no shift-enter,
 and alt-enter is Windows Terminal's fullscreen key, so the PowerShell picker
@@ -112,9 +117,9 @@ takes Ctrl+E as well. The panel page (fields changed with arrows, `+` `-`
 `M`) ↔ an fzf list with `▶ start` / agents / `+ add agent` / `rounds` rows,
 Enter on an agent opening its settings; the question page (Shift+Enter or
 Ctrl+J new line, Ctrl+O editor) ↔ one line, a multi-line paste, or `e` / an
-empty line for $EDITOR. In ccr.py a row cannot change account and get a model
-in one step (Ctrl-O and Ctrl-E each launch); on Windows Space + Shift+Enter
-combine. The mapping table lives in `docs/multi-account.md`.
+empty line for $EDITOR. A row's account and a model combine on both sides
+(the account cycling, then Shift+Enter / Ctrl-E). The mapping table lives in
+`docs/multi-account.md`.
 The panel is Ctrl+P on both sides (named MAP, multi-agent panel, in the UI;
 -MAP / --map alias -Panel / --panel): fzf binds ctrl-p to "up" by default,
 and `--expect` takes it over (the arrows still move). Its agents' tabs are

@@ -12,6 +12,7 @@ marked rows under another account, Ctrl-T installs or updates claude / codex, De
 marked rows or the highlighted one, Esc cancels.
 """
 import argparse
+import atexit
 import base64
 import ctypes
 import json
@@ -36,7 +37,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.84"
+VERSION = "0.85"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -1306,10 +1307,123 @@ INFO_CMD = (r'printf "%s" "$FZF_MATCH_COUNT/$FZF_TOTAL_COUNT"; '
             r'printf " \033[32m·\033[0m \033[1;32m%s marked\033[0m" "$FZF_SELECT_COUNT"; :')
 
 
-def run_fzf(rows, header, query="", multi=True, expect=None, preview=True, prompt="filter> ", listen=0):
+def tab_cycle_on(ctx) -> bool:
+    """Tab steps a row's account (multi-account mode), as on Windows: fzf
+    reloads the list on Tab and --track (fzf 0.39) keeps the cursor on its
+    row. An older fzf keeps Tab = mark and Ctrl-O for the account."""
+    return ctx.multi_root and fzf_version() >= (0, 39)
+
+
+# Tab in multi-account mode: fzf runs this helper on every Tab - it steps the
+# row's target account (none -> its own -> the other accounts of its tool ->
+# none) and prints the rows again with their marks. A script of its own, so
+# it starts in milliseconds (ccr.py would compile thousands of lines on every
+# key); ccr draws the first list with the same code (exec of this text).
+TAB_HELPER = r'''
+import json, os, sys
+
+
+def render(d, rid=None):
+    meta = json.load(open(os.path.join(d, "meta.json"), encoding="utf-8"))
+    tp = os.path.join(d, "targets.json")
+    try:
+        tg = json.load(open(tp, encoding="utf-8"))
+    except Exception:
+        tg = {}
+    rid = (rid or "").strip()
+    if rid in meta and meta[rid]["cycle"]:
+        cyc = meta[rid]["cycle"]
+        cur = cyc.index(tg[rid]) if tg.get(rid) in cyc else -1
+        if cur + 1 >= len(cyc):
+            tg.pop(rid, None)
+        else:
+            tg[rid] = cyc[cur + 1]
+        with open(tp, "w", encoding="utf-8") as f:
+            json.dump(tg, f)
+    with open(os.path.join(d, "count"), "w") as f:
+        f.write(str(len(tg)))
+    out = []
+    with open(os.path.join(d, "rows.tsv"), encoding="utf-8") as f:
+        for line in f:
+            i, rest = line.split("\t", 1)
+            out.append(i + "\t" + meta.get(i, {}).get("marks", {}).get(tg.get(i, ""), " ") + " " + rest)
+    return "".join(out)
+
+
+if __name__ == "__main__":
+    sys.stdout.buffer.write(render(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else None).encode("utf-8"))
+'''
+
+
+def _cmd_arg(x: str) -> str:
+    """One argument of a command fzf hands to the shell."""
+    return subprocess.list2cmdline([x]) if os.name == "nt" else shlex.quote(x)
+
+
+class TabMarks:
+    """The targets Tab sets in multi-account mode, by session key, kept
+    across the picker's fzf runs (Ctrl-K, a notice...): the PowerShell
+    picker's per-row account cycling, with the same signs - a green dot for
+    the row's own account, the legend number of another one."""
+
+    def __init__(self):
+        self.dir = tempfile.mkdtemp(prefix="ccr-tab-")
+        atexit.register(shutil.rmtree, self.dir, True)
+        self.helper = os.path.join(self.dir, "tab.py")
+        with open(self.helper, "w", encoding="utf-8") as f:
+            f.write(TAB_HELPER)
+        self.ns = {"__name__": "ccr_tab"}
+        exec(TAB_HELPER, self.ns)
+        self.targets = {}   # session key -> account label
+
+    def rows(self, rows: list, index: dict, ctx) -> list:
+        """The rows as fzf gets them, a mark column in front of the display."""
+        meta, tg = {}, {}
+        for i, s in index.items():
+            cycle = [l for l in [s.root] + [r.label for _, t, r in ctx.entries if t == s.tool and r.label != s.root] if l]
+            marks = {l: (f"{GREEN}●{RESET}" if l == s.root else
+                         next((f"{TOOL_COLOR[s.tool]}{BOLD}{n}{RESET}" for n, t, r in ctx.entries
+                               if t == s.tool and r.label == l), "?"))
+                     for l in cycle}
+            meta[i] = {"cycle": cycle, "marks": marks}
+            if s.key in self.targets:
+                tg[i] = self.targets[s.key]
+        with open(os.path.join(self.dir, "rows.tsv"), "w", encoding="utf-8") as f:
+            f.write("".join(r + "\n" for r in rows))
+        with open(os.path.join(self.dir, "meta.json"), "w", encoding="utf-8") as f:
+            json.dump(meta, f)
+        with open(os.path.join(self.dir, "targets.json"), "w", encoding="utf-8") as f:
+            json.dump(tg, f)
+        return self.ns["render"](self.dir).splitlines()
+
+    def bind(self) -> str:
+        cmd = " ".join(_cmd_arg(x) for x in (sys.executable, "-I", self.helper, self.dir))
+        return f"tab:reload({cmd} {{1}})"
+
+    def info_cmd(self) -> str:
+        return (r'printf "%s" "$FZF_MATCH_COUNT/$FZF_TOTAL_COUNT"; n=$(cat ' + _cmd_arg(os.path.join(self.dir, "count"))
+                + r' 2>/dev/null); [ "${n:-0}" -gt 0 ] && printf " \033[32m·\033[0m \033[1;32m%s marked\033[0m" "$n"; :')
+
+    def read(self, index: dict, sessions: list) -> list:
+        """After fzf: the targets it left, by session key; every session's
+        target_root follows them. Returns the marked sessions."""
+        try:
+            with open(os.path.join(self.dir, "targets.json"), encoding="utf-8") as f:
+                tg = json.load(f)
+        except Exception:
+            tg = {}
+        self.targets = {index[i].key: l for i, l in tg.items() if i in index}
+        for s in sessions:
+            s.target_root = self.targets.get(s.key, "")
+        return [s for s in sessions if s.key in self.targets]
+
+
+def run_fzf(rows, header, query="", multi=True, expect=None, preview=True, prompt="filter> ", listen=0,
+            binds=None, track=False, info_cmd=None):
     """Rows are '<id>\\t<display>\\t<preview>'. Returns (key, [ids]) or None on
     Esc/Ctrl-C; key is '' for Enter or one of `expect`. listen: a port for
-    fzf --listen (actions sent while it runs, see Limits)."""
+    fzf --listen (actions sent while it runs, see Limits). binds: extra
+    --bind specs; track: --track; info_cmd: the info line without --multi."""
     if not shutil.which(FZF[0]):
         sys.exit("ccr: fzf not found - install it first (brew install fzf)")
     ver = fzf_version()
@@ -1327,6 +1441,12 @@ def run_fzf(rows, header, query="", multi=True, expect=None, preview=True, promp
         args.append("--multi")
         if ver >= (0, 46):
             args += ["--info-command=" + INFO_CMD]
+    elif info_cmd and ver >= (0, 46):
+        args += ["--info-command=" + info_cmd]
+    for b in binds or []:
+        args += ["--bind", b]
+    if track:
+        args.append("--track")
     if query:
         args += ["--query", query]
     if expect:
@@ -1839,14 +1959,18 @@ def picker_guide(ctx, lim=None, width: int = 0) -> list:
     `width` wide: the explanations wrap under themselves."""
     width = width or shutil.get_terminal_size((100, 24)).columns
     multi = ctx.multi_root
+    cycle = tab_cycle_on(ctx)
     sections = [
         ("Moving and opening", [
             ("↑ ↓  PgUp PgDn", "move"),
-            ("Tab", "mark / unmark a row"),
+            ("Tab", "cycle the account the row opens under: its own (green dot), another one (its number in the "
+                    "table on top: the conversation moves there first), none" if cycle else "mark / unmark a row"),
             ("Enter", "open the marked rows, or the highlighted one: the first here, the others as tabs "
                       "(iTerm2, tmux) or windows (Terminal.app)"),
             ("Ctrl-E", "the same, with a model and an effort you pick first"),
-        ] + ([("Ctrl-O", "open the marked rows under another account: the conversations move there first")] if multi else []) + [
+        ] + ([("Ctrl-O", "open the marked rows under another account: the conversations move there first "
+                         "(fzf older than 0.39; with a newer one Tab sets the account per row)")]
+             if multi and not cycle else []) + [
             ("type", "fuzzy filter by tool, account, title and folder; the words run, cleared, archived and app "
                      "list those rows"),
             ("Esc", "leave"),
@@ -1911,7 +2035,8 @@ def picker_hint(ctx: Ctx, upd_note: str = "", lim: Limits = None) -> str:
         lines.append(f"{BOLD}{GREEN}ccr updated v{f} -> v{t}{RESET}")
     lines += account_table(ctx, lim)
     # The essentials; every other key is in the guide (Ctrl-G or F1).
-    keys = [("↑↓", "move"), ("Tab", "mark"), ("Enter", "open"), ("Ctrl-N", "new"), ("Ctrl-G/F1", "guide: all the keys"),
+    keys = [("↑↓", "move"), ("Tab", "account" if tab_cycle_on(ctx) else "mark"), ("Enter", "open"), ("Ctrl-N", "new"),
+            ("Ctrl-G/F1", "guide: all the keys"),
             ("Esc", "cancel")]
     lines.append(right_align(hint(*keys) + f"{DIM}  ·  type to filter{RESET}", f"{DIM}ccr v{VERSION}{RESET}"))
     return "\n".join(lines)
@@ -5827,22 +5952,35 @@ def main():
         # header of the fzf on screen, else it shows at the next redraw.
         lim = Limits(ctx)
         lim.refresh()
+        # Multi-account mode: Tab steps the account of a row (TabMarks), and
+        # fzf runs without --multi - the marked rows are those with a target.
+        tabs = TabMarks() if tab_cycle_on(ctx) else None
         restart = False
         while not restart:
             index = {}
             rows = session_rows(sessions, index, ctx, usage_of if usage_on else None)
+            if tabs:
+                rows = tabs.rows(rows, index, ctx)
             note = upd_note
             lim.header = lambda: picker_hint(ctx, note, lim)
             lim.port = free_port() if lim.pending and fzf_version() >= (0, 45) else 0
-            res = run_fzf(rows, picker_hint(ctx, upd_note, lim), query=query,
-                          expect=delete_keys() + ["ctrl-n", "ctrl-p", "ctrl-a", "ctrl-o", "ctrl-k", "ctrl-j", "ctrl-x", "ctrl-e",
-                                  "ctrl-t", "ctrl-l", "ctrl-g", "f1", "ctrl-f"], listen=lim.port)
+            res = run_fzf(rows, picker_hint(ctx, upd_note, lim), query=query, multi=not tabs,
+                          expect=delete_keys() + ["ctrl-n", "ctrl-p", "ctrl-a", "ctrl-k", "ctrl-j", "ctrl-x", "ctrl-e",
+                                                  "ctrl-t", "ctrl-l", "ctrl-g", "f1", "ctrl-f"]
+                          + ([] if tabs else ["ctrl-o"]),
+                          listen=lim.port, binds=[tabs.bind()] if tabs else None, track=bool(tabs),
+                          info_cmd=tabs.info_cmd() if tabs else None)
             lim.port = 0
             if res is None:
                 print("ccr: cancelled.")
                 return
             key, ids = res
             picked = [index[i] for i in ids if i in index]
+            # The highlighted row, for the keys that act on one row (Ctrl-F,
+            # Ctrl-X, Ctrl-J); without --multi fzf prints just that one.
+            here = picked
+            if tabs:
+                picked = tabs.read(index, sessions) or here
             if key in ("ctrl-g", "f1"):
                 # The guide: every key, the signs on a row, the table on top.
                 # F1 too: on a Mac, Grammarly's AI Chat takes Ctrl-G system-wide.
@@ -5863,10 +6001,10 @@ def main():
             if key == "ctrl-j":
                 # The usage details of the highlighted row, plus the window
                 # split session by session (every listed session).
-                if picked:
+                if here:
                     print(f"{YELLOW}ccr: reading token usage of the last {a.usage_hours} h...{RESET}")
                     all_ = [(x, usage_cached(x)) for x in sessions]
-                    usage_page(picked[0], usage_cached(picked[0]), a.usage_hours, usage_since, all_)
+                    usage_page(here[0], usage_cached(here[0]), a.usage_hours, usage_since, all_)
                     pause()
                 continue
             if key == "ctrl-n":
@@ -5902,8 +6040,8 @@ def main():
             if key == "ctrl-f":
                 # Find the window of the running conversation of the highlighted
                 # row: to the front, its tab selected, blinking.
-                if picked:
-                    s = picked[0]
+                if here:
+                    s = here[0]
                     if s.running_on:
                         why = f"'{s.title}' is open on {s.running_on} - its window is there."
                     elif not s.running:
@@ -5920,8 +6058,8 @@ def main():
             if key == "ctrl-x":
                 # Close the running conversation of the highlighted row (a stray
                 # background session, a forgotten tab). Kept on disk.
-                if picked:
-                    s = picked[0]
+                if here:
+                    s = here[0]
                     if s.running_on:
                         print(f"{YELLOW}ccr: '{s.title}' is open on {s.running_on} - close it there.{RESET}")
                         pause("(Enter to continue)")
@@ -5968,6 +6106,8 @@ def main():
                             print(f"ccr: delete of '{v.title}' failed: {e}", file=sys.stderr)
                         if ok:
                             sessions = [s for s in sessions if s.key != v.key]
+                            if tabs:
+                                tabs.targets.pop(v.key, None)
                         else:
                             failed.append(v)
                     if failed:
