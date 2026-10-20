@@ -44,7 +44,7 @@ Accounts  C:\Users\me\OneDrive\.claude\pwsh\ccr.json
   work       claude  ~\.claude-work       me@company.com
   work       codex   ~\.codex-work        me@company.com
 
-  A session always resumes under the account whose dir it lives in. In the picker, Space cycles the account a row opens under.
+  A session always resumes under the account whose dir it lives in. In the picker, Tab cycles the account a row opens under.
 ```
 
 Rows are grouped by account, the default one in parentheses; the email comes from the dir's own
@@ -126,7 +126,7 @@ A `ccr.json` with only those keys does not turn multi-account mode on.
 
 An **account column** appears between the tool and the age (magenta), for both tools, the
 default account in parentheses; above the rows, the account table lists the accounts (see
-[Space](#opening-a-conversation-under-another-account--space) below) with each one's usage limits:
+[Tab](#opening-a-conversation-under-another-account--tab) below) with each one's usage limits:
 
 ```
 filter>                                                 88/121 · 2 marked
@@ -135,7 +135,7 @@ Multi-account mode active.
           2 work       ~\.claude-work  me@company.com  no limits reported
   codex   3 (default)  ~\.codex        me@gmail.com    5h 0% · week 2%  → Wed 7 07:57
           4 work       ~\.codex-work   me@company.com  week 27% → Sun 4 21:02
-↑↓ move · Space cycles the account (dot = as is) · Enter open · Ctrl+N new · Ctrl+A accounts · Del delete · Esc cancel
+↑↓ move · Tab account · Enter open · Ctrl+N new · Ctrl+G/F1 guide: all the keys · Esc cancel · type to filter
 ● claude work       1h  Billing API pagination          D:\repos\api-server
   claude (default)  3h  Home automation bridge          D:\repos\home
   codex  work       5h  migrate build to vite           D:\repos\web-app
@@ -206,11 +206,11 @@ The login next to each dir comes from the dir's own files; an account added on a
 Enter starts `claude --name "<name>"` (or `codex`) in the chosen dir; Esc steps back one level.
 The account question only appears for a tool that has several accounts configured.
 
-## Opening a conversation under another account — Space
+## Opening a conversation under another account — Tab
 
 While multi-account mode is on, the picker shows a fixed legend under the filter line, one
 line per **tool and account**, numbered straight through (claude first, then codex) with the
-number in the tool's colour. `Space` cycles the account the highlighted row will open under:
+number in the tool's colour. `Tab` cycles the account the highlighted row will open under:
 its own account first (a green dot — a plain open), then the other accounts **of its tool**
 (the entry's number, in the tool's colour), then none — a claude row only ever shows claude
 numbers, a codex row only codex numbers.
@@ -222,7 +222,7 @@ Multi-account mode active.
           2 personal   ~\OneDrive\.claude-personal  me@gmail.com
   codex   3 (default)  ~\.codex                     me@company.com
           4 personal   ~\.codex-personal            me@gmail.com
-↑↓ move · Space cycles the account (dot = as is) · Enter open · Ctrl+N new · Ctrl+A accounts · Del delete · Esc cancel
+↑↓ move · Tab account · Enter open · Ctrl+N new · Ctrl+G/F1 guide: all the keys · Esc cancel · type to filter
 2 claude (default)  1h  Billing API pagination          D:\repos\api-server
 ● claude personal   3h  Home automation bridge          D:\repos\home
 4 codex  (default)  5h  migrate build to vite           D:\repos\web-app
@@ -263,7 +263,7 @@ Everything above exists in the Python version with the same `ccr.json` keys (fil
 |-----------------------------------------|-------------------------------------------------|
 | `-Root work` · `-Accounts` · `-AddAccount work -CopySettings` · `-RemoveAccount work` · `-DisableAccounts` | `--root work` · `--accounts` · `--add-account work --copy-settings` · `--remove-account work` · `--disable-accounts` |
 | `Ctrl+A` account page: `+` add, `L` log in here, `Del` remove, `S` copy settings, `X` off | `Ctrl-A` account page: `+` and `X` are rows you pick with Enter, `Ctrl-L` logs in here, `Del` removes, `Ctrl-S` copies settings |
-| `Space` cycles the account a row opens under (per row) | `Tab` marks rows as usual, `Ctrl-O` opens the marked rows under an entry chosen from a menu with the legend's numbering (one target for the whole selection) |
+| `Tab` cycles the account a row opens under (per row; `Space` until v0.85) | the same with fzf 0.39 or later (v0.85: fzf reloads the list on Tab); an older fzf: `Tab` marks rows, `Ctrl-O` opens the marked rows under an entry chosen from a menu with the legend's numbering (one target for the whole selection) |
 | account column and legend in the picker | the same; the label is part of the fuzzy-searchable text |
 | `-WhatIf` lists the moves and the `$env:` prefixes | `--dry-run` lists the moves and the `CLAUDE_CONFIG_DIR='…'` / `CODEX_HOME='…'` prefixes |
 

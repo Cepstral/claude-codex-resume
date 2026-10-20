@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.85'
+$script:CcrVersion = '0.86'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -400,7 +400,7 @@ function Copy-CcrCodexConfig {
 
 # What "copy settings from the default account" means per tool.
 function Get-CcrSettingsInfo([string]$Tool) {
-    if ($Tool -eq 'claude') { [pscustomobject]@{ Text = 'Copy statusline from default account'; Note = 'statusLine in settings.json + statusline*.ps1'; What = 'status line' } }
+    if ($Tool -eq 'claude') { [pscustomobject]@{ Text = 'Copy statusline from default account'; Note = 'statusLine in settings.json + statusline* files'; What = 'status line' } }
     else { [pscustomobject]@{ Text = 'Copy config.toml from default account'; Note = 'model, effort, features, project trust'; What = 'config.toml' } }
 }
 function Test-CcrSettings([string]$Tool, [string]$RootPath) { if ($Tool -eq 'claude') { Test-CcrStatusline $RootPath } else { Test-CcrCodexConfig $RootPath } }
@@ -1772,6 +1772,7 @@ function Show-CcrDeleteConfirm {
     $lines.Add('')
     $lines.Add("    $($Session.Tool) $([char]0x00B7) `e[1m$($Session.Title)`e[22m")
     $lines.Add("    folder:    $($Session.Cwd)")
+    if ($Session.Root) { $lines.Add("    account:   $($Session.Root)  `e[2m$(Format-CcrCwd "$($Session.RootPath)" 50)`e[22m") }
     $lines.Add("    last used: $($Session.LastActivity.ToLocalTime().ToString('yyyy-MM-dd HH:mm'))  ($(Format-CcrAge $Session.LastActivity))")
     if ($size) { $lines.Add("    size:      $size") }
     if ($preview) {
@@ -1811,7 +1812,7 @@ function Write-CcrScreen([string[]]$Lines) {
     [Console]::Write($sb.ToString())
 }
 
-# A small checklist inside the alt buffer: Space toggles, Enter confirms,
+# A small checklist inside the alt buffer: Tab (or Space) toggles, Enter confirms,
 # Esc backs out. Items are @{ Key; Text; Note; Checked }; returns a
 # hashtable Key -> [bool], or $null on Esc.
 function Select-CcrChecklist {
@@ -1822,7 +1823,7 @@ function Select-CcrChecklist {
     while ($true) {
         $lines = [System.Collections.Generic.List[string]]::new()
         $lines.Add($Title)
-        $lines.Add("`e[2m$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space toggle $([char]0x00B7) Enter continue $([char]0x00B7) Esc back`e[22m")
+        $lines.Add("`e[2m$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Tab toggle $([char]0x00B7) Enter continue $([char]0x00B7) Esc back`e[22m")
         for ($i = 0; $i -lt $Items.Count; $i++) {
             $it = $Items[$i]
             $box = if ($state[$it.Key]) { "`e[32m[x]`e[39m" } else { '[ ]' }
@@ -1836,7 +1837,7 @@ function Select-CcrChecklist {
         switch ($k.Key) {
             'UpArrow' { if ($cursor -gt 0) { $cursor-- } }
             'DownArrow' { if ($cursor -lt $Items.Count - 1) { $cursor++ } }
-            'Spacebar' { $state[$Items[$cursor].Key] = -not $state[$Items[$cursor].Key] }
+            { $_ -in 'Tab', 'Spacebar' } { $state[$Items[$cursor].Key] = -not $state[$Items[$cursor].Key] }
             'Enter' { return $state }
             'Escape' { return $null }
         }
@@ -1945,7 +1946,7 @@ function Show-CcrAccountPage {
             $lines.Add($row)
         }
         $lines.Add('')
-        $lines.Add("  `e[2mA session always resumes under the account whose dir it lives in. In the picker, Space cycles the account a row opens under.`e[22m")
+        $lines.Add("  `e[2mA session always resumes under the account whose dir it lives in. In the picker, Tab cycles the account a row opens under.`e[22m")
         Write-CcrScreen $lines
         $k = [Console]::ReadKey($true)
         if ($k.Key -eq [ConsoleKey]::C -and ($k.Modifiers -band [ConsoleModifiers]::Control)) { return $null }
@@ -2179,7 +2180,8 @@ function Select-CcrPath {
     $top = 0
     while ($true) {
         $view = @($here) + @(if ($filter) {
-                $groups | Where-Object { $_.Path.IndexOf($filter, [StringComparison]::OrdinalIgnoreCase) -ge 0 }
+                $words = @("$filter" -split '\s+' | Where-Object { $_ })
+                $groups | Where-Object { $p = $_.Path; -not @($words | Where-Object { $p.IndexOf($_, [StringComparison]::OrdinalIgnoreCase) -lt 0 }).Count }
             }
             else { $groups })
 
@@ -4617,10 +4619,10 @@ function Get-CcrPickerGuide([int]$Width, [bool]$AcctMode, [bool]$LimitsOn) {
     $sections = @(
         , @('Moving and opening',
             @("$([char]0x2191) $([char]0x2193)  PgUp PgDn  Home End", 'move'),
-            @('Space', $(if ($AcctMode) { 'cycle the account the row opens under: its own (green dot), another one (its number in the table on top: the conversation moves there first), none' } else { 'mark / unmark a row' })),
+            @('Tab', $(if ($AcctMode) { 'cycle the account the row opens under: its own (green dot), another one (its number in the table on top: the conversation moves there first), none' } else { 'mark / unmark a row' })),
             @('Enter', 'open the marked rows, or the highlighted one: the first in this tab, the others as new tabs'),
             @('Shift+Enter  or  Ctrl+E', 'the same, with a model and an effort you pick first'),
-            @('type', "filter by tool, account, title and folder; the words run, bg, cleared, archived, elsewhere and @host list those rows"),
+            @('type', "filter by tool, account, title and folder, every word separated by a space must match; the words run, bg, cleared, archived, elsewhere and @host list those rows"),
             @('Esc', 'clear the filter, then leave'))
         , @('New',
             @('Ctrl+N', 'a new conversation: the folder, then claude, codex or MAP'),
@@ -5073,7 +5075,7 @@ function Select-CcrSession {
     }
     if ($limitsOn) { Start-CcrLimitsRefresh $false }
     # The table above the list: one line per tool and account - the tool
-    # (once per group), in multi-account mode the number Space cycles
+    # (once per group), in multi-account mode the number Tab cycles
     # through and the label, the dir, who is logged in there (from the dir's
     # own files, see Get-CcrQuickIdentity) and how far it is into its usage
     # limits. Dirs go first, then the emails, when the lines would not fit.
@@ -5158,9 +5160,12 @@ function Select-CcrSession {
     try {
         while ($true) {
             # --- refilter (recomputed every pass; cheap at <= 500 rows) ---
-            $view = if ($filter) {
+            # Every word of the filter must match somewhere (fzf's rule in ccr.py).
+            $words = @("$filter" -split '\s+' | Where-Object { $_ })
+            $view = if ($words.Count) {
                 @($Sessions | Where-Object {
-                        ("$($_.Tool) $($_.Root) $($_.Title) $($_.Cwd)$(if ($_.Cleared) { ' cleared' })$(if ($_.Archived) { ' archived' })$(if ($_.Running) { ' run' })$(if ($_.Running -and $_.RunKind -eq 'bg') { ' bg' })$(if ($_.RunningOn) { " elsewhere @$($_.RunningOn)" })").IndexOf($filter, [StringComparison]::OrdinalIgnoreCase) -ge 0
+                        $hay = "$($_.Tool) $($_.Root) $($_.Title) $($_.Cwd)$(if ($_.Cleared) { ' cleared' })$(if ($_.Archived) { ' archived' })$(if ($_.Running) { ' run' })$(if ($_.Running -and $_.RunKind -eq 'bg') { ' bg' })$(if ($_.RunningOn) { " elsewhere @$($_.RunningOn)" })"
+                        -not @($words | Where-Object { $hay.IndexOf($_, [StringComparison]::OrdinalIgnoreCase) -lt 0 }).Count
                     })
             }
             else { $Sessions }
@@ -5170,7 +5175,7 @@ function Select-CcrSession {
             $h = [Console]::WindowHeight
             # The key legend wraps onto as many lines as the window needs.
             # The essentials; every other key is in the guide (Ctrl+G or F1).
-            $hint = "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Space $(if ($acctMode) { 'account' } else { 'mark' }) $([char]0x00B7) Enter open $([char]0x00B7) Ctrl+N new $([char]0x00B7) Ctrl+G/F1 guide: all the keys $([char]0x00B7) Esc cancel $([char]0x00B7) type to filter $([char]0x00B7) v$script:CcrVersion"
+            $hint = "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Tab $(if ($acctMode) { 'account' } else { 'mark' }) $([char]0x00B7) Enter open $([char]0x00B7) Ctrl+N new $([char]0x00B7) Ctrl+G/F1 guide: all the keys $([char]0x00B7) Esc cancel $([char]0x00B7) type to filter $([char]0x00B7) v$script:CcrVersion"
             $hintLines = @(Split-CcrHint $hint ($w - 1))
             $tableLines = @(Get-CcrAccountTable $w)
             $viewH = [Math]::Max(1, $h - 1 - $hintLines.Count - $tableLines.Count - $(if ($updNote) { 1 } else { 0 }))
@@ -5466,8 +5471,10 @@ function Select-CcrSession {
                 'PageDown' { $cursor = [Math]::Min([Math]::Max($view.Count - 1, 0), $cursor + $viewH) }
                 'Home' { $cursor = 0 }
                 'End' { $cursor = [Math]::Max($view.Count - 1, 0) }
-                'Spacebar' {
-                    if ($view.Count -gt 0) {
+                # Tab marks / cycles the account, as in ccr.py (fzf's key); Space
+                # types into the filter there and here (v0.86).
+                'Tab' {
+                    if ($view.Count -gt 0 -and -not $ctrl) {
                         $row = $view[$cursor]
                         $key = "$($row.Tool)|$($row.SessionId)"
                         if ($acctMode) {
@@ -5751,7 +5758,7 @@ function Resume-CcSessions {
         With a single selection ccr simply resumes it right here. -NewWindow
         instead sends every selection to a fresh window and keeps this tab.
 
-        Picker keys: Up/Down/PgUp/PgDn/Home/End move, Space marks/unmarks,
+        Picker keys: Up/Down/PgUp/PgDn/Home/End move, Tab marks/unmarks,
         Enter opens the marked set (or the highlighted row if nothing is
         marked), Ctrl+L asks every account for its usage limits again (the
         table above the list), Shift+Enter (or Ctrl+E) opens it with a model and an effort
@@ -5765,7 +5772,7 @@ function Resume-CcSessions {
         deletions go through 'codex delete' so its catalog stays consistent;
         running sessions are refused, and kept when marked with others), Esc clears the filter then
         cancels, typing filters (spaces can't be typed into the filter -
-        Space marks).
+        Tab marks).
 
         A title or folder cut to fit its column rotates through it on the
         highlighted row while the picker waits (the fzf picker of ccr.py
@@ -5789,10 +5796,11 @@ function Resume-CcSessions {
     .EXAMPLE
         ccr -n
         Start a NEW conversation: pick from every folder past sessions used,
-        most recently used first. Enter asks for a session name and starts
-        claude there in this tab (empty name = claude's auto title); Tab
-        Enter on a folder asks which tool (claude or codex; c / x jump), then
-        for claude a session name. Same menu as Ctrl+N inside the picker.
+        most recently used first. Enter on a folder asks which tool - claude,
+        codex or MAP (c / x / p jump) - then, for claude, a session name
+        (empty = claude's auto title), and starts it in this tab; MAP asks
+        the question, then the agents. Esc steps back one page. Same menu as
+        Ctrl+N inside the picker.
     .EXAMPLE
         ccr -n Kitchen renovation
         Same, with the name box prefilled to "Kitchen renovation".
@@ -5836,7 +5844,7 @@ function Resume-CcSessions {
         on this PC" until then; ccr -AddAccount <label> does the same from
         the command line), X turns multi-account mode off (every session
         goes to the default account).
-        While multi-account mode is on, the picker's Space cycles the
+        While multi-account mode is on, the picker's Tab cycles the
         account a row opens under: its own (green dot = plain open), then
         the others (a digit in the tool's colour, numbered as in the
         legend: one entry per tool and account), then none. Enter
@@ -5979,8 +5987,14 @@ function Resume-CcSessions {
         # Window, in hours, of the token-usage column (Ctrl+K) and details
         # (Ctrl+J) in the picker; 0 = ccr.json "usageHours", else 5 = the
         # length of Claude's usage window.
-        [ValidateRange(0, 24 * 365)][int]$UsageHours = 0
+        [ValidateRange(0, 24 * 365)][int]$UsageHours = 0,
+        # The version, as ccr.py --version prints it.
+        [switch]$Version,
+        # -WhatIf by another name, as in ccr.py (--dry-run / -DryRun).
+        [switch]$DryRun
     )
+    if ($DryRun) { $WhatIfPreference = $true }
+    if ($Version) { "ccr $script:CcrVersion (powershell)"; return }
     # --- GNU spellings (ccr --update, --root work, --dry-run ...) ------------
     # The ones ccr.py uses on macOS; PowerShell would take them as filter
     # words, so translate them and run again. One or two dashes and any
@@ -5989,7 +6003,8 @@ function Resume-CcSessions {
         $map = @{ update = 'Update'; channel = 'Channel'; root = 'Root'; accounts = 'Accounts'; 'add-account' = 'AddAccount'
             'remove-account' = 'RemoveAccount'; 'disable-accounts' = 'DisableAccounts'; 'copy-settings' = 'CopySettings'
             'copy-statusline' = 'CopySettings'; tool = 'Tool'; top = 'Top'; new = 'New'; 'new-window' = 'NewWindow'
-            'dry-run' = 'WhatIf'; whatif = 'WhatIf'; 'usage-hours' = 'UsageHours'; usage = 'Usage'; install = 'Install'; panel = 'Panel'; map = 'Panel'; continue = 'Continue' }
+            'dry-run' = 'WhatIf'; dryrun = 'WhatIf'; whatif = 'WhatIf'; 'usage-hours' = 'UsageHours'; usage = 'Usage'; install = 'Install'; panel = 'Panel'; map = 'Panel'; continue = 'Continue'
+            version = 'Version'; filter = '' }
         $takesValue = 'Channel', 'Root', 'AddAccount', 'RemoveAccount', 'Tool', 'Top', 'UsageHours', 'Install'
         $again = @{} + $PSBoundParameters
         $again.Remove('Filter')
@@ -5999,7 +6014,8 @@ function Resume-CcSessions {
             $name, $val = if ($tok -like '--*=*') { $tok.Substring(2) -split '=', 2 } else { $tok.Substring(2), $null }
             if ($tok -like '--*' -and $map.ContainsKey($name.ToLowerInvariant())) {
                 $p = $map[$name.ToLowerInvariant()]
-                if ($p -in $takesValue) { if ($null -eq $val) { $i++; $val = $Filter[$i] }; $again[$p] = $val }
+                if (-not $p) { if ($null -eq $val) { $i++; $val = $Filter[$i] }; $rest += $val }   # --filter kit: the words themselves
+                elseif ($p -in $takesValue) { if ($null -eq $val) { $i++; $val = $Filter[$i] }; $again[$p] = $val }
                 else { $again[$p] = $true }
             }
             else { $rest += $tok }
@@ -6058,6 +6074,7 @@ function Resume-CcSessions {
             if ($Install) { $inv += " -Install $Install" }
             if ($Panel) { $inv += ' -Panel' }
             if ($Continue) { $inv += ' -Continue' }
+            if ($Usage) { $inv += ' -Usage' }
             if ($WhatIfPreference) { $inv += ' -WhatIf' }
             & ([scriptblock]::Create($inv))
             return

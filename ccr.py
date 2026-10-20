@@ -37,7 +37,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.85"
+VERSION = "0.86"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -1307,11 +1307,16 @@ INFO_CMD = (r'printf "%s" "$FZF_MATCH_COUNT/$FZF_TOTAL_COUNT"; '
             r'printf " \033[32m·\033[0m \033[1;32m%s marked\033[0m" "$FZF_SELECT_COUNT"; :')
 
 
+def tab_marks_on() -> bool:
+    """ccr keeps the marks itself (TabMarks): fzf reloads the list on Tab and
+    --track (fzf 0.39) keeps the cursor on its row. An older fzf marks with
+    its own --multi, and Ctrl-O picks the account."""
+    return fzf_version() >= (0, 39)
+
+
 def tab_cycle_on(ctx) -> bool:
-    """Tab steps a row's account (multi-account mode), as on Windows: fzf
-    reloads the list on Tab and --track (fzf 0.39) keeps the cursor on its
-    row. An older fzf keeps Tab = mark and Ctrl-O for the account."""
-    return ctx.multi_root and fzf_version() >= (0, 39)
+    """Tab steps a row's account (multi-account mode), as on Windows."""
+    return ctx.multi_root and tab_marks_on()
 
 
 # Tab in multi-account mode: fzf runs this helper on every Tab - it steps the
@@ -1361,10 +1366,13 @@ def _cmd_arg(x: str) -> str:
 
 
 class TabMarks:
-    """The targets Tab sets in multi-account mode, by session key, kept
-    across the picker's fzf runs (Ctrl-K, a notice...): the PowerShell
-    picker's per-row account cycling, with the same signs - a green dot for
-    the row's own account, the legend number of another one."""
+    """The marks Tab sets, by session key, kept across the picker's fzf runs
+    (Ctrl-K, a notice...), with fzf run without --multi - so fzf always
+    prints the highlighted row, for the keys that act on one row. With one
+    account a mark is just on/off ("*" = as is); in multi-account mode it is
+    the account the row opens under, the PowerShell picker's per-row
+    cycling, with the same signs: a green dot for the row's own account, the
+    legend number of another one."""
 
     def __init__(self):
         self.dir = tempfile.mkdtemp(prefix="ccr-tab-")
@@ -1380,8 +1388,10 @@ class TabMarks:
         """The rows as fzf gets them, a mark column in front of the display."""
         meta, tg = {}, {}
         for i, s in index.items():
-            cycle = [l for l in [s.root] + [r.label for _, t, r in ctx.entries if t == s.tool and r.label != s.root] if l]
-            marks = {l: (f"{GREEN}●{RESET}" if l == s.root else
+            own = s.root or "*"
+            cycle = [own] + ([r.label for _, t, r in ctx.entries if t == s.tool and r.label and r.label != s.root]
+                             if ctx.multi_root else [])
+            marks = {l: (f"{GREEN}●{RESET}" if l == own else
                          next((f"{TOOL_COLOR[s.tool]}{BOLD}{n}{RESET}" for n, t, r in ctx.entries
                                if t == s.tool and r.label == l), "?"))
                      for l in cycle}
@@ -1414,16 +1424,18 @@ class TabMarks:
             tg = {}
         self.targets = {index[i].key: l for i, l in tg.items() if i in index}
         for s in sessions:
-            s.target_root = self.targets.get(s.key, "")
+            t = self.targets.get(s.key, "")
+            s.target_root = "" if t == "*" else t
         return [s for s in sessions if s.key in self.targets]
 
 
 def run_fzf(rows, header, query="", multi=True, expect=None, preview=True, prompt="filter> ", listen=0,
-            binds=None, track=False, info_cmd=None):
+            binds=None, track=False, info_cmd=None, state=None):
     """Rows are '<id>\\t<display>\\t<preview>'. Returns (key, [ids]) or None on
     Esc/Ctrl-C; key is '' for Enter or one of `expect`. listen: a port for
     fzf --listen (actions sent while it runs, see Limits). binds: extra
-    --bind specs; track: --track; info_cmd: the info line without --multi."""
+    --bind specs; track: --track; info_cmd: the info line without --multi;
+    state: a dict that gets the typed filter as "query" (--print-query)."""
     if not shutil.which(FZF[0]):
         sys.exit("ccr: fzf not found - install it first (brew install fzf)")
     ver = fzf_version()
@@ -1455,10 +1467,15 @@ def run_fzf(rows, header, query="", multi=True, expect=None, preview=True, promp
         args.append(f"--listen=127.0.0.1:{listen}")
     if preview:
         args += ["--preview", "printf '%b\\n' {3}", "--preview-window=down,5,wrap"]
+    if state is not None:
+        args.append("--print-query")
     p = subprocess.run(args, input="\n".join(rows) + "\n", text=True, stdout=subprocess.PIPE)
     if p.returncode not in (0, 1):
         return None
     lines = p.stdout.splitlines()
+    if state is not None:
+        state["query"] = lines[0] if lines else ""
+        lines = lines[1:]
     key = ""
     if expect:
         key = lines[0] if lines else ""
@@ -1971,8 +1988,8 @@ def picker_guide(ctx, lim=None, width: int = 0) -> list:
         ] + ([("Ctrl-O", "open the marked rows under another account: the conversations move there first "
                          "(fzf older than 0.39; with a newer one Tab sets the account per row)")]
              if multi and not cycle else []) + [
-            ("type", "fuzzy filter by tool, account, title and folder; the words run, cleared, archived and app "
-                     "list those rows"),
+            ("type", "fuzzy filter by tool, account, title and folder, every word separated by a space must match; "
+                     "the words run, bg, cleared, archived, elsewhere, @host and app list those rows"),
             ("Esc", "leave"),
         ]),
         ("New", [
@@ -2048,11 +2065,18 @@ def choose_tool(title: str, claude_note: str, codex_note: str, extra: list = Non
     rows = [f"claude\t{ORANGE}claude{RESET}{' ' * 5}{DIM}{claude_note}{RESET}\tclaude",
             f"codex\t{CYAN}codex{RESET}{' ' * 6}{DIM}{codex_note}{RESET}\tcodex"]
     rows += extra or []
-    res = run_fzf(rows, hint(("Enter", "choose"), ("Esc", "back"), tail=title),
-                  multi=False, preview=False, prompt="tool> ")
-    if not res or not res[1]:
+    # c / x / p jump straight to claude / codex / MAP, as in the PowerShell
+    # picker (the list is too short to need typing into its filter).
+    keys = {"c": "claude", "x": "codex"}
+    if any(r.startswith("panel\t") for r in rows):
+        keys["p"] = "panel"
+    res = run_fzf(rows, hint(("Enter", "choose"), (" ".join(keys), "jump"), ("Esc", "back"), tail=title),
+                  multi=False, preview=False, prompt="tool> ", expect=list(keys))
+    if not res:
         return None
-    return res[1][0]
+    if res[0] in keys:
+        return keys[res[0]]
+    return res[1][0] if res[1] else None
 
 
 def choose_account(items: list, title: str):
@@ -3576,13 +3600,27 @@ def choose_folder(sessions: list, seed: str, dry: bool, tail: str, prompt: str =
     return index[res[1][0]]["path"]
 
 
-def new_conversation(sessions: list, initial_name: str, dry: bool, ctx: Ctx, terminal: bool = False) -> bool:
+def new_conversation(sessions: list, initial_name: str, dry: bool, ctx: Ctx, terminal: bool = False):
     """Folder -> tool -> (claude) name -> (several accounts for that tool)
     account, then the tool takes over this terminal. Or folder -> panel ->
-    question -> agents, and the panel runs here."""
-    folder = choose_folder(sessions, initial_name, dry, "new conversation · step 1: folder")
-    if not folder:
-        return False
+    question -> agents, and the panel runs here. Esc steps back one level,
+    as in the PowerShell picker: to the tool, to the folder, then None (back
+    to the list). True = started, False = an error was printed."""
+    while True:
+        folder = choose_folder(sessions, initial_name, dry, "new conversation · step 1: folder")
+        if not folder:
+            return None
+        while True:
+            r = _new_in_folder(folder, sessions, initial_name, dry, ctx, terminal)
+            if r == "folder":
+                break
+            if r != "tool":
+                return r
+
+
+def _new_in_folder(folder: str, sessions: list, initial_name: str, dry: bool, ctx: Ctx, terminal: bool):
+    """new_conversation from the tool step on: 'folder' / 'tool' = Esc, step
+    back to that page; else new_conversation's result."""
     opener = [] if terminal else url_opener()
     app_ok = bool(opener) and codex_app_installed(sessions)
     extra = []
@@ -3594,7 +3632,7 @@ def new_conversation(sessions: list, initial_name: str, dry: bool, ctx: Ctx, ter
     tool = choose_tool(f"step 2: tool · {fmt_cwd(folder, 46)}", "asks for a session name",
                        "a terminal tab · no start name - /rename inside", extra)
     if not tool:
-        return False
+        return "folder"
     if tool == "panel":
         # A panel runs its agents here, in this terminal, without handing it
         # over: the question, then the agents; Esc on the agents goes back to
@@ -3606,7 +3644,7 @@ def new_conversation(sessions: list, initial_name: str, dry: bool, ctx: Ctx, ter
         while True:
             q = read_panel_question(panel_default(ctx), folder, q)
             if q is None:
-                return False
+                return "tool"
             choice = panel_page(folder, ctx, None, q)
             if choice:
                 if not dry:
@@ -3619,14 +3657,14 @@ def new_conversation(sessions: list, initial_name: str, dry: bool, ctx: Ctx, ter
         seed = f" [{initial_name}]" if initial_name else ""
         first = ask(f"first message for codex (empty = just open the folder){seed}> ")
         if first is None:
-            return False
+            return "tool"
         return open_new_app_thread(folder, first.strip() or initial_name, opener, dry)
     name = ""
     if tool == "claude":
         seed = f" [{initial_name}]" if initial_name else ""
         name = ask(f"session name for claude (empty = auto title){seed}> ")
         if name is None:
-            return False
+            return "tool"
         name = name.strip() or initial_name
     # Account: only asked for a tool with several accounts configured.
     roots = ctx.roots(tool)
@@ -3638,7 +3676,7 @@ def new_conversation(sessions: list, initial_name: str, dry: bool, ctx: Ctx, ter
             lbl = choose_account([(r.label, f"{fmt_cwd(r.path, 40):<{dir_w}}  {who_at(tool, r.path)}", r.default) for r in roots],
                                  "step 3: account for the new conversation")
             if lbl is None:
-                return False
+                return "tool"
             root = next(r for r in roots if r.label == lbl)
         else:
             root = roots[0] if roots else default_root(tool)
@@ -5394,7 +5432,7 @@ def new_panel(sessions: list, question: str, dry: bool, ctx) -> bool:
         if step == "question":
             q = read_panel_question(panel_default(ctx), "<the folder you pick next>", q or "")
             if q is None:
-                return False
+                return None   # Esc at the question: back to the list
             if isinstance(q, dict):
                 if continue_panel(dry, ctx):
                     return True
@@ -5952,9 +5990,11 @@ def main():
         # header of the fzf on screen, else it shows at the next redraw.
         lim = Limits(ctx)
         lim.refresh()
-        # Multi-account mode: Tab steps the account of a row (TabMarks), and
-        # fzf runs without --multi - the marked rows are those with a target.
-        tabs = TabMarks() if tab_cycle_on(ctx) else None
+        # Tab marks (multi-account mode: steps the account of a row) through
+        # TabMarks, and fzf runs without --multi: the marked rows are those
+        # with a mark, the row fzf prints is the highlighted one.
+        tabs = TabMarks() if tab_marks_on() else None
+        typed = {}
         restart = False
         while not restart:
             index = {}
@@ -5969,11 +6009,14 @@ def main():
                                                   "ctrl-t", "ctrl-l", "ctrl-g", "f1", "ctrl-f"]
                           + ([] if tabs else ["ctrl-o"]),
                           listen=lim.port, binds=[tabs.bind()] if tabs else None, track=bool(tabs),
-                          info_cmd=tabs.info_cmd() if tabs else None)
+                          info_cmd=tabs.info_cmd() if tabs else None, state=typed)
             lim.port = 0
             if res is None:
                 print("ccr: cancelled.")
                 return
+            # The typed filter survives a redraw (Ctrl-K, a notice, Del...),
+            # as in the PowerShell picker.
+            query = typed.get("query", query)
             key, ids = res
             picked = [index[i] for i in ids if i in index]
             # The highlighted row, for the keys that act on one row (Ctrl-F,
@@ -6007,15 +6050,18 @@ def main():
                     usage_page(here[0], usage_cached(here[0]), a.usage_hours, usage_since, all_)
                     pause()
                 continue
-            if key == "ctrl-n":
-                if not new_conversation(sessions, "", a.dry_run, ctx, a.terminal):
-                    print("ccr: cancelled.")
-                return
-            if key == "ctrl-p":
-                # A panel: the question first, then the folder, then the agents.
-                if not new_panel(sessions, "", a.dry_run, ctx):
-                    print("ccr: cancelled.")
-                return
+            if key in ("ctrl-n", "ctrl-p"):
+                # Ctrl-N: folder, tool...; Ctrl-P, a panel: the question, the
+                # folder, the agents. Esc steps back page by page and, from
+                # the first one, to this list (as in the PowerShell picker);
+                # an error is shown before the list comes back.
+                r = (new_conversation(sessions, "", a.dry_run, ctx, a.terminal) if key == "ctrl-n"
+                     else new_panel(sessions, "", a.dry_run, ctx))
+                if r:
+                    return
+                if r is False:
+                    pause("(Enter: back to the list)")
+                continue
             if key == "ctrl-t":
                 # Install or update claude / codex (Ctrl+I or Ctrl+T in the
                 # PowerShell picker; fzf sees Ctrl-I as Tab), then list again.
@@ -6113,7 +6159,8 @@ def main():
                     if failed:
                         print(f"ccr: could not delete {', '.join(repr(v.title) for v in failed)}.", file=sys.stderr)
                         pause("(Enter to continue)")
-                query = ""
+                    elif a.dry_run:
+                        pause("(Enter to continue)")
                 continue
             if key == "ctrl-e":
                 # The rows Enter would open, resumed with a model and an effort
@@ -6132,8 +6179,9 @@ def main():
                 launch(picked, a.new_window, a.dry_run, ctx, a.terminal, a.tabs)
                 return
             if not picked:
-                print("ccr: cancelled.")
-                return
+                # Enter on an empty list (a filter that matches nothing):
+                # stay, as the PowerShell picker does.
+                continue
             if key == "ctrl-o":
                 # Open the marked rows under another account: the conversation
                 # moves into that account's dir first (running ones refused).

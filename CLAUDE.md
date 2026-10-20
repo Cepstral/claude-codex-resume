@@ -109,6 +109,12 @@ dot), the other accounts of its tool (their legend number) - through a fzf
 the cursor, fzf without --multi (the marked rows are those with a target).
 Verified with fzf 0.74 driven over --listen. fzf older than 0.39 keeps Tab
 mark + `Ctrl-O` (one target account for the marked rows).
+Since v0.86 ccr.py keeps the marks itself in every mode (one account: Tab
+is on/off), so fzf always prints the highlighted row and Ctrl-F / Ctrl-X /
+Ctrl-J act on it, as on Windows; the typed filter survives a redraw
+(--print-query). And the PowerShell picker marks with Tab too - it was
+Space - so Space types into the filter on both sides, where every word
+must match (PowerShell: a substring per word; fzf: fuzzy).
 Remaining differences: `+`/`X` on the account page ↔ rows picked with Enter;
 `S` ↔ `Ctrl-S`; the Shift+Enter model/effort page ↔ `Ctrl-E` with fzf
 menus in sequence (model, then effort, per tool) — fzf has no shift-enter,
@@ -157,6 +163,21 @@ Ctrl-N that the PowerShell script does not have yet. The PowerShell picker
 rotates a cut title or path through its column on the highlighted row
 (marquee); fzf cannot animate a list row, so `ccr.py` relies on its preview
 pane, which shows the full title and folder of the highlighted row.
+
+Audit of 2026-10-20 (v0.84 -> v0.86): aligned Tab, the filter's words, the
+highlighted row of Ctrl-F/X/J, Esc stepping back through Ctrl-N / Ctrl-P
+(ccr.py quit), Enter on an empty list (ccr.py quit), the filter kept across
+redraws, the dry-run delete pause, c / x / p on the tool step, `--version`,
+`--filter` and `-DryRun` in PowerShell, `-Usage` through the self-heal, the
+delete page's account line, the guide's filter words. Accepted, because fzf
+or the platform differ: Esc in fzf leaves at once (PowerShell clears the
+filter first); ccr.py does not put the cursor back on its row after a
+redraw; `+ add agent` on the MAP page copies the highlighted agent in
+PowerShell, the last one in ccr.py (the highlighted row is "+ add agent");
+the many-row delete list is capped to the screen only in PowerShell; Insert
+also adds an account on the PowerShell account page; ccr.py says
+"computer" where PowerShell says "PC"; the install page's confirm is a key
+in PowerShell, a y/N line in ccr.py; `-WhatIf` lists no `unarchive:` lines.
 
 ## Working rules
 
