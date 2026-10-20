@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.86'
+$script:CcrVersion = '0.87'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -4619,7 +4619,7 @@ function Get-CcrPickerGuide([int]$Width, [bool]$AcctMode, [bool]$LimitsOn) {
     $sections = @(
         , @('Moving and opening',
             @("$([char]0x2191) $([char]0x2193)  PgUp PgDn  Home End", 'move'),
-            @('Tab', $(if ($AcctMode) { 'cycle the account the row opens under: its own (green dot), another one (its number in the table on top: the conversation moves there first), none' } else { 'mark / unmark a row' })),
+            @('Tab', $(if ($AcctMode) { 'mark a row, and press again to open it under another account: its own (green dot), another one (its number in the table on top: the conversation moves there), none' } else { 'mark / unmark a row' })),
             @('Enter', 'open the marked rows, or the highlighted one: the first in this tab, the others as new tabs'),
             @('Shift+Enter  or  Ctrl+E', 'the same, with a model and an effort you pick first'),
             @('type', "filter by tool, account, title and folder, every word separated by a space must match; the words run, bg, cleared, archived, elsewhere and @host list those rows"),
@@ -4635,8 +4635,8 @@ function Get-CcrPickerGuide([int]$Width, [bool]$AcctMode, [bool]$LimitsOn) {
             @('Ctrl+F', 'find the window of the running conversation of the highlighted row: it comes to the front with its tab selected, and its title blinks'),
             @('Ctrl+X', 'close the running conversation of the highlighted row (it is kept)'),
             @('Ctrl+I  or  Ctrl+T', 'install or update Claude Code and Codex with their official installers'),
-            @('Del  or  Ctrl+D', 'delete the marked conversations, or the highlighted one, for good, after a confirmation (Ctrl+Backspace too)'),
-            @('Ctrl+G  or  F1', 'this guide (F1 for when another program takes Ctrl+G: Grammarly does on a Mac)'))
+            @('Del  or  Ctrl+D', 'delete the marked conversations, or the highlighted one, for good, after a confirmation'),
+            @('Ctrl+G  or  F1', 'this guide'))
         , @('Signs on a row',
             @("$([char]0x25CF)  1 2 $([char]0x2026)", 'marked; a number: it opens under that account of the table on top'),
             @('run  bg  @host', "the age column: running here $d a Claude background session $d open on another PC"),
@@ -4982,8 +4982,10 @@ function Select-CcrSession {
     if ($null -eq $AllCodexRoots) { $AllCodexRoots = $CodexRoots }
     $multiRoot = ($ClaudeRoots.Count -gt 1) -or ($CodexRoots.Count -gt 1)
     $defLabel = @{ claude = "$(@($ClaudeRoots | Where-Object Default)[0].Label)"; codex = "$(@($CodexRoots | Where-Object Default)[0].Label)" }
+    # Account column: blank for the default account, so the rows of the
+    # other accounts stand out (the table on top names the default).
     $rootW = if ($multiRoot) {
-        [Math]::Min(14, (@($ClaudeRoots) + @($CodexRoots) | ForEach-Object { (Format-CcrAcctLabel $_.Label $_.Default).Length } | Measure-Object -Maximum).Maximum)
+        [int][Math]::Min(14, [int](@($ClaudeRoots) + @($CodexRoots) | Where-Object { -not $_.Default } | ForEach-Object { "$($_.Label)".Length } | Measure-Object -Maximum).Maximum)
     }
     else { 0 }
 
@@ -5108,7 +5110,6 @@ function Select-CcrSession {
         $withDirs = ($base + 2 + $dirW + 2 + $whoW + $limPart) -le $Width - 1
         $withWho = $withDirs -or (($base + 2 + $whoW + $limPart) -le $Width - 1)
         $out = [System.Collections.Generic.List[string]]::new()
-        if ($acctMode) { $out.Add("`e[1;35mMulti-account mode active.`e[22;39m") }
         $prevTool = ''
         foreach ($r in $rows) {
             $tc = Get-CcrToolColor $r.Tool
@@ -5175,7 +5176,7 @@ function Select-CcrSession {
             $h = [Console]::WindowHeight
             # The key legend wraps onto as many lines as the window needs.
             # The essentials; every other key is in the guide (Ctrl+G or F1).
-            $hint = "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Tab $(if ($acctMode) { 'account' } else { 'mark' }) $([char]0x00B7) Enter open $([char]0x00B7) Ctrl+N new $([char]0x00B7) Ctrl+G/F1 guide: all the keys $([char]0x00B7) Esc cancel $([char]0x00B7) type to filter $([char]0x00B7) v$script:CcrVersion"
+            $hint = "$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Tab $(if ($acctMode) { 'mark/account' } else { 'mark' }) $([char]0x00B7) Enter open $([char]0x00B7) Ctrl+N new $([char]0x00B7) Ctrl+G/F1 guide: all the keys $([char]0x00B7) Esc cancel $([char]0x00B7) type to filter $([char]0x00B7) v$script:CcrVersion"
             $hintLines = @(Split-CcrHint $hint ($w - 1))
             $tableLines = @(Get-CcrAccountTable $w)
             $viewH = [Math]::Max(1, $h - 1 - $hintLines.Count - $tableLines.Count - $(if ($updNote) { 1 } else { 0 }))
@@ -5186,7 +5187,7 @@ function Select-CcrSession {
 
             # row = status(1) sp tool(6) sp [account(rootW) sp] age(6) [sp usage(6) sp share(6)] 2sp title 2sp cwd
             $cwdW = [Math]::Min(45, [Math]::Max(12, [int]($w * 0.4)))
-            $titleW = $w - 21 - $cwdW - $(if ($multiRoot) { $rootW + 1 } else { 0 }) - $(if ($usageOn) { 14 } else { 0 })
+            $titleW = $w - 21 - $cwdW - $(if ($multiRoot -and $rootW) { $rootW + 1 } else { 0 }) - $(if ($usageOn) { 14 } else { 0 })
             # The window's tokens across the listed sessions, for the share.
             $usageSum = if ($usageOn) { [long](($usageOf.Values | Where-Object { $_ } | ForEach-Object { $_.Total } | Measure-Object -Sum).Sum) } else { 0L }
             if ($titleW -lt 10) { $cwdW = [Math]::Max(8, $cwdW + $titleW - 10); $titleW = [Math]::Max(1, $w - 23 - $cwdW) }
@@ -5266,8 +5267,8 @@ function Select-CcrSession {
                 $cwdTxt = if ($scroll -ge 0) { Get-CcrCell (Format-CcrCwd $s.Cwd 100000) $cwdW $scroll } else { (Format-CcrCwd $s.Cwd $cwdW).PadRight($cwdW) }
                 # Account column (multi-root only): the config dir this claude
                 # session lives in; codex rows have none.
-                $rootTxt = if ($multiRoot) {
-                    $lbl = Format-CcrAcctLabel "$($s.Root)" ("$($s.Root)" -eq $defLabel[$s.Tool]); if ($lbl.Length -gt $rootW) { $lbl = $lbl.Substring(0, $rootW) }
+                $rootTxt = if ($multiRoot -and $rootW) {
+                    $lbl = if ("$($s.Root)" -eq $defLabel[$s.Tool]) { '' } else { "$($s.Root)" }; if ($lbl.Length -gt $rootW) { $lbl = $lbl.Substring(0, $rootW) }
                     "`e[35m $($lbl.PadRight($rootW))`e[39m"
                 }
                 else { '' }

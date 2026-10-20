@@ -124,23 +124,22 @@ A `ccr.json` with only those keys does not turn multi-account mode on.
 
 ## What the picker shows
 
-An **account column** appears between the tool and the age (magenta), for both tools, the
-default account in parentheses; above the rows, the account table lists the accounts (see
+An **account column** appears between the tool and the age (magenta), for both tools; it is
+blank for the default account, so the rows of the other accounts stand out; above the rows, the account table lists the accounts (see
 [Tab](#opening-a-conversation-under-another-account--tab) below) with each one's usage limits:
 
 ```
 filter>                                                 88/121 · 2 marked
-Multi-account mode active.
   claude  1 (default)  ~\.claude       me@gmail.com    5h 9% → 00:19 · week 50% → Wed 7 09:59 · Fable 40%
           2 work       ~\.claude-work  me@company.com  no limits reported
   codex   3 (default)  ~\.codex        me@gmail.com    5h 0% · week 2%  → Wed 7 07:57
           4 work       ~\.codex-work   me@company.com  week 27% → Sun 4 21:02
-↑↓ move · Tab account · Enter open · Ctrl+N new · Ctrl+G/F1 guide: all the keys · Esc cancel · type to filter
+↑↓ move · Tab mark/account · Enter open · Ctrl+N new · Ctrl+G/F1 guide: all the keys · Esc cancel · type to filter
 ● claude work       1h  Billing API pagination          D:\repos\api-server
-  claude (default)  3h  Home automation bridge          D:\repos\home
+  claude            3h  Home automation bridge          D:\repos\home
   codex  work       5h  migrate build to vite           D:\repos\web-app
-● claude (default)  1d  Physics simulation viral videos D:\repos\sim-shorts
-  codex  (default)  2d  sono affidabili i nebulizzatori ~
+● claude            1d  Physics simulation viral videos D:\repos\sim-shorts
+  codex             2d  sono affidabili i nebulizzatori ~
 ```
 
 The table is there with a single account per tool too (one line per tool, without the
@@ -217,15 +216,14 @@ numbers, a codex row only codex numbers.
 
 ```
 filter>                                                              198/198 · 1 marked · 1 re-homed
-Multi-account mode active.
   claude  1 (default)  ~\OneDrive\.claude           me@company.com
           2 personal   ~\OneDrive\.claude-personal  me@gmail.com
   codex   3 (default)  ~\.codex                     me@company.com
           4 personal   ~\.codex-personal            me@gmail.com
-↑↓ move · Tab account · Enter open · Ctrl+N new · Ctrl+G/F1 guide: all the keys · Esc cancel · type to filter
-2 claude (default)  1h  Billing API pagination          D:\repos\api-server
+↑↓ move · Tab mark/account · Enter open · Ctrl+N new · Ctrl+G/F1 guide: all the keys · Esc cancel · type to filter
+2 claude            1h  Billing API pagination          D:\repos\api-server
 ● claude personal   3h  Home automation bridge          D:\repos\home
-4 codex  (default)  5h  migrate build to vite           D:\repos\web-app
+4 codex             5h  migrate build to vite           D:\repos\web-app
 ```
 
 The email is read per dir from that dir's own files, so the same account can show different

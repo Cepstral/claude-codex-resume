@@ -37,7 +37,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.86"
+VERSION = "0.87"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -1429,6 +1429,12 @@ class TabMarks:
         return [s for s in sessions if s.key in self.targets]
 
 
+def esc_bind() -> list:
+    """Esc in the picker: clears a typed filter first, then leaves - as in the
+    PowerShell picker (fzf 0.45+, `transform`; an older fzf leaves at once)."""
+    return ["esc:transform:[ -n {q} ] && echo clear-query || echo abort"] if fzf_version() >= (0, 45) else []
+
+
 def run_fzf(rows, header, query="", multi=True, expect=None, preview=True, prompt="filter> ", listen=0,
             binds=None, track=False, info_cmd=None, state=None):
     """Rows are '<id>\\t<display>\\t<preview>'. Returns (key, [ids]) or None on
@@ -1899,7 +1905,7 @@ def account_table(ctx, lim: Limits = None) -> list:
     lim_part = 2 + lim_w if lim_w else 0
     with_dirs = base + 2 + dir_w + 2 + who_w + lim_part <= width
     with_who = with_dirs or base + 2 + who_w + lim_part <= width
-    lines = [f"{BOLD}{MAGENTA}Multi-account mode active.{RESET}"] if ctx.multi_root else []
+    lines = []
     prev = ""
     for t, n, lbl, d, who, cell in rows:
         tool_txt = f"{t:<6}" if t != prev else " " * 6
@@ -1920,8 +1926,14 @@ def account_table(ctx, lim: Limits = None) -> list:
 def session_rows(sessions, index, ctx: Ctx, usage: dict = None):
     """usage: "tool|id" -> Usage or None, when the Ctrl-K column is on."""
     rows = []
-    root_w = min(14, max((len(acct_label(r.label, r.default)) for r in ctx.claude + ctx.codex), default=0)) \
+    # Account column: blank for the default account, so the rows of the
+    # other accounts stand out (the table on top names the default).
+    root_w = min(14, max((len(r.label) for r in ctx.claude + ctx.codex if not r.default), default=0)) \
         if ctx.multi_root else 0
+    # Title column of a fixed width, so the folders line up as in the
+    # PowerShell picker: the longest title (and its tags), at most 50.
+    tag_len = lambda s: (10 if s.cleared else 0) + (11 if s.archived else 0)
+    title_w = min(50, max((min(len(s.title), 50) + tag_len(s) for s in sessions), default=0))
     usage_sum = sum(u.total for u in usage.values() if u) if usage else 0
     for i, s in enumerate(sessions):
         index[str(i)] = s
@@ -1936,6 +1948,7 @@ def session_rows(sessions, index, ctx: Ctx, usage: dict = None):
             age = f"{fmt_age(s.last):>6}"
         title = s.title if len(s.title) <= 50 else s.title[:49] + "…"
         tag = (f" {YELLOW}(cleared){RESET}" if s.cleared else "") + (f" {DIM}(archived){RESET}" if s.archived else "")
+        tag += " " * max(0, title_w - len(title) - tag_len(s))
         # Tool column, padded on the plain text (the colors are zero-width).
         app = s.origin == "app"
         tool = f"{color}{s.tool}{RESET}" + (f"{DIM} app{RESET}" if app else "")
@@ -1944,8 +1957,8 @@ def session_rows(sessions, index, ctx: Ctx, usage: dict = None):
         # lives in; the label is part of the text fzf matches on.
         acct = ""
         if ctx.multi_root:
-            lbl = acct_label(s.root, s.root == ctx.def_label[s.tool])[:root_w]
-            acct = f"{MAGENTA}{lbl:<{root_w}}{RESET} "
+            lbl = ("" if s.root == ctx.def_label[s.tool] else s.root)[:root_w]
+            acct = f"{MAGENTA}{lbl:<{root_w}}{RESET} " if root_w else ""
         # Usage column (Ctrl-K): total tokens in the window and, in
         # parentheses, the session's share of the window's tokens across
         # the listed sessions; blank when the session had no turn in it.
@@ -1954,10 +1967,11 @@ def session_rows(sessions, index, ctx: Ctx, usage: dict = None):
             u = usage.get(s.key)
             use = f" {YELLOW}{fmt_tokens(u.total):>6} {fmt_share(u.total, usage_sum):>6}{RESET}" if u else " " * 14
         disp = f"{tool}{acct}{age}{use}  {title}{tag}  {DIM}{fmt_cwd(s.cwd, 50)}{RESET}"
-        extra = ((" cleared" if s.cleared else "") + (" archived" if s.archived else "") + (" run" if s.running else "")
-                 + (" bg" if s.running and s.run_kind == "bg" else "")
-                 + (f" elsewhere @{s.running_on}" if s.running_on else "")
-                 + (" app" if app else ""))  # filter words
+        # Filter words not already on the row (fzf matches only what it
+        # shows): run, cleared, archived and app are; a bg row is running
+        # too, and an @host cut to the age column is spelled out.
+        extra = ((" run" if s.running and s.run_kind == "bg" else "")
+                 + (f" elsewhere @{s.running_on}" if s.running_on else ""))
         how = (f"opens in: Codex app (codex://threads/{s.id})" if app
                else f"opens in: terminal ({resume_argv(s)[0]} …)")
         where = f"\\naccount: {s.root} ({fmt_cwd(s.root_path, 40)})" if ctx.multi_root else ""
@@ -1980,8 +1994,9 @@ def picker_guide(ctx, lim=None, width: int = 0) -> list:
     sections = [
         ("Moving and opening", [
             ("↑ ↓  PgUp PgDn", "move"),
-            ("Tab", "cycle the account the row opens under: its own (green dot), another one (its number in the "
-                    "table on top: the conversation moves there first), none" if cycle else "mark / unmark a row"),
+            ("Tab", "mark a row, and press again to open it under another account: its own (green dot), another "
+                    "one (its number in the table on top: the conversation moves there), none" if cycle
+                    else "mark / unmark a row"),
             ("Enter", "open the marked rows, or the highlighted one: the first here, the others as tabs "
                       "(iTerm2, tmux) or windows (Terminal.app)"),
             ("Ctrl-E", "the same, with a model and an effort you pick first"),
@@ -1990,7 +2005,7 @@ def picker_guide(ctx, lim=None, width: int = 0) -> list:
              if multi and not cycle else []) + [
             ("type", "fuzzy filter by tool, account, title and folder, every word separated by a space must match; "
                      "the words run, bg, cleared, archived, elsewhere, @host and app list those rows"),
-            ("Esc", "leave"),
+            ("Esc", "clear the filter, then leave" if fzf_version() >= (0, 45) else "leave"),
         ]),
         ("New", [
             ("Ctrl-N", "a new conversation: the folder, then claude, codex (or the codex app) or MAP"),
@@ -2008,10 +2023,8 @@ def picker_guide(ctx, lim=None, width: int = 0) -> list:
             ("Ctrl-X", "close the running conversation of the highlighted row (it is kept)"),
             ("Ctrl-T", "install or update Claude Code and Codex with their official installers"),
             ("Del  or  Ctrl-D", "delete the marked conversations, or the highlighted one, for good, after a "
-                                "confirmation (fn+⌫ is Del on a Mac keyboard; Ctrl-Backspace too where the "
-                                "terminal tells it from Backspace - Terminal.app does not)"),
-            ("Ctrl-G  or  F1", "this guide (F1, fn+F1 on a Mac keyboard, for when another app takes Ctrl-G: "
-                               "Grammarly's AI Chat does on a Mac)"),
+                                "confirmation (on a Mac keyboard Del is fn+⌫)"),
+            ("Ctrl-G  or  F1", "this guide (F1 is fn+F1 on a Mac keyboard)"),
         ]),
         ("Signs on a row", [
             ("●", "marked"),
@@ -2052,7 +2065,7 @@ def picker_hint(ctx: Ctx, upd_note: str = "", lim: Limits = None) -> str:
         lines.append(f"{BOLD}{GREEN}ccr updated v{f} -> v{t}{RESET}")
     lines += account_table(ctx, lim)
     # The essentials; every other key is in the guide (Ctrl-G or F1).
-    keys = [("↑↓", "move"), ("Tab", "account" if tab_cycle_on(ctx) else "mark"), ("Enter", "open"), ("Ctrl-N", "new"),
+    keys = [("↑↓", "move"), ("Tab", "mark/account" if tab_cycle_on(ctx) else "mark"), ("Enter", "open"), ("Ctrl-N", "new"),
             ("Ctrl-G/F1", "guide: all the keys"),
             ("Esc", "cancel")]
     lines.append(right_align(hint(*keys) + f"{DIM}  ·  type to filter{RESET}", f"{DIM}ccr v{VERSION}{RESET}"))
@@ -6008,7 +6021,7 @@ def main():
                           expect=delete_keys() + ["ctrl-n", "ctrl-p", "ctrl-a", "ctrl-k", "ctrl-j", "ctrl-x", "ctrl-e",
                                                   "ctrl-t", "ctrl-l", "ctrl-g", "f1", "ctrl-f"]
                           + ([] if tabs else ["ctrl-o"]),
-                          listen=lim.port, binds=[tabs.bind()] if tabs else None, track=bool(tabs),
+                          listen=lim.port, binds=([tabs.bind()] if tabs else []) + esc_bind(), track=bool(tabs),
                           info_cmd=tabs.info_cmd() if tabs else None, state=typed)
             lim.port = 0
             if res is None:

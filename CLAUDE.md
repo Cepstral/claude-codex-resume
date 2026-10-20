@@ -170,14 +170,27 @@ highlighted row of Ctrl-F/X/J, Esc stepping back through Ctrl-N / Ctrl-P
 redraws, the dry-run delete pause, c / x / p on the tool step, `--version`,
 `--filter` and `-DryRun` in PowerShell, `-Usage` through the self-heal, the
 delete page's account line, the guide's filter words. Accepted, because fzf
-or the platform differ: Esc in fzf leaves at once (PowerShell clears the
-filter first); ccr.py does not put the cursor back on its row after a
+or the platform differ: ccr.py does not put the cursor back on its row after a
 redraw; `+ add agent` on the MAP page copies the highlighted agent in
 PowerShell, the last one in ccr.py (the highlighted row is "+ add agent");
 the many-row delete list is capped to the screen only in PowerShell; Insert
 also adds an account on the PowerShell account page; ccr.py says
 "computer" where PowerShell says "PC"; the install page's confirm is a key
 in PowerShell, a y/N line in ccr.py; `-WhatIf` lists no `unarchive:` lines.
+
+UI pass of v0.87 (both sides): the account column is blank for the default
+account (the table on top names it) and "Multi-account mode active." is
+gone; the key line says `Tab mark/account` in multi-account mode; the
+guide keeps the keys and drops the terminal notes (Ctrl+Backspace, ^H,
+Grammarly), which live in the README. ccr.py: the title column has a fixed
+width so the folders line up (PowerShell did already); the hidden filter
+words that showed dimmed after the folder are gone, since fzf matches only
+what it shows and run / bg / app / (cleared) / (archived) are on the row
+already - only `run` on a bg row and `elsewhere @host` stay; Esc clears a
+typed filter first, then leaves, as in PowerShell (fzf 0.45+ `transform`,
+esc_bind; verified with fzf 0.74 in a pty). Consequence in ccr.py: the
+default account's label is no longer on the row, so typing it no longer
+narrows to it (the PowerShell filter still matches it); `-Root` does.
 
 ## Working rules
 

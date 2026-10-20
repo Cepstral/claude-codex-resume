@@ -1,56 +1,43 @@
 # claude-codex-resume
 
-A multi-select resume picker for **Claude Code** and **OpenAI Codex CLI** conversations — Windows first, macOS/Linux via tmux.
+**One picker for your Claude Code and Codex CLI conversations.** `ccr` lists the past sessions of both tools in one list, most recent first. Mark the ones you want, press `Enter`, and each one reopens in a terminal tab of its own — in the folder it was started in, with the right resume command (`claude --resume <id>` / `codex resume <id>`).
 
-`ccr` shows your past sessions from both tools in one list, sorted by last message. Mark the ones you want with `Tab`, press `Enter`, and each reopens as a tab of your current Windows Terminal window — in its original working directory, with the right resume command.
+| | Windows | macOS / Linux |
+|---|---|---|
+| Script | `Resume-CcSessions.ps1` | `ccr.py` |
+| Needs | [PowerShell 7+](https://github.com/PowerShell/PowerShell), [Windows Terminal](https://github.com/microsoft/terminal) | Python 3 (stdlib only), [fzf](https://github.com/junegunn/fzf) |
+| Extra conversations open as | tabs of the current Windows Terminal window | iTerm2 tabs, Terminal.app windows, tmux windows |
+
+Both need [Claude Code](https://code.claude.com) and/or [Codex CLI](https://github.com/openai/codex). The two scripts are the same tool: same version number, same features, same config file (`ccr.json`), same flags. A few keys differ because fzf cannot read them — see [Keys](#keys). (The PowerShell script also runs on macOS/Linux under `pwsh`, with tmux windows, but `ccr.py` is the native choice there.)
 
 ```
-filter>                                            49/128 · 2 marked
-↑↓ move · Tab mark · Enter open · Ctrl+N new · Ctrl+G/F1 guide: all the keys · Esc cancel · type to filter · v0.86
-  claude   run  API rate limiting bug          D:\repos\api-server
-● codex     1h  migrate build to vite          D:\repos\web-app
-  claude    3h  Docs restructure               D:\repos\docs
-● claude   23h  dotfiles cleanup               ~\dotfiles
+filter>                                                       49/128 · 2 marked
+  claude  ~/.claude  me@example.com  5h 9% → 00:19 · week 50% → Wed 7 09:59
+  codex   ~/.codex   me@example.com  5h 0% · week 2% → Wed 7 07:57
+↑↓ move · Tab mark · Enter open · Ctrl+N new · Ctrl+G/F1 guide: all the keys · Esc cancel · type to filter
+  claude    run  API rate limiting bug          ~/repos/api-server
+● codex      1h  migrate build to vite          ~/repos/web-app
+  claude     3h  Docs restructure               ~/repos/docs
+● claude    23h  dotfiles cleanup               ~/dotfiles
 ```
 
-A green `●` = marked for opening. Sessions running right now in some terminal show a red `run` in the age column, so you don't open a second copy by accident.
+On top, one line per tool (and per account): who is logged in and how much of the usage limits is used. A green `●` is a marked row. A red `run` in the age column means the conversation is running right now on this PC, so you don't open a second copy by accident.
 
 ## Why
 
-If you work with several CLI agent sessions at once — one Windows Terminal window, one tab per conversation — reopening them after a reboot means `cd`-ing around and running `claude --resume` / `codex resume` once per tab. `ccr` does the whole thing in one go.
-
-## Features
-
-- **One merged list** for Claude Code + Codex, sorted by last activity. Claude ordering replicates the real `--resume` picker exactly (`min(last message timestamp, file mtime)`), titles follow the same precedence (custom title → AI title → first prompt).
-- **Zero dependencies.** Pure PowerShell 7. No modules, no fzf, nothing to install (the optional Codex title overlay uses `winsqlite3.dll`, which ships with Windows).
-- **Robust across tool updates.** It reads only the session files the tools themselves use to resume (`<claude config>\projects\*\*.jsonl`, `~\.codex\sessions\**\rollout-*.jsonl`), with bounded reads (transcripts can reach hundreds of MB) and defensive parsing — an unknown format degrades a row's title, never crashes the listing.
-- **The first selection takes over the tab you ran `ccr` in** — the launcher tab never sits idle — and the rest open as tabs of the current window (`wt -w 0`), each in the session's recorded folder. Sessions already running elsewhere are flagged `run` (codex ones when started via `codex resume <id>`).
-- **Cleared conversations are labeled.** `/clear` starts a new session that keeps the tab's name, so the conversation it replaced would look like a duplicate; ccr tags it with a yellow `(cleared)`. The link is exact where Claude Code recorded a Remote Control bridge id (the new session's first id equals the old one's last), with a same-folder-and-name fallback only for older sessions that predate those ids. Type `cleared` to list them all.
-- **Archived Codex conversations are listed too.** `codex archive` moves a conversation's file out of `sessions` into `archived_sessions`, where a picker that reads only `sessions` would lose it. ccr lists those as well, with a dimmed `(archived)` after the title (type `archived` to list them all), and opening one — or moving it to another account — runs `codex unarchive` first, under its account: Codex refuses to resume an archived conversation.
-- **Long titles and paths scroll.** A title or folder cut to fit its column rotates through it on the highlighted row while the picker waits for a key, so nothing stays hidden behind an ellipsis (the macOS/Linux fzf picker shows the full text in its preview pane instead).
-- Respects `CLAUDE_CONFIG_DIR` for relocated Claude data directories.
-- **Several accounts, decided per conversation** — for Claude Code and Codex alike: `Ctrl+A` in the picker (or `ccr -AddAccount work`) turns it on: the dirs in use today become the `default` account, and each extra account gets a fresh data dir per tool with that tool's own login in it. The picker gains an account column, every session resumes under its own account, `Ctrl+N` asks which account a new conversation goes to, the account page adds/removes accounts (a removed account's sessions move to `default`) or turns the mode off again, and `Tab` in the picker cycles the account a conversation opens under (it moves there). `-Root work` narrows the listing to one account, `-Accounts` shows who is logged in where. Details and examples: [docs/multi-account.md](docs/multi-account.md).
-- **Every account's usage limits, at a glance.** Above the list, one line per tool and account — with a single account per tool too — shows the dir, who is logged in there and how far it is into its usage limits: `5h 9% → 00:19 · week 50% → Wed 7 09:59 · Fable 40%` (from 70% yellow, from 90% red). The figures are the tools' own, asked live and in the background: Claude Code's `/usage` (`claude -p "/usage"`, a local command — no model call, no cost) and Codex's app-server (`account/rateLimits/read`); ccr reads no credential. Answers are cached for 5 minutes, `Ctrl+L` asks again, and `CCR_LIMITS=0` or `"limits": false` in `ccr.json` turns the asking off.
-- **MAP, a multi-agent panel** — one question, two to four fresh agents (Claude Code and/or Codex, each with its own model, effort and account) that discuss it in a folder round after round until they all agree. An optional master may change files while the others review read-only; ccr shows every reply as it lands, ends with one final answer and a saved transcript, and leaves the agents' sessions in the picker. Each agent can have a tab of its own that shows live what it reads, runs, changes and writes. Every agent works like its CLI in auto mode, web search included, precision before speed; a long turn is never cut (after 20 minutes ccr asks). `Ctrl+P` in the picker, or `ccr -Panel "question"`: the question first, then the folder, then the agents. A MAP that ends without agreement goes on later with the same agents, in their own sessions: `ccr -Panel -Continue`, or `Ctrl+R` on the question page. Details: [docs/panel.md](docs/panel.md).
-- Type to filter, `-WhatIf` to preview the exact `wt.exe` command line instead of launching.
-
-## Requirements
-
-- [PowerShell 7+](https://github.com/PowerShell/PowerShell) and [Claude Code](https://code.claude.com) and/or [Codex CLI](https://github.com/openai/codex)
-- **Windows 10/11**: [Windows Terminal](https://github.com/microsoft/terminal) (multiple selections open as tabs)
-- **macOS / Linux**: use the **native Python version** below (`ccr.py` — real iTerm2/Terminal.app tabs, fzf picker). The PowerShell script also runs there under `pwsh` (tmux windows for multiple selections).
+If you work with several CLI agent sessions at once — one terminal window, one tab per conversation — reopening them after a reboot means `cd`-ing around and running `claude --resume` / `codex resume` once per tab. `ccr` does the whole thing in one go.
 
 ## Install
 
-One line, no admin rights (it copies the script next to your PowerShell profile and adds a load line to the profile — both idempotent):
+### Windows
+
+One line, no admin rights. It copies the script next to your PowerShell profile and adds a load line to the profile (both idempotent):
 
 ```powershell
 irm https://raw.githubusercontent.com/Cepstral/claude-codex-resume/main/install.ps1 | iex
 ```
 
-From a clone: `.\install.ps1`. To update later, run **`ccr -Update`** — it downloads `main`'s script from GitHub over the installed copy, and open tabs pick the new version up by themselves on the next `ccr`. ccr also **checks by itself**: on the first run in a shell and then once an hour, it asks GitHub for its channel's head; a newer version is installed before the run (with a message) and the picker's first line says `ccr updated v0.48 -> v0.49` for that run. `$env:CCR_AUTO_UPDATE = '0'` turns the check off; `%LOCALAPPDATA%\ccr\ccr.state.json` remembers the installed commit and the last check, per machine (never in a synced folder, so a second PC does not think it is up to date). To try what's coming next without touching your daily `ccr`: **`ccr -Channel test`** installs the `test` branch as a side-by-side copy and **`ccrtest`** runs it (same parameters and keys); `ccrtest -Update` refreshes it.
-
-If the raw URL isn't reachable (e.g. a private fork), install through the authenticated [GitHub CLI](https://cli.github.com) instead — the installer then also downloads the script via `gh`:
+From a clone: `.\install.ps1`. If the raw URL isn't reachable (e.g. a private fork), go through the authenticated [GitHub CLI](https://cli.github.com) — the installer then downloads the script via `gh` too:
 
 ```powershell
 gh api repos/Cepstral/claude-codex-resume/contents/install.ps1 -H "Accept: application/vnd.github.raw" | Out-String | iex
@@ -81,155 +68,277 @@ gh api repos/Cepstral/claude-codex-resume/contents/install.ps1 -H "Accept: appli
 
 </details>
 
-## Usage
-
-```powershell
-ccr                    # pick from the 200 most recent sessions (-Top 0 = all)
-ccr kit                # open the picker already filtered to "kit"
-ccr -n                 # new conversation: pick a folder, name it, go
-ccr -n Kitchen         # same, name box prefilled with "Kitchen"
-ccr -Panel "why does the import skip rows?"   # a MAP (multi-agent panel, also -MAP): 2-4 fresh agents discuss one question until they agree (quote it)
-ccr -Panel -Continue   # go on with a saved MAP: the same agents, in their own sessions, from the next round
-ccr -Tool codex        # only codex sessions
-ccr -Top 100           # deeper history
-ccr -NewWindow         # open the tabs in a fresh WT window instead
-ccr -WhatIf            # print the wt.exe command line, launch nothing
-ccr -Install codex     # install codex here - or update it - with its official installer (-Install all: both tools)
-```
-
-The line above the list names only the essentials — move, mark, open, new, cancel — and **`Ctrl+G`** (or **`F1`**), the guide: a full page with every key and a short explanation of it, what the signs on a row mean (`run`, `@host`, `(cleared)`, `(archived)`…) and what the account table on top shows. Any key goes back to the list. `F1` is there for when another program takes `Ctrl+G` before the terminal sees it: on a Mac, Grammarly's AI Chat does.
-
-| Key | Action |
-|---|---|
-| `↑` `↓` `PgUp` `PgDn` `Home` `End` | move |
-| `Tab` | mark / unmark; in **multi-account mode** cycle the account the row opens under — its own (green dot), each other account of its tool (its number in the table on top: the conversation moves there first), none. Tab, as in the macOS picker (fzf's key); until v0.85 it was `Space` here, which now types into the filter |
-| `Ctrl+A` | the **account page**: add an account (`+`), log this PC in to one (`L`), remove one (`Del`), copy the default account's settings (`S`), turn multi-account mode off (`X`). [docs/multi-account.md](docs/multi-account.md) |
-| `Enter` | open all marked (or the highlighted row if none marked) |
-| `Shift+Enter` (or `Ctrl+E`) | open the same rows with a **model and an effort** you pick first: a page with one section for the Claude rows and one for the Codex rows, each shown only when the selection has such rows. `↑` `↓` pick a field, `←` `→` change it, `Del` puts it back to *no override*, `Enter` resumes, `Esc` returns to the list. Claude gets `--model` / `--effort`: the aliases `claude --model` knows (`fable`, `opus`, `opus[1m]`, `sonnet`, …), the extra options Claude Code caches, the model in `settings.json`, and the levels `low` … `max`. Codex gets `-m` / `-c model_reasoning_effort=`: the models its own `/model` menu lists (`models_cache.json`), and only the levels the chosen model supports. Every field starts at *no override*, which is plain `Enter`; next to it, the value the dir's settings name. `Ctrl+E` is the key of the macOS picker, where fzf cannot see Shift+Enter. |
-| `Ctrl+N` | start a **new conversation**: a menu lists the folder ccr was started from first (`here`, known or not), then every folder past sessions used, most recently used first (with session counts, filterable). `Enter` on a folder asks **which tool** — `claude`, `codex` or **`MAP`** (`c` / `x` / `p` jump straight there) — then, for Claude, a session name (empty = auto title) and starts `claude --name <name>` in the current tab; Codex starts directly (no start-name flag — `/rename` inside); a MAP asks the question, then sets up its agents (the same pages as `Ctrl+P`). `Esc` steps back one level. `ccr -n` jumps straight to this menu, and `ccr -n TEXT` prefills the name box with TEXT; `ccr -Panel "question"` is `Ctrl+P`, the question filled in. |
-| `Ctrl+P` | start a **MAP** (multi-agent panel): two to four fresh agents discuss one question until they agree, each with a tab of its own that shows live what it reads, runs, changes and writes (Windows Terminal; at the end `Enter` there opens the agent's session). The first page is the question: the rules ccr puts in front of it are shown above, read-only, and the box below takes the question (`Shift+Enter` or `Ctrl+J` for a new line, `Ctrl+O` for an editor, a paste arrives whole); `Enter` goes on to the folder (same list as `Ctrl+N`), then to the agents page, where `Enter` starts. `Esc` steps back one page. `ccr -Panel "question"` (or `-MAP`) does the same from the command line; `Ctrl+N` → folder → `MAP` too. While it runs, `T` opens the agents' tabs again. `Ctrl+R` on the question page goes on with a saved MAP instead (`ccr -Panel -Continue`). [docs/panel.md](docs/panel.md) |
-| `Del` or `Ctrl+D` | **permanently delete** the marked conversations, or the highlighted one, after a full-screen confirmation: for one row its title, folder, dates, size and the last prompt/reply; for several, one list with each row's folder, age and size and the total. `Ctrl+D` is for keyboards without a `Del` key; `Ctrl+Backspace` works too. Claude: removes the transcript and its sidecar folder; Codex: goes through `codex delete --force` (ccr has asked already; codex 0.159 refuses to ask without a terminal of its own) so the catalog stays consistent. Running sessions are refused; marked together with others, they are kept and named on the confirmation. No undo. |
-| `Ctrl+K` | toggle a **token usage** column: each session's total tokens of the last 5 hours (`-UsageHours` changes the window) and, in parentheses, its share of those tokens across the listed sessions (`5.4M (90%)`). `ccr -Usage` starts with the column on, and `"usageColumn": true` / `"usageHours": 24` in `ccr.json` make that the default so nothing has to be typed. Read from the transcripts written in that window — Claude's per-turn usage blocks, Codex's per-turn `token_count` events. Sessions with no turn in the window stay blank; the order of the list does not change. Which sessions ate the quota is the question this answers. |
-| `Ctrl+L` | ask every account again for its **usage limits** (the table above the list; otherwise the answers of the last 5 minutes are reused). The table redraws as each answer lands; `…` marks an account still being asked, `(as of HH:mm)` figures that could not be refreshed. A window at 0% shows no reset time; a window whose reset has passed reads 0%. |
-| `Ctrl+J` | the **usage details** of the highlighted row: fresh input / cache write / cache read / output (thinking), the models used, a 30-minute timeline of the window, and — Codex only — the rate-limit meter the session saw at its last turn (5 h and 7 d). Claude Code does not record its meter, and the page says so. Below that, **the window split session by session**: every listed session with turns in it, largest first, with its share of the window's tokens. |
-| `Ctrl+I` (or `Ctrl+T`) | **install or update Claude Code or Codex** on this PC. A page shows each tool's state here (version and how it was installed, or *not installed*) and what `Enter` runs; a confirmation shows the exact command first. A missing tool gets its vendor's **published installer**, fetched from the official URL at that moment and run as published, in a separate PowerShell: `irm https://claude.ai/install.ps1 \| iex`, `irm https://chatgpt.com/codex/install.ps1 \| iex`. ccr keeps no copy of them. An installed tool is updated the way it was installed: `claude update`, the Codex installer again (it updates in place; Codex has no update command), `npm install -g <package>@latest`, `winget upgrade`. One installed another way is left alone. Claude's installer keeps the `stable` channel when `settings.json` has chosen it, and Codex's is always run with the default account's data dir, where it keeps its package. `ccr -Install codex` (or `--install codex`, `-Install all`) does the same from the command line, and `-WhatIf` prints the command. `Ctrl+T` is the key of the macOS picker, where fzf cannot tell Ctrl-I from Tab. A conversation whose tool is not installed here is skipped at launch with that hint instead of failing in the tab. |
-| `Ctrl+X` | **close** the running conversation of the highlighted row — a stray background session, a tab you forgot. After a confirmation (pid, kind, status, a warning when it is busy), a Claude background session is stopped with Claude's own `claude stop`, anything else by ending its process (politely first, by force after 3 s). The conversation itself is kept and can be resumed. Refused for a conversation open on another PC. |
-| `Ctrl+F` | **find the window** of the running conversation of the highlighted row (a `run` row): its Windows Terminal window comes to the front, restored if minimized, with the conversation's tab selected; it flashes in the taskbar and the tab's title blinks three times. ccr finds the tab by giving the conversation's console a unique title for a moment and looking for it among the window's tabs (UI Automation), so a profile with `suppressApplicationTitle` gets the window only. Also a classic console window. Not for a background session (no window) or one open on another PC. |
-| any character | filter (matches tool, account, title and path; every word separated by a space must match; also the words `run`, `bg`, `cleared`, `archived`, `elsewhere` and `@host`) |
-| `Backspace` | edit filter |
-| `Esc` | clear filter, then cancel |
-| `Ctrl+G` (or `F1`) | the guide: every key with a short explanation, the signs on a row, the table on top (`↑` `↓` scroll it in a low window) |
-
-The age column doubles as the running flag: red **`run`** = running on this PC, red **`bg`** = a Claude background session (`claude --bg`) running here, yellow **`@host`** = open on another PC that shares the data dir. Enter on an `@host` row asks first, because two processes would append to the same transcript; Del and moving it to another account are refused until it is closed there.
-
-Selected sessions reopen with `claude --resume <id>` / `codex resume <id>` — plus `--model` / `--effort` or `-m` / `-c model_reasoning_effort=` when picked with `Shift+Enter` — each starting in the session's recorded working directory (Claude requires it; for Codex it keeps the agent's working root correct). The first selection resumes in the current tab; with a single selection `ccr` is simply "resume here". `-NewWindow` sends everything to a fresh window and leaves the current tab alone.
-
-## Several PCs on one OneDrive
-
-When the Claude data dirs live in a synced folder, ccr works across the PCs that share it, with two things to know.
-
-**The first listing on a new PC is slow, and OneDrive can fix that.** ccr reads a small head and tail of every listed transcript, but OneDrive's Files On-Demand downloads the *whole* file on any read, so the first run pulls every transcript. Tell OneDrive to keep those folders local: in Explorer, right-click each Claude data folder (`.claude`, `.claude-<label>`) → **Always keep on this device**; or from a terminal `attrib +P -U "<dir>"` and then `attrib +P -U "<dir>\*" /S /D` (the folder, then everything in it: given a folder path alone, `attrib` changes only the folder). On macOS: Finder → right-click the folder → **Always Keep on This Device**. OneDrive then fetches everything once in the background and keeps new files local.
-
-**A conversation open on the other PC is labelled.** Claude registers every running process in `<dir>\sessions\<pid>.json`, host included, and that registry syncs too. ccr shows a yellow `@host` instead of the age, asks before opening such a conversation here, and refuses to delete or move it until it is closed there. A registry entry left behind by a crash on the other PC ages out after 7 days. Codex has no such registry, and its `~/.codex` is normally not synced.
-
-What travels with the synced script folder: the script, `ccr.json` (dirs under the home folder are written as `~\...`), and with it the accounts — an account added elsewhere reads `not on this PC` until you press `L` on the `Ctrl+A` page. Until then ccr starts nothing under it: a new conversation or a move to that account stops with `not on this PC - <dir> does not exist` and the command that fixes it, `ccr -AddAccount <label> -Tool <tool>` (Codex refuses a `CODEX_HOME` that does not exist, and Claude would start from an empty dir). What stays per machine: the auto-update record, and the Codex dirs.
-
-## How it works
-
-No database, no index: the picker enumerates the same on-disk session files the tools' own resume features read.
-
-- **Claude Code** — `<config>\projects\<slug>\<uuid>.jsonl`. Reads a 16 KB head window (cwd, exclusion markers) and a 128 KB tail window (title lines, last timestamp) per file. Sidechain/daemon transcripts are excluded, matching the built-in picker.
-- **Codex** — `~\.codex\sessions\YYYY\MM\DD\rollout-*.jsonl`. Session id from the filename, cwd and title from a bounded streaming read of the first lines, last activity from the time on the file's last line (every rollout line carries one). Not from the file's modified time: Codex appends turns from the desktop app, the IDE extension and subagents without moving it, so it stays at the conversation's start; it is only the fallback. A conversation can span several files: with paginated history (the Codex desktop app), editing a message starts a new page `rollout-<ts>-<id>_<page>.jsonl` and the conversation goes on there. ccr shows the pages as one row, takes title and folder from the first page and last activity from the newest one, and reads (Ctrl+K), moves and deletes all of them together.
-
-### A note on Codex titles
-
-A Codex conversation's name — the one `/rename` gives it, or the one Codex 0.159 gives by itself — lives in Codex's local catalog (`state_N.sqlite`, `threads.name` / distinct `title`) and in `session_index.jsonl`. ccr reads both (a private snapshot of the catalog via Windows' built-in `winsqlite3.dll`) and shows the name; without one, the conversation's first message of yours — never the text Codex puts there itself (the environment block, the `# AGENTS.md instructions` block; from the IDE extension, the request inside its `# Context from my IDE setup` block). Renaming the Windows Terminal *tab* is invisible to Codex and to ccr; rename the thread inside Codex.
-
-**On several PCs.** The name is never in the conversation's file, so with Codex's `sessions` folder synced between PCs (a link into OneDrive, say) a name given on one PC would not reach the other, which would show the first message instead. When `sessions` is a link, ccr keeps `<synced folder>.names.jsonl` next to it (`OneDrive\.codex-sessions\work.names.jsonl` for `...\work`), in the format of `session_index.jsonl`: every PC's ccr adds the names it knows, the newest name of a conversation wins wherever it was given, and a newer one from the other PC also goes into the local `session_index.jsonl`, so Codex itself shows it too. A PC passes its names on when ccr runs there.
-
-## macOS / Linux — native version
-
-`ccr.py` is a port of the same tool with no PowerShell involved: Python 3 (stdlib only) for the data, [fzf](https://github.com/junegunn/fzf) for the picker, and **real terminal tabs** — iTerm2 and Terminal.app via AppleScript, tmux windows when you're inside tmux. Same files, same rules, same features as the PowerShell version (titles, `(cleared)` tags, `run` flags, Codex catalog titles, delete via `codex delete`, new-conversation flow, [multi-account mode](docs/multi-account.md), self-update), **plus Codex desktop-app support** (below). The two scripts carry the same version number and move in lockstep.
+### macOS / Linux
 
 ```sh
-brew install fzf          # picker UI (python3 comes with the Xcode command line tools)
+brew install fzf          # the picker UI (python3 comes with the Xcode command line tools)
 curl -fsSL https://raw.githubusercontent.com/Cepstral/claude-codex-resume/main/install.sh | sh
 ccr
 ```
 
-The installer puts `ccr` in `~/.local/bin` (tells you if that isn't on your PATH); afterwards `ccr --update` refreshes it from the main branch, and `ccr --channel test` installs the test branch side by side as `ccrtest` (`ccrtest --update` refreshes that one).
+The installer puts `ccr` in `~/.local/bin` and tells you if that folder isn't on your PATH.
 
-| | |
+### Updates
+
+ccr **updates itself**: on the first run in a shell, and then once an hour, it asks GitHub for the head of its channel. A newer version is installed before the run, with a message, and the picker's first line says `ccr updated v0.48 -> v0.49` for that run. It never downgrades, and a copy that sits in a git checkout is never auto-updated. On Windows, tabs that are already open pick the new version up on their next `ccr`.
+
+| | Windows | macOS / Linux |
+|---|---|---|
+| update now | `ccr -Update` | `ccr --update` |
+| try the `test` branch, side by side | `ccr -Channel test`, then run `ccrtest` | `ccr --channel test`, then run `ccrtest` |
+| update the test copy | `ccrtest -Update` | `ccrtest --update` |
+| turn the automatic check off | `$env:CCR_AUTO_UPDATE = '0'` | `CCR_AUTO_UPDATE=0` |
+| where the installed commit and last check are kept | `%LOCALAPPDATA%\ccr\ccr.state.json` | `~/.cache/ccr/ccr.state.json` |
+
+The state file is per machine, never in a synced folder, so a second PC does not think it is up to date. `ccrtest` takes the same parameters and keys as `ccr`.
+
+## Usage
+
+Every flag works in both spellings on both systems: the PowerShell one (`-Update`, `-Root work`, `-WhatIf`, any case) and the GNU one (`--update`, `--root work`, `--dry-run`).
+
+```powershell
+ccr                    # pick from the 200 most recent sessions (-Top 0 = all)
+ccr kit                # the picker, already filtered to "kit"
+ccr -Tool codex        # only codex sessions
+ccr -Top 100           # deeper history
+ccr -n                 # new conversation: pick a folder, name it, go
+ccr -n Kitchen         # same, name box prefilled with "Kitchen"
+ccr -NewWindow         # open the tabs in a fresh window instead of the current one
+ccr -WhatIf            # print what would run, launch nothing (--dry-run)
+ccr -Usage             # start with the token-usage column on
+ccr -Panel "why does the import skip rows?"   # a MAP: 2-4 fresh agents discuss one question until they agree (quote it; -MAP too)
+ccr -Panel -Continue   # go on with a saved MAP: the same agents, in their own sessions
+ccr -Install codex     # install or update codex with its official installer (-Install all: both tools)
+ccr -AddAccount work   # add a second account (see "Several accounts")
+ccr -Root work         # list only the conversations of the account "work"
+ccr -Accounts          # which accounts exist, and who is logged in where
+```
+
+macOS / Linux only: `--terminal` (resume Codex **app** conversations with `codex resume` in a terminal instead of handing them to the app) and `--tabs` (Terminal.app: extra sessions as tabs instead of windows). See [macOS / Linux notes](#macos--linux-notes).
+
+## Keys
+
+The line above the list names only the essentials. **`Ctrl+G`** (or **`F1`**) opens the **guide**: every key with a short explanation, what the signs on a row mean and what the table on top shows. `F1` is there for when another program takes `Ctrl+G` before the terminal sees it — on a Mac, Grammarly's AI Chat does (on a Mac keyboard `F1` is `fn`+`F1`).
+
+| What | Windows | macOS / Linux |
+|---|---|---|
+| move | `↑` `↓` `PgUp` `PgDn` `Home` `End` | `↑` `↓` `PgUp` `PgDn` |
+| filter (`Space` separates words; every word must match) | type; `Backspace` edits | type (fuzzy) |
+| mark / unmark a row | `Tab` | `Tab` |
+| [open](#opening-enter) the marked rows, or the highlighted one | `Enter` | `Enter` |
+| open them with a [model and an effort](#model-and-effort) | `Shift+Enter` or `Ctrl+E` | `Ctrl-E` |
+| [new conversation](#new-conversation) | `Ctrl+N` | `Ctrl-N` |
+| [MAP](#map-the-multi-agent-panel), the multi-agent panel | `Ctrl+P` | `Ctrl-P` |
+| [accounts page](#several-accounts) | `Ctrl+A` | `Ctrl-A` |
+| open under [another account](#several-accounts) | `Tab` cycles the account of the row | `Tab` cycles it too (fzf 0.39+; older fzf: `Tab` marks, `Ctrl-O` picks the account) |
+| [token usage](#usage-limits-and-token-usage): column / details | `Ctrl+K` / `Ctrl+J` | `Ctrl-K` / `Ctrl-J` |
+| ask the [usage limits](#usage-limits-and-token-usage) again | `Ctrl+L` | `Ctrl-L` |
+| [find the window](#running-conversations-find-and-close) of a running conversation | `Ctrl+F` | `Ctrl-F` |
+| [close](#running-conversations-find-and-close) a running conversation | `Ctrl+X` | `Ctrl-X` |
+| [install / update](#installing-or-updating-claude-code-and-codex) Claude Code or Codex | `Ctrl+I` or `Ctrl+T` | `Ctrl-T` (fzf reads `Ctrl-I` as `Tab`) |
+| [delete](#delete) | `Del` or `Ctrl+D` | `Del` (`fn`+`⌫`) or `Ctrl-D` |
+| the guide | `Ctrl+G` or `F1` — any key goes back | `Ctrl-G` or `F1` — `Enter` goes back |
+| cancel | `Esc` (clears the filter first) | `Esc` (clears the filter first; fzf 0.45+) |
+
+### The signs on a row
+
+| Sign | Meaning |
 |---|---|
-| `ccr` · `ccr kit` · `ccr -n [name]` · `ccr --panel "question"` · `ccr --panel --continue` · `ccr --tool codex` · `ccr --top 0` · `ccr --new-window` · `ccr --dry-run` | same meanings as the PowerShell flags — and the PowerShell spellings work too (`ccr -Update`, `-Root work`, `-WhatIf`, any case), as the GNU ones do on Windows (`ccr --update`) |
-| `ccr --root work` · `ccr --accounts` · `ccr --add-account work [--copy-settings]` · `ccr --remove-account work` · `ccr --disable-accounts` | multi-account mode, same meanings as the PowerShell flags; the config is `$CCR_CONFIG` or `~/.config/ccr/ccr.json` (same keys) |
-| `ccr --update` · `ccr --channel test` | self-update from the release channels (see above). ccr also checks its channel on the first run in a shell and then once an hour, and installs a newer version before the run, with a message and a one-run `ccr updated vX -> vY` line in the picker; `CCR_AUTO_UPDATE=0` turns that off (`~/.cache/ccr/ccr.state.json` keeps the installed commit, per machine) |
-| `ccr --terminal` | resume Codex **app** conversations with `codex resume` in a terminal instead of handing them back to the app |
-| `ccr --tabs` | Terminal.app: extra sessions as tabs instead of windows (see below); iTerm2 and tmux use tabs either way |
-| type | fuzzy filter (fzf); `run`, `bg`, `cleared`, `archived`, `elsewhere`, `@host`, `app` and the account label are searchable words |
-| `Tab` | mark / unmark (fzf convention — Space types into the filter). Marked rows take a green **●** in the gutter and the counter beside the prompt reads `49/128 · 2 marked`. In **multi-account mode** Tab cycles the account the row opens under, as on Windows: none → its own account (green **●**) → each other account of its tool (its number in the table on top: the conversation moves there first) → none. Needs fzf 0.39 or later (`brew upgrade fzf`); an older fzf keeps Tab = mark and `Ctrl-O`. |
-| `Enter` | open the marked sessions (or the highlighted one); the first takes over the current terminal, the rest become tabs in iTerm2 and tmux, separate windows in Terminal.app |
-| `Ctrl-E` | open the marked sessions (or the highlighted one) with a **model and an effort**: fzf menus, model then effort, for each tool in the selection — the PowerShell picker's `Shift+Enter` page (fzf cannot tell Shift+Enter from Enter). Same lists, flags and *no override* default. Codex **app** threads open in the app, which takes no model from ccr: ccr says so, and `--terminal` resumes them in a terminal with the flags |
-| `Ctrl-O` | multi-account with fzf older than 0.39 only: open the marked sessions **under another account** — a menu asks which; each conversation moves into that account's dir first (a newer fzf does this per row with Tab) |
-| `Ctrl-A` | the account page: turn multi-account mode on, add an account (`+`), log this machine in to one added elsewhere (`Ctrl-L`), remove one (`Del`), copy the default account's settings to one (`Ctrl-S`), turn the mode off (`X`). Same key and page as the PowerShell picker |
-| `Ctrl-N` | new conversation: folder → tool → name → account (when the tool has several). The folder list starts with **`here`** (the folder ccr runs in) and **`+ new folder`** (`Ctrl-O` jumps straight there) — type a path, `~` and relative paths welcome, and ccr offers to create it, so a brand-new project needs nothing prepared. The tool step offers **`codex app`** wherever the desktop app is installed, and **`MAP`** (multi-agent panel): two to four fresh agents discuss one question until they agree, set up with fzf menus instead of the Windows page ([docs/panel.md](docs/panel.md)). |
-| `Ctrl-P` · `ccr --panel "question"` | a **MAP** (multi-agent panel; `--map` too), each agent with a tab of its own showing live what it does (an iTerm2 tab, a Terminal.app window, a tmux window): the question first (the rules ccr adds shown above it; one line, a multi-line paste, or an empty line for `$EDITOR`), then the folder, then the agents as an fzf list whose `▶ start` row starts. Same pages and order as `Ctrl+P` on Windows (`t` + Enter while it runs opens the tabs again); `r` at the question prompt goes on with a saved MAP (`ccr --panel --continue`) ([docs/panel.md](docs/panel.md)) |
-| `Ctrl-K` · `Ctrl-J` | token usage: `Ctrl-K` toggles a column with each session's total tokens of the last 5 hours (`--usage-hours`) and its share in parentheses (`ccr --usage` starts with it on; `"usageColumn": true` / `"usageHours": 24` in `ccr.json` make that the default), `Ctrl-J` prints the details of the highlighted row (split, models, 30-minute timeline, Codex rate-limit meter) and the window split session by session with shares. Same data and wording as the PowerShell picker |
-| `Ctrl-L` | ask every account again for its usage limits, shown in the header's account table (one line per tool and account, always). With fzf 0.45 or later the header is rewritten while fzf is open, as each answer lands (`fzf --listen`); with an older fzf the answers show at the next redraw |
-| `Ctrl-T` · `ccr --install codex` | install or update Claude Code or Codex: the same page and rules as `Ctrl+I` on Windows (fzf cannot tell Ctrl-I from Tab). A missing tool gets its vendor's published installer, fetched now and run as published: `curl -fsSL https://claude.ai/install.sh \| bash`, `curl -fsSL https://chatgpt.com/codex/install.sh \| sh`. An installed one is updated the way it was installed (`claude update`, the Codex installer again, `npm`, `brew upgrade --cask`); one installed another way is left alone. `--install all` does both, `--dry-run` prints the command |
-| `Ctrl-X` | close the running conversation of the highlighted row after a confirmation: `claude stop` for a Claude background session, else the process (SIGTERM, SIGKILL after 3 s). The conversation is kept. Same key and rules as the PowerShell picker; the age column shows `run`, `bg` or `@host` the same way |
-| `Ctrl-F` | **find the window** of the running conversation of the highlighted row, for when many terminal windows are open: the iTerm2 session or Terminal.app tab whose tty is the conversation's comes to the front, selected (un-minimized), and its background blinks amber three times, then goes back to its profile's colors; in tmux its window and pane are selected first (the pane blinks), then the terminal showing that session. AppleScript, so the first use from another app asks for Automation rights. Same key as the PowerShell picker |
-| `Del` or `Ctrl-D` | delete the marked conversations (`Tab`), or the highlighted one, after a confirmation — one list for several rows. On a Mac keyboard `fn`+`⌫` is `Del` too. `Ctrl-Backspace` also deletes where the terminal sends it as `^H` (fzf's `ctrl-h`), apart from `Backspace`; Terminal.app sends the same byte for both, so there it stays Backspace. Where `Backspace` itself sends `^H` (`stty erase ^H`), `ctrl-h` stays the filter's backspace |
-| `Esc` | cancel |
-| `Ctrl-G` · `F1` | the guide, as on Windows: printed in full, `Enter` goes back to the list (fzf's own Ctrl-G, abort, is taken over). `F1` (`fn`+`F1` on a Mac keyboard) for when another app takes Ctrl-G system-wide, as Grammarly's AI Chat does |
+| green `●` | marked |
+| red `run` in the age column | running on this PC |
+| red `bg` | a Claude background session (`claude --bg`) running on this PC |
+| yellow `@host` | open on another PC that shares the data dir — see [Several PCs](#several-pcs-on-one-onedrive) |
+| yellow `(cleared)` after the title | a Claude conversation that a `/clear` replaced — see [below](#cleared-and-archived-conversations) |
+| dim `(archived)` after the title | a Codex conversation put away with `codex archive` |
+| `codex app` in the tool column | a conversation of the Codex desktop app (macOS) — see [Codex app vs Codex CLI](#codex-app-vs-codex-cli) |
+
+These are also filter words: type `run`, `bg`, `@host` (or `elsewhere`), `cleared`, `archived`, `app` or the label of a non-default account to list only those rows. The filter also matches tool, title and folder.
+
+A title or folder too long for its column scrolls through it on the highlighted row (Windows); on macOS / Linux the preview pane shows the full title, folder, account, how the row will open, last-used time and session id.
+
+## What the keys do
+
+### Opening (Enter)
+
+Every selected conversation reopens with `claude --resume <id>` / `codex resume <id>`, each in the folder it was started in (Claude requires it; for Codex it keeps the agent's working root right). The **first one takes over the tab you ran `ccr` in**, so with a single selection `ccr` is simply "resume here"; the others open as new tabs (Windows Terminal: `wt -w 0`; iTerm2 tabs, Terminal.app windows, tmux windows). `-NewWindow` sends everything to a fresh window and leaves the current tab alone.
+
+- Enter on an `@host` row asks first: two processes would append to the same transcript.
+- A conversation whose tool is not installed on this PC is skipped, with a hint, instead of failing in its tab.
+- Under several accounts, each conversation starts under its own account (see [Several accounts](#several-accounts)).
+
+### Model and effort
+
+`Shift+Enter` or `Ctrl+E` (Windows), `Ctrl-E` (macOS / Linux) opens the same rows, but first lets you pick a model and an effort for each tool in the selection:
+
+| | Claude Code | Codex |
+|---|---|---|
+| flags | `--model` / `--effort` | `-m` / `-c model_reasoning_effort=` |
+| models offered | the aliases `claude --model` knows (`fable`, `opus`, `opus[1m]`, `sonnet`, …), the extra options Claude Code caches, the model in `settings.json` | the models of Codex's own `/model` menu (`models_cache.json`) |
+| efforts offered | `low` … `max` | only the levels the chosen model supports |
+
+Every field starts at *no override* — the same as a plain `Enter` — with the value the account's settings name shown next to it.
+
+- **Windows**: one page, a section for the Claude rows and one for the Codex rows (each only when the selection has such rows). `↑` `↓` pick a field, `←` `→` change it, `Del` puts it back to *no override*, `Enter` resumes, `Esc` goes back to the list.
+- **macOS / Linux**: fzf menus in a row — model, then effort, for each tool (fzf cannot tell Shift+Enter from Enter). Codex **app** conversations open in the app, which takes no model from outside: ccr says so, and `--terminal` resumes them in a terminal with the flags.
+
+### New conversation
+
+`Ctrl+N` in the picker, or `ccr -n` (`ccr -n TEXT` prefills the name box). Step by step, `Esc` going back one step:
+
+1. **Folder.** First `here` (the folder ccr was started from, known or not), then every folder past sessions used, most recently used first, with session counts; type to filter. On macOS / Linux there is also **`+ new folder`** (`Ctrl-O` jumps to it): type a path (`~` and relative paths welcome) and ccr offers to create it, so a brand-new project needs nothing prepared. *(Not in the PowerShell picker yet.)*
+2. **Tool.** `claude`, `codex` or `MAP` (`c` / `x` / `p` jump straight there). On macOS also **`codex app`** wherever the desktop app is installed.
+3. **Name** (Claude only; empty = automatic title). ccr starts `claude --name <name>` in the current tab. Codex starts directly: it has no flag for a name at start, use `/rename` inside it.
+4. **Account**, only when that tool has more than one.
+
+`MAP` asks for the question instead, then sets up its agents — the same pages as `Ctrl+P`.
+
+### Several accounts
+
+**Yes, you can use several Claude accounts — and several Codex accounts — and choose one per conversation, right from the picker.** Each account is a data dir of its own next to the tool's default one (`~/.claude-work` next to `~/.claude`, `~/.codex-work` next to `~/.codex`), with the tool's own normal login inside. ccr never handles a credential: it only sets `CLAUDE_CONFIG_DIR` / `CODEX_HOME` on the process it starts.
+
+**Adding a second Claude account:**
+
+1. In the picker press `Ctrl+A`. The first time, a page explains what happens: the dirs you use today become the `default` account; nothing is moved or logged out. Press `Enter`.
+2. Choose the tool (`claude`) and type a label, for example `work`.
+3. If your default account has a status line, ccr offers to copy it (for Codex: its `config.toml`).
+4. ccr creates `~/.claude-work`, leaves the picker and runs `claude auth login` inside it: a browser opens and you sign in with the other account. Then the picker comes back with an **account column**.
+
+From the command line the same is `ccr -AddAccount work -Tool claude` (`--add-account work --tool claude`); without `-Tool` both tools get an account `work`; `-CopySettings` copies the default's settings.
+
+**From then on:**
+
+- every conversation resumes under the account it belongs to — the dir its file lives in;
+- `Ctrl+N` asks which account a new conversation goes to;
+- **to move a conversation to another account**: press `Tab` on its row until it shows the target account's number in the table on top, then `Enter` (fzf older than 0.39: mark with `Tab`, press `Ctrl-O` and choose). In multi-account mode `Tab` steps through: none → its own account (green `●`) → each other account of its tool → none. ccr moves the conversation's files into that account's dir and resumes it there;
+- `Ctrl+A` lists the accounts and who is logged in where, and adds one, logs this PC in to an account added on another PC, copies the default's settings, removes one (its conversations move to `default`) or turns the mode off;
+- `-Root work` lists one account only; `-Accounts` shows who is logged in where.
+
+The account page, the keys of each side, the `ccr.json` format and what is shared between accounts: [docs/multi-account.md](docs/multi-account.md).
+
+### Usage limits and token usage
+
+**The table on top** — there with a single account too — shows one line per tool and account: the dir, who is logged in and how far it is into its usage limits, e.g. `5h 9% → 00:19 · week 50% → Wed 7 09:59 · Fable 40%` (used, then the reset time after `→`; yellow from 70%, red from 90%). The figures are the tools' own, asked live in the background: Claude Code's `/usage` (`claude -p "/usage"`, a local command — no model call, no cost) and Codex's app-server (`account/rateLimits/read`); ccr reads no credential.
+
+- Answers are kept for 5 minutes; **`Ctrl+L`** asks every account again. The table redraws as each answer lands (macOS: with fzf 0.45 or later, through `fzf --listen`; with an older fzf at the next redraw).
+- `…` marks an account still being asked, `(as of HH:mm)` figures that could not be refreshed. A window at 0% shows no reset time; a window whose reset has passed reads 0%.
+- `CCR_LIMITS=0`, or `"limits": false` in `ccr.json`, turns the asking off.
+
+**`Ctrl+K`** toggles a **token-usage column**: each session's total tokens in the last 5 hours and, in parentheses, its share of the tokens of all listed sessions (`5.4M (90%)`). It answers "which sessions ate the quota?". Sessions with no turn in the window stay blank; the order of the list does not change. `-UsageHours 24` changes the window, `ccr -Usage` starts with the column on, and `"usageColumn": true` / `"usageHours": 24` in `ccr.json` make that the default. The data comes from the transcripts: Claude's per-turn usage blocks, Codex's per-turn `token_count` events.
+
+**`Ctrl+J`** shows the **usage details** of the highlighted row: fresh input / cache write / cache read / output (thinking), the models used, a 30-minute timeline of the window and — Codex only — the rate-limit meter the session saw at its last turn (5 h and 7 d; Claude Code does not record its meter, and the page says so). Below that, the window split session by session, largest first, with each one's share.
+
+### Running conversations: find and close
+
+**`Ctrl+F` finds the window** of the highlighted `run` row, for when many terminal windows are open:
+
+- **Windows**: its Windows Terminal window comes to the front, restored if minimized, with the conversation's tab selected; it flashes in the taskbar and the tab's title blinks three times. ccr finds the tab by giving the conversation's console a unique title for a moment and looking for it among the window's tabs (UI Automation), so with a profile that sets `suppressApplicationTitle` you get the window only. A classic console window works too.
+- **macOS / Linux**: the iTerm2 session or Terminal.app tab whose tty is the conversation's comes to the front, selected (un-minimized), and its background blinks amber three times before going back to its profile's colors. In tmux its window and pane are selected first (the pane blinks), then the terminal showing that session. This is AppleScript, so the first use from another app asks for Automation rights.
+
+Not for a background session (it has no window) or one open on another PC.
+
+**`Ctrl+X` closes** the running conversation of the highlighted row — a stray background session, a tab you forgot. After a confirmation (pid, kind, status, and a warning when it is busy), a Claude background session is stopped with Claude's own `claude stop`, anything else by ending its process: politely first, by force after 3 s. The conversation itself is kept and can be resumed. Refused for a conversation open on another PC.
+
+### Delete
+
+`Del` or `Ctrl+D` **permanently deletes** the marked conversations, or the highlighted one, after a full-screen confirmation: for one row its title, folder, dates, size and the last prompt and reply; for several, one list with each row's folder, age and size, and the total. **No undo.**
+
+- Claude: the transcript and its sidecar folder are removed. Codex: ccr runs `codex delete --force <id>` (it has already asked you; codex 0.159 refuses to ask without a terminal of its own), so Codex's catalog stays consistent.
+- Running conversations are refused; marked together with others, they are kept and named on the confirmation.
+- `Ctrl+D` is for keyboards without a `Del` key (on a Mac keyboard `fn`+`⌫` is `Del`). On Windows `Ctrl+Backspace` deletes too. On macOS / Linux it does only where the terminal sends it as `^H`, apart from `Backspace`: Terminal.app sends the same byte for both, so there it stays Backspace (and where `Backspace` itself sends `^H`, `stty erase ^H`, `Ctrl-H` stays the filter's backspace).
+
+### Installing or updating Claude Code and Codex
+
+`Ctrl+I` or `Ctrl+T` (Windows), `Ctrl-T` (macOS / Linux), or `ccr -Install codex` / `-Install all` from the command line. A page shows each tool's state on this PC (version and how it was installed, or *not installed*) and what `Enter` would run; a confirmation shows the exact command first, and `-WhatIf` only prints it.
+
+| | Claude Code | Codex |
+|---|---|---|
+| not installed | its vendor's installer: `irm https://claude.ai/install.ps1 \| iex` (Windows), `curl -fsSL https://claude.ai/install.sh \| bash` | `irm https://chatgpt.com/codex/install.ps1 \| iex` (Windows), `curl -fsSL https://chatgpt.com/codex/install.sh \| sh` |
+| installed by its installer | `claude update` | the installer again (it updates in place; Codex has no update command) |
+| installed with npm / winget / Homebrew | `npm install -g <package>@latest`, `winget upgrade`, `brew upgrade --cask` | the same |
+
+- The installer is fetched from the official URL at that moment and run as published, in a separate shell; ccr keeps no copy of it. A tool installed any other way is left alone.
+- Claude's installer keeps the `stable` channel when `settings.json` has chosen it. On Windows it puts `claude.exe` in `~\.local\bin` without adding that folder to the PATH, so ccr adds it to the User PATH.
+- Codex's installer is always run with the default account's dir, where it keeps its package.
+
+### MAP, the multi-agent panel
+
+One question, two to four fresh agents (Claude Code and/or Codex, each with its own model, effort and account) that discuss it in a folder, round after round, until they all agree. An optional master may change files while the others review read-only. ccr shows every reply as it lands, ends with one final answer and a saved transcript, and leaves the agents' sessions in the picker. Every agent works like its CLI in auto mode, web search included; a long turn is never cut (after 20 minutes ccr asks).
+
+- **Start it**: `Ctrl+P`, `ccr -Panel "question"` (`-MAP`), or `Ctrl+N` → folder → `MAP`. First the question (the rules ccr adds are shown above it), then the folder, then the agents; `Enter` on the agents page starts.
+- **Writing the question**: Windows — `Shift+Enter` or `Ctrl+J` for a new line, `Ctrl+O` for an editor, a paste arrives whole. macOS / Linux — one line, a multi-line paste, or an empty line for `$EDITOR`.
+- **Watching**: each agent gets a tab of its own that shows live what it reads, runs, changes and writes (Windows Terminal tabs; iTerm2 tabs, Terminal.app windows, tmux windows). At the end, that tab offers to open the agent's session. While the MAP runs, `T` (Windows) or `t` + `Enter` (macOS) opens the tabs again.
+- **Going on**: a MAP that ends without agreement continues later with the same agents in their own sessions: `ccr -Panel -Continue`, or `Ctrl+R` on the question page (`r` at the question prompt on macOS).
+
+Details: [docs/panel.md](docs/panel.md).
+
+### Cleared and archived conversations
+
+- **Cleared (Claude).** `/clear` starts a new session that keeps the tab's name, so the conversation it replaced would look like a duplicate. ccr tags it with a yellow `(cleared)`. The link is exact where Claude Code recorded a Remote Control bridge id (the new session's first id equals the old one's last); sessions older than those ids fall back to same folder and same name. Type `cleared` to list them all.
+- **Archived (Codex).** `codex archive` moves a conversation's file out of `sessions` into `archived_sessions`, where a picker that reads only `sessions` would lose it. ccr lists those too, with a dimmed `(archived)` (type `archived` to list them all). Opening one, or moving it to another account, runs `codex unarchive` first, under its account: Codex refuses to resume an archived conversation.
+
+## Several PCs on one OneDrive
+
+When the Claude data dirs live in a synced folder, ccr works across the PCs that share it. Three things to know.
+
+**The first listing on a new PC is slow — tell OneDrive to keep the folders local.** ccr reads only a small head and tail of every listed transcript, but OneDrive's Files On-Demand downloads the *whole* file on any read, so the first run pulls every transcript. Fix it once per folder (`.claude`, `.claude-<label>`):
+
+- Windows Explorer: right-click the folder → **Always keep on this device**. Or from a terminal `attrib +P -U "<dir>"` and then `attrib +P -U "<dir>\*" /S /D` (given a folder path alone, `attrib` changes only the folder, not what is in it).
+- macOS Finder: right-click the folder → **Always Keep on This Device**.
+
+OneDrive then fetches everything once in the background and keeps new files local.
+
+**A conversation open on the other PC is labelled `@host`.** Claude registers every running process in `<dir>/sessions/<pid>.json`, host included, and that registry syncs too. ccr shows a yellow `@host` instead of the age, asks before opening such a conversation here, and refuses to delete it or move it to another account until it is closed there. An entry left behind by a crash on the other PC ages out after 7 days. Codex has no such registry, and its `~/.codex` is normally not synced.
+
+**What travels and what stays.** With the synced script folder travel the script and `ccr.json` (dirs under the home folder are written as `~\...`), and with it the list of accounts. An account added on another PC reads `not on this PC` until you log this PC in to it (`L` on the `Ctrl+A` page, `Ctrl-L` on macOS). Until then ccr starts nothing under it: a new conversation or a move there stops with `not on this PC - <dir> does not exist` and the command that fixes it, `ccr -AddAccount <label> -Tool <tool>` (Codex refuses a `CODEX_HOME` that does not exist, and Claude would start from an empty dir). What stays per machine: the auto-update record, and the Codex dirs.
+
+## macOS / Linux notes
+
+`ccr.py` has everything the PowerShell version has, **plus Codex desktop-app support** (below). Where the two pickers differ, it is because fzf cannot do the same thing; the [Keys](#keys) table lists every such key, and [docs/multi-account.md](docs/multi-account.md#macos--linux-ccrpy) the account ones.
 
 ### Codex app vs Codex CLI
 
-Codex conversations can start in two places, and they do not reopen the same way. Each rollout records who
-opened it (`session_meta.originator`: `Codex Desktop` for the app, a `codex_cli_*` token for the CLI), so ccr
-shows the difference in the tool column and routes each row to where it belongs:
+Codex conversations can start in two places, and they do not reopen the same way. Each rollout records who opened it (`session_meta.originator`: `Codex Desktop` for the app, a `codex_cli_*` token for the CLI), so ccr shows the difference in the tool column and sends each row where it belongs:
 
 ```
   codex app   22h  Review flusso completo locale   ~/Documents/bnb-monitor
   codex        3d  migrate build to vite           ~/repos/web-app
 ```
 
-- `codex app` → opened with the app's own deeplink, `codex://threads/<id>`, which focuses that thread in the
-  Codex desktop app (the ChatGPT app, bundle id `com.openai.codex`). No terminal tab is spent, so a selection
-  of app conversations leaves your current tab alone.
-- `codex` → resumed as before, `codex resume <id>` in a tab, in the session's recorded folder.
+- `codex app` → opened with the app's own deeplink, `codex://threads/<id>`, which focuses that thread in the Codex desktop app (the ChatGPT app, bundle id `com.openai.codex`). No terminal tab is spent, so a selection of app conversations leaves your current tab alone.
+- `codex` → resumed as usual, `codex resume <id>` in a tab, in the session's recorded folder.
 
-This matters when the `codex` CLI is not on your `PATH` — the usual case when Codex arrived as the desktop app —
-because `codex resume` would have nothing to run. `--terminal` forces the old behaviour for app conversations,
-and `--dry-run` prints the exact `open codex://…` line instead of launching. On a machine with no URL handler
-at all, app conversations fall back to `codex resume` with a notice.
+This matters when the `codex` CLI is not on your `PATH` — the usual case when Codex arrived as the desktop app — because `codex resume` would have nothing to run. `--terminal` forces `codex resume` for app conversations too, and `--dry-run` prints the exact `open codex://…` line instead of launching. On a machine with no URL handler at all, app conversations fall back to `codex resume` with a notice.
 
-Type `app` in the filter to list just those. Note that the `run` flag still only sees CLI sessions (it scans for
-`codex resume <uuid>` processes); reopening a thread already open in the app just refocuses it, so nothing breaks.
+Type `app` in the filter to list just those. The `run` flag still only sees CLI sessions (it looks for `codex resume <uuid>` processes); reopening a thread already open in the app just brings it to the front, so nothing breaks.
 
-**Starting one.** `Ctrl-N` → folder → `codex app` opens `codex://threads/new?path=<folder>`, and the app treats that
-folder as the thread's workspace root — registering it as a project when it is not one yet. That is what makes the
-`+ new folder` entry useful: type a path for a project that does not exist, let ccr create the directory, and the new
-Codex conversation starts there with the project already set up. A first message typed at the prompt (or the trailing
-text of `ccr -n TEXT`) is prefilled in the composer; nothing is sent for you.
+**Starting one.** `Ctrl-N` → folder → `codex app` opens `codex://threads/new?path=<folder>`, and the app takes that folder as the thread's workspace root — registering it as a project when it is not one yet. Together with `+ new folder`, that means: type the path of a project that does not exist yet, let ccr create the directory, and the new Codex conversation starts there with the project already set up. A first message (typed at the prompt, or the text of `ccr -n TEXT`) is prefilled in the composer; nothing is sent for you.
 
-The legend sits above the prompt rather than under it, one line of the essential keys with `Ctrl-G` / `F1` for the
-guide, the keys picked out in colour and the rest kept quiet — and the two-step new-conversation menu labels which step you are on
-and which folder you chose. A preview pane shows the full title, folder, how the row will open, last-used time and
-session id of the highlighted row. Everything beyond the plain picker is version-gated, so an older fzf loses the
-marked counter or the line highlight rather than refusing to start. Outside iTerm2/Terminal.app/tmux (e.g. a bare SSH shell) only the first selection can start, in the current terminal; ccr says so.
+### Terminal.app: windows, not tabs (unless you ask)
 
-**Terminal.app gets windows, and asks for nothing.** Terminal's AppleScript dictionary has `do script`, which opens a
-window — an app sending itself an Apple event needs no rights, so nothing is ever prompted. It has no verb for a new
-*tab* at all: that takes a `Cmd-T` keystroke through System Events, a different app, which macOS gates behind
-*Privacy & Security → Automation*. ccr does not go looking for that permission, so extra sessions open as separate
-windows. Pass `--tabs` if you would rather have tabs and don't mind granting it once — and if you decline, or the
-keystroke fails for any other reason, ccr says what happened and opens the window anyway. iTerm2 creates tabs
-natively and asks for nothing, and so do tmux, `--new-window`, and Codex conversations sent to the desktop app.
+Terminal's AppleScript has `do script`, which opens a *window*; an app sending itself an Apple event needs no rights, so nothing is ever prompted. It has no verb for a new *tab*: that takes a `Cmd-T` keystroke through System Events, a different app, which macOS gates behind *Privacy & Security → Automation*. So by default extra sessions open as separate windows. Pass `--tabs` if you would rather have tabs and don't mind granting that permission once; if you decline, or the keystroke fails for another reason, ccr says what happened and opens a window anyway. iTerm2 makes tabs natively and asks for nothing, and so do tmux, `--new-window`, and Codex conversations sent to the desktop app.
 
-*The Python port is verified against the same session data as the PowerShell version. The Terminal.app path has since
-been exercised on a Mac; the iTerm2 scripting is still written from the dictionary alone — report anything odd with
-`ccr --dry-run`, which prints the exact AppleScript it would run.*
+Outside iTerm2, Terminal.app and tmux (e.g. a bare SSH shell) only the first selection can start, in the current terminal; ccr says so.
+
+### The fzf picker
+
+The key line sits above the prompt, with `Ctrl-G` / `F1` for the guide; on the new-conversation pages it says which step you are on and which folder you chose. Everything beyond the plain picker is version-gated, so an older fzf loses the marked counter or the line highlight rather than refusing to start. The config file is `$CCR_CONFIG` or `~/.config/ccr/ccr.json` (same keys as on Windows).
+
+*The Python port is verified against the same session data as the PowerShell version, and the Terminal.app path on a Mac; the iTerm2 scripting is still written from its dictionary alone — report anything odd with `ccr --dry-run`, which prints the exact AppleScript it would run.*
+
+## How it works
+
+No database, no index: ccr reads the same files the tools' own resume features read, and nothing else — so it keeps working across tool updates. Reads are bounded (transcripts can reach hundreds of MB) and parsing is defensive: an unknown format degrades a row's title, never the listing.
+
+- **Claude Code** — `<config>/projects/<slug>/<uuid>.jsonl` (`CLAUDE_CONFIG_DIR` is respected). ccr reads a 16 KB head (folder, exclusion markers) and a 128 KB tail (title lines, last timestamp) of each file. Sidechain and daemon transcripts are left out, as in the built-in picker. The order is exactly the one of `claude --resume` (`min(last message timestamp, file mtime)`), and so is the title: custom title → AI title → first prompt.
+- **Codex** — `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` (plus `archived_sessions/`). Session id from the file name, folder and title from the first lines, last activity from the time on the file's **last line** (every rollout line carries one) — not from the file's modified time, which the desktop app, the IDE extension and subagents leave at the conversation's start; the file time is only the fallback. A conversation can span several files: with paginated history (the Codex desktop app), editing a message starts a new page `rollout-<ts>-<id>_<page>.jsonl` and the conversation goes on there. ccr shows the pages as one row, with title and folder from the first page and last activity from the newest, and reads (`Ctrl+K`), moves and deletes all of them together.
+
+The PowerShell version needs no modules (the Codex catalog is read with `winsqlite3.dll`, which ships with Windows); the Python version needs only the standard library and fzf.
+
+### A note on Codex titles
+
+A Codex conversation's name — the one `/rename` gives it, or the one Codex 0.159 gives by itself — lives in Codex's local catalog (`state_N.sqlite`, `threads.name` / distinct `title`) and in `session_index.jsonl`, never in the conversation's file. ccr reads both (on Windows a private snapshot of the catalog via `winsqlite3.dll`) and shows the name. Without one it shows your first message — never the text Codex puts there itself (the environment block, the `# AGENTS.md instructions` block; from the IDE extension, it takes the request inside its `# Context from my IDE setup` block). Renaming the terminal *tab* is invisible to Codex and to ccr; rename the thread inside Codex.
+
+**On several PCs.** Since the name is not in the file, with Codex's `sessions` folder synced between PCs (a link into OneDrive, say) a name given on one PC would not reach the other, which would show the first message instead. So when `sessions` is a link, ccr keeps `<synced folder>.names.jsonl` next to it (`OneDrive\.codex-sessions\work.names.jsonl` for `...\work`), in the format of `session_index.jsonl`: every PC's ccr adds the names it knows, the newest name of a conversation wins wherever it was given, and a newer one from the other PC also goes into the local `session_index.jsonl`, so Codex itself shows it too. A PC passes its names on when ccr runs there.
 
 ## License
 
