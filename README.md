@@ -215,6 +215,34 @@ From the command line the same is `ccr -AddAccount work -Tool claude` (`--add-ac
 
 The account page, the keys of each side, the `ccr.json` format and what is shared between accounts: [docs/multi-account.md](docs/multi-account.md).
 
+### Local accounts: Ollama on this computer only
+
+**For work that must not leave the computer** (a confidentiality agreement, say), an account can be **local**: its conversations only ever reach the [Ollama](https://ollama.com) server running on this computer. They never go to Anthropic, OpenAI, ollama.com or a synced folder, and need no login.
+
+```
+ccr -AddAccount local -Local              # both tools; -Tool claude / -Tool codex for one
+ccr --add-account local --local           # the same, GNU spelling
+```
+
+or `Ctrl+A` → add → tool → label → tick **Local**. ccr creates the account's dirs outside any synced folder (`%LOCALAPPDATA%\ccr-local\<label>\claude` and `\codex`; macOS / Linux `~/.local/share/ccr-local/...`). It points them at Ollama and lists them in `ccr.json` under `claudeLocalRoots` / `codexLocalRoots`. A ccr older than 0.88 does not read those keys, so it cannot start the plain tools there.
+
+- **Starting:** `Ctrl+N` → folder → tool → the local account → the **model**, among those installed in Ollama (`ollama pull <model>` adds one), with the last one picked first. A resume uses the model the conversation last ran with; `Shift+Enter` / `Ctrl+E` picks another (no effort for these rows).
+- **What ccr checks before every start**, refusing with the fix when something is off:
+  - Ollama answers on `127.0.0.1:11434`;
+  - Ollama's cloud is off, in its settings (`OLLAMA_NO_CLOUD=1`, or `"disable_ollama_cloud": true` in `~/.ollama/server.json`) and on the running server, which must refuse a cloud model. Otherwise a model picked inside the session (`/model something:cloud`) would reach ollama.com;
+  - the account's dir still points at Ollama;
+  - the model is installed and is not a cloud one.
+- **How the dir keeps the tools local**, even when started by hand:
+  - **Claude:** its `settings.json` sets `ANTHROPIC_BASE_URL` to Ollama and turns off non-essential traffic, the auto-updater, error reporting and claude.ai MCP servers, and it denies `WebFetch` / `WebSearch`. ccr passes the file again with `--settings`, so a project's own `.claude/settings*.json` cannot redirect it.
+  - **Codex:** its `config.toml` has Ollama as the model provider. Plugins, apps, web search, the update check, usage metrics, feedback uploads and the start-up tips are off. ccr passes the provider again with `-c`.
+  - Checked with Claude Code 2.1.306, Codex 0.160 and Ollama 0.40.7, both in their own UI and headless: the only connection either tool opened was `127.0.0.1:11434`.
+- **Kept apart:**
+  - `Tab` never moves a conversation into or out of a local account;
+  - a MAP never uses one, since its agents share what they find with cloud agents;
+  - a local account takes no copied settings and has no usage limits;
+  - removing it (`-RemoveAccount local`, `Ctrl+A` → `Del`) only forgets the entry. The conversations stay in its dir.
+- **Not covered:** what the agent writes into the working folder lives there. `Ctrl+N` warns when that folder is inside OneDrive, Dropbox, Google Drive or iCloud.
+
 ### Usage limits and token usage
 
 **The table on top** — there with a single account too — shows one line per tool and account: the dir, who is logged in and how far it is into its usage limits, e.g. `5h 9% → 00:19 · week 50% → Wed 7 09:59 · Fable 40%` (used, then the reset time after `→`; yellow from 70%, red from 90%). The figures are the tools' own, asked live in the background: Claude Code's `/usage` (`claude -p "/usage"`, a local command — no model call, no cost) and Codex's app-server (`account/rateLimits/read`); ccr reads no credential.

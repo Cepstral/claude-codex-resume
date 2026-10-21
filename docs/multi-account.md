@@ -264,6 +264,8 @@ Everything above exists in the Python version with the same `ccr.json` keys (fil
 | `Tab` cycles the account a row opens under (per row; `Space` until v0.85) | the same with fzf 0.39 or later (v0.85: fzf reloads the list on Tab); an older fzf: `Tab` marks rows, `Ctrl-O` opens the marked rows under an entry chosen from a menu with the legend's numbering (one target for the whole selection) |
 | account column and legend in the picker | the same; the label is part of the fuzzy-searchable text |
 | `-WhatIf` lists the moves and the `$env:` prefixes | `--dry-run` lists the moves and the `CLAUDE_CONFIG_DIR='…'` / `CODEX_HOME='…'` prefixes |
+| `-AddAccount local -Local`: a local account (Ollama only); `Ctrl+A` → add → tick **Local**; `L` on its row sets it up on this PC | `--add-account local --local`; `Ctrl-A` → add → `y` to "Local"; `Ctrl-L` on its row sets it up here |
+| `Shift+Enter` on a local row: a model from Ollama, no effort | `Ctrl-E`: a menu of Ollama's models per local account, no effort |
 
 ## What is shared and what is per account
 
@@ -315,3 +317,4 @@ Every account feature exists for both tools. Where a concept has no counterpart,
 | MAP: going on (`-Panel -Continue`)        | `--resume <uuid>` from the next round; a session whose turn was killed mid-command resumes | `exec … resume <id>` from the next round; a thread whose turn was killed mid-command resumes |
 | MAP: the agents' tabs                     | the stream-json events: `system/init` (model, mode, tools), `assistant` text / `tool_use` / `thinking`, failed `tool_result` | the exec JSONL events: `item.started` / `item.completed` for `command_execution`, `reasoning`, `agent_message`, `file_change`, `mcp_tool_call`, `web_search`; `turn.failed` / `error` |
 | MAP: the agent's shell on Windows         | **not applicable** — Claude does not run its commands under a restricted token | the sandbox cannot start the Store PowerShell, so ccr drops the `WindowsApps` entries from the agent's `PATH` |
+| Local account (Ollama on this PC only; README "Local accounts") | `claudeLocalRoots`; `settings.json` env `ANTHROPIC_BASE_URL` = Ollama, non-essential traffic and the auto-updater off, `WebFetch` / `WebSearch` denied; started with `--settings <that file>` (above a project's settings) `--model <m>` and every model tier (`ANTHROPIC_DEFAULT_*_MODEL`, `CLAUDE_CODE_SUBAGENT_MODEL`) set to it | `codexLocalRoots`; `config.toml` with Ollama as `model_provider`, plugins, apps, web search, update check, `[analytics]`, `[otel]` metrics and `[tui]` tips off; started with `-m <m>` and the provider again as `-c` (above a project's config.toml). `ollama launch codex` is not used: it writes `~/.codex` whatever `CODEX_HOME` says |

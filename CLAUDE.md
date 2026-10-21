@@ -194,6 +194,50 @@ narrows to it (the PowerShell filter still matches it); `-Root` does.
 
 v0.87 verified on Windows on 2026-10-21 (pwsh 7.6.7, the real picker in a console with keys injected and the screen read back): all four checks Jacopo listed pass with one and with two accounts, nothing to fix.
 
+Local accounts (v0.88, README "Local accounts"): an account whose
+conversations only reach the Ollama server of this computer, for work under a
+confidentiality agreement. What was found on 2026-10-21 (claude 2.1.306,
+codex 0.160, Ollama 0.40.7), and why it is built this way:
+- Separate ccr.json keys (`claudeLocalRoots` / `codexLocalRoots`), never an
+  object value inside `claudeRoots`: v0.87 turns an object into a garbage
+  relative path, and its account page's "log in" would create that dir and run
+  a cloud login there. And Setup-Pc.ps1 / Sync-CodexSessions.ps1 (outside the
+  repo) read `codexRoots`: a local codex account there would get its sessions
+  linked into OneDrive. Old saves keep unknown keys.
+- No `ollama launch`: `ollama launch codex` writes its profile and model
+  catalog to `~/.codex` whatever CODEX_HOME says (cmd/launch/codex.go,
+  codexConfigPath), i.e. into the default account. ccr starts the tools
+  itself, with the env `ollama launch claude` sets, and the account's dir
+  pins Ollama, so a tool started there by hand (or by an old ccr) stays local.
+- Claude precedence, tested with a bogus base URL: settings.json `env` beats
+  the process env; a project's `.claude/settings.json` and
+  `settings.local.json` beat the user settings (they redirected it); `--settings
+  <file>` beats both. So every local start passes `--settings`.
+- Network, watched per process tree (Get-NetTCPConnection): claude's UI with
+  only `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` still fetched
+  downloads.claude.ai (version check): `DISABLE_AUTOUPDATER=1` stops it.
+  Codex's UI fetched raw.githubusercontent.com/openai/codex/main/announcement_tip.toml
+  (`[tui] show_tooltips = false`) and opened ab.chatgpt.com: its built-in
+  statsig metrics exporter (`ab.chatgpt.com/otlp/v1/metrics`; `[otel]
+  metrics_exporter = "none"`, `[analytics] enabled = false`); `[features]
+  plugins = false` stops a git fetch of the plugin marketplace. After that,
+  127.0.0.1:11434 only, headless and in both UIs. The model requests in
+  codex's logs_2.sqlite all went to 127.0.0.1. (pwsh itself phones its own
+  telemetry at start; not ccr's, and no content.)
+- Ollama's cloud: off when `~/.ollama/server.json` has `disable_ollama_cloud`
+  or OLLAMA_NO_CLOUD=1; the running server then answers a cloud model with 403
+  "ollama cloud is disabled", locally - ccr checks the settings first (nothing
+  sent while they allow the cloud), then that answer (catches a setting made
+  after Ollama started). Without it `/model x:cloud` inside a session would go
+  through local Ollama to ollama.com.
+- Ollama's default context depends on the VRAM it finds: on 0 VRAM it is 4096
+  and truncates Claude's / Codex's prompts silently (both reported 2051 input
+  tokens). On GRINDELWALD an auto-update had started the server before its GPU
+  libraries were in place; a restart fixed it.
+- Testing ccr.py on Windows: a claude transcript path over 260 characters (a
+  long scratch cwd) is invisible to Python's directory listing, not to pwsh.
+  Use a short working folder for py tests there.
+
 ## Working rules
 
 - Edit `Resume-CcSessions.ps1` in this repo, parse-check, commit, push; the
