@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.89'
+$script:CcrVersion = '0.90'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -334,6 +334,16 @@ $script:CcrLocalClaudeEnv = [ordered]@{
     # update check (dc.services.visualstudio.com) unless told not to.
     POWERSHELL_TELEMETRY_OPTOUT = '1'; POWERSHELL_UPDATECHECK = 'Off'
 }
+# A local model can stay silent for many minutes: Ollama streams nothing while
+# it reads the whole conversation again (after unloading the model, or a cache
+# miss), at a few hundred tokens/s on a laptop. Behind a custom base URL
+# claude gives up after 5 minutes of silence (body idle timeout, byte- and
+# event-level watchdogs), codex after 300 s (stream_idle_timeout_ms). Raised
+# to 30 minutes, the most claude allows for the byte-level watchdog. Added
+# where missing, at -AddAccount and before every start (Add-CcrLocalWaits),
+# so accounts made by v0.88-0.89 get them too; a value changed by hand stays.
+$script:CcrLocalClaudeWaitEnv = [ordered]@{ API_FORCE_IDLE_TIMEOUT = '0'; CLAUDE_STREAM_IDLE_TIMEOUT_MS = '1800000'; API_TIMEOUT_MS = '1800000' }
+$script:CcrLocalCodexIdleMs = 1800000
 function Get-CcrLocalCodexToml {
     @"
 # ccr local account: everything goes to the Ollama server of this PC.
@@ -366,13 +376,35 @@ show_tooltips = false
 name = "Ollama (this PC)"
 base_url = "$script:CcrOllamaUrl/v1"
 wire_api = "responses"
+# Ollama may stay silent for minutes while it reads a long conversation.
+stream_idle_timeout_ms = $script:CcrLocalCodexIdleMs
 "@
+}
+
+# Add the long waits above to a local account's files where they are missing.
+function Add-CcrLocalWaits([string]$Tool, [string]$Dir) {
+    if ($Tool -eq 'claude') {
+        $sj = Join-Path $Dir 'settings.json'
+        $cfg = Get-Content -LiteralPath $sj -Raw | ConvertFrom-Json
+        $miss = @($script:CcrLocalClaudeWaitEnv.Keys | Where-Object { -not $cfg.env.PSObject.Properties[$_] })
+        if (-not $miss.Count) { return }
+        foreach ($k in $miss) { $cfg.env | Add-Member -NotePropertyName $k -NotePropertyValue $script:CcrLocalClaudeWaitEnv[$k] }
+        $cfg | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath $sj -Encoding utf8NoBOM
+        return
+    }
+    $ct = Join-Path $Dir 'config.toml'
+    $t = Get-Content -LiteralPath $ct -Raw
+    $prov = [regex]::Escape($script:CcrOllamaProvider)
+    if ($t -match "(?ms)^\[model_providers\.$prov\][^\[]*?^\s*stream_idle_timeout_ms\s*=") { return }
+    $t = ([regex]"(?m)^\[model_providers\.$prov\][ \t]*\r?\n").Replace($t, '$0' + "stream_idle_timeout_ms = $script:CcrLocalCodexIdleMs`n", 1)
+    Set-Content -LiteralPath $ct -Value $t -NoNewline -Encoding utf8NoBOM
 }
 
 # Point a local account's dir at Ollama: claude's settings.json gets the env
 # block and the denies merged in (other keys kept); codex's config.toml is
 # written whole, the previous one kept as config.toml.bak-<date> when it did
-# not point at Ollama. Plus claude's first-start flag, as Add-CcrAccount.
+# not point at Ollama. Plus the long waits where missing, and claude's
+# first-start flag, as Add-CcrAccount.
 function Set-CcrLocalPin([string]$Tool, [string]$Dir) {
     New-Item -ItemType Directory -Path $Dir -Force | Out-Null
     if ($Tool -eq 'claude') {
@@ -401,6 +433,7 @@ function Set-CcrLocalPin([string]$Tool, [string]$Dir) {
             Set-Content -LiteralPath $ct -Value (Get-CcrLocalCodexToml) -Encoding utf8NoBOM
         }
     }
+    Add-CcrLocalWaits $Tool $Dir
 }
 
 # '' when a local account's dir still sends everything to this PC's Ollama.
@@ -6761,6 +6794,7 @@ function Resume-CcSessions {
             $bad = Get-CcrLocalProblem $newTool $newRoot $newModel
             if (-not $bad -and -not $newModel) { $bad = "ccr: no model chosen for the local $newTool account '$($newRoot.Label)'" }
             if ($bad) { Write-Warning $bad; return }
+            if (-not $WhatIfPreference) { Add-CcrLocalWaits $newTool $newRoot.Path }
             $newArgs += @(Get-CcrLocalArgs $newTool $newRoot.Path $newModel)
             $newVars = Get-CcrLocalEnv $newTool $newModel
             if (Test-CcrSyncedPath $dir) {
@@ -6828,6 +6862,7 @@ function Resume-CcSessions {
             elseif (-not $lm) { "ccr: no model found in the transcript - Shift+Enter (or Ctrl+E) picks one" }
             else { Get-CcrLocalProblem $s.Tool $lroot $lm }
             if ($bad) { Write-Warning "$bad   '$($s.Title)' skipped."; continue }
+            if (-not $WhatIfPreference) { Add-CcrLocalWaits $s.Tool $lroot.Path }
             $argv += @(Get-CcrLocalArgs $s.Tool $s.RootPath $lm)
             $vars = Get-CcrLocalEnv $s.Tool $lm
         }

@@ -251,6 +251,21 @@ codex 0.160, Ollama 0.40.7), and why it is built this way:
   and truncates Claude's / Codex's prompts silently (both reported 2051 input
   tokens). On GRINDELWALD an auto-update had started the server before its GPU
   libraries were in place; a restart fixed it.
+- Long silences (v0.90): Ollama streams nothing while it reads a whole
+  conversation again (after the 5-minute keep-alive unloads the model, or a
+  cache miss); on GRINDELWALD qwen3.8:27b reads 150-230 tokens/s, so 50k
+  tokens take over 5 minutes, and claude aborted one at 5m23s (Ollama logged
+  500). Tested on 2026-10-21 against a fake server that held 400 s
+  (scratchpad, not in the repo): claude 2.1.306 closed at 360 s when no
+  headers came (body idle timeout) and at 300 s when headers came first
+  (byte-level watchdog), then re-sent; codex 0.160 waited without headers but
+  closed at 300 s after them ("idle timeout waiting for SSE", reconnect 1/5).
+  With `API_FORCE_IDLE_TIMEOUT=0`, `CLAUDE_STREAM_IDLE_TIMEOUT_MS=1800000`,
+  `API_TIMEOUT_MS=1800000` in settings.json env, and
+  `stream_idle_timeout_ms = 1800000` in codex's provider table, all four cases
+  waited the 400 s. 30 minutes is the byte-level watchdog's cap (docs:
+  network-config, "Streaming idle watchdogs"). ccr adds the keys where missing
+  before every start and keeps hand-set values, so it never fights an edit.
 - Testing ccr.py on Windows: a claude transcript path over 260 characters (a
   long scratch cwd) is invisible to Python's directory listing, not to pwsh.
   Use a short working folder for py tests there.

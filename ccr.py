@@ -38,7 +38,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.89"
+VERSION = "0.90"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -429,6 +429,17 @@ LOCAL_CLAUDE_ENV = {
     # update check (dc.services.visualstudio.com) unless told not to.
     "POWERSHELL_TELEMETRY_OPTOUT": "1", "POWERSHELL_UPDATECHECK": "Off",
 }
+# A local model can stay silent for many minutes: Ollama streams nothing while
+# it reads the whole conversation again (after unloading the model, or a cache
+# miss), at a few hundred tokens/s on a laptop. Behind a custom base URL
+# claude gives up after 5 minutes of silence (body idle timeout, byte- and
+# event-level watchdogs), codex after 300 s (stream_idle_timeout_ms). Raised
+# to 30 minutes, the most claude allows for the byte-level watchdog. Added
+# where missing, at --add-account and before every start (add_local_waits),
+# so accounts made by v0.88-0.89 get them too; a value changed by hand stays.
+LOCAL_CLAUDE_WAIT_ENV = {"API_FORCE_IDLE_TIMEOUT": "0", "CLAUDE_STREAM_IDLE_TIMEOUT_MS": "1800000",
+                         "API_TIMEOUT_MS": "1800000"}
+LOCAL_CODEX_IDLE_MS = 1800000
 LOCAL_CODEX_TOML = f"""# ccr local account: everything goes to the Ollama server of this computer.
 # Written by ccr (--add-account --local), checked before every start.
 model_provider = "{OLLAMA_PROVIDER}"
@@ -459,6 +470,8 @@ show_tooltips = false
 name = "Ollama (this PC)"
 base_url = "{OLLAMA_URL}/v1"
 wire_api = "responses"
+# Ollama may stay silent for minutes while it reads a long conversation.
+stream_idle_timeout_ms = {LOCAL_CODEX_IDLE_MS}
 """
 
 
@@ -614,11 +627,33 @@ def local_pin_problem(tool: str, d: str) -> str:
     return ""
 
 
+def add_local_waits(tool: str, d: str):
+    """Add the long waits above to a local account's files where they are
+    missing."""
+    if tool == "claude":
+        sj = Path(d) / "settings.json"
+        cfg = json.loads(sj.read_text(encoding="utf-8"))
+        miss = [k for k in LOCAL_CLAUDE_WAIT_ENV if k not in cfg["env"]]
+        if miss:
+            cfg["env"].update({k: LOCAL_CLAUDE_WAIT_ENV[k] for k in miss})
+            sj.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+        return
+    ct = Path(d) / "config.toml"
+    t = ct.read_text(encoding="utf-8")
+    prov = re.escape(OLLAMA_PROVIDER)
+    if re.search(rf"(?ms)^\[model_providers\.{prov}\][^\[]*?^\s*stream_idle_timeout_ms\s*=", t):
+        return
+    t = re.sub(rf"(?m)^\[model_providers\.{prov}\][ \t]*\r?\n",
+               lambda m: f"{m.group(0)}stream_idle_timeout_ms = {LOCAL_CODEX_IDLE_MS}\n", t, count=1)
+    ct.write_text(t, encoding="utf-8")
+
+
 def set_local_pin(tool: str, d: str):
     """Point a local account's dir at Ollama: claude's settings.json gets the
     env block and the denies merged in (other keys kept); codex's config.toml
     is written whole, the previous one kept as config.toml.bak-<date> when it
-    did not point at Ollama. Plus claude's first-start flag."""
+    did not point at Ollama. Plus the long waits where missing, and claude's
+    first-start flag."""
     Path(d).mkdir(parents=True, exist_ok=True)
     if tool == "claude":
         sj = Path(d) / "settings.json"
@@ -643,12 +678,13 @@ def set_local_pin(tool: str, d: str):
         cj = Path(d) / ".claude.json"
         if not cj.exists():
             cj.write_text(json.dumps({"hasCompletedOnboarding": True}, indent=2) + "\n", encoding="utf-8")
-        return
-    ct = Path(d) / "config.toml"
-    if ct.is_file() and local_pin_problem("codex", d):
-        shutil.copy2(ct, f"{ct}.bak-{datetime.now().strftime('%Y-%m-%d-%H%M%S')}")
-    if not ct.is_file() or local_pin_problem("codex", d):
-        ct.write_text(LOCAL_CODEX_TOML, encoding="utf-8")
+    else:
+        ct = Path(d) / "config.toml"
+        if ct.is_file() and local_pin_problem("codex", d):
+            shutil.copy2(ct, f"{ct}.bak-{datetime.now().strftime('%Y-%m-%d-%H%M%S')}")
+        if not ct.is_file() or local_pin_problem("codex", d):
+            ct.write_text(LOCAL_CODEX_TOML, encoding="utf-8")
+    add_local_waits(tool, d)
 
 
 def local_problem(tool: str, root, model: str) -> str:
@@ -3942,6 +3978,8 @@ def launch(picked: list, new_window: bool, dry: bool, ctx: Ctx, terminal: bool =
             if bad:
                 print(f"{bad}   '{s.title}' skipped.", file=sys.stderr)
                 continue
+            if not dry:
+                add_local_waits(s.tool, lroot.path)
             argv = resume_argv(s, local=True) + local_args(s.tool, s.root_path, model)
             extra = local_env(s.tool, model)
         if tgt and tgt != s.root:
@@ -4259,6 +4297,8 @@ def _new_in_folder(folder: str, sessions: list, initial_name: str, dry: bool, ct
         if bad:
             print(bad, file=sys.stderr)
             return False
+        if not dry:
+            add_local_waits(tool, rp)
         argv += local_args(tool, rp, model)
         extra = local_env(tool, model)
         if synced_path(folder):
