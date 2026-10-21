@@ -234,8 +234,9 @@ codex 0.160, Ollama 0.40.7), and why it is built this way:
   (`web_search_20250305`) run by the model provider: through Ollama it returns
   nothing and opens no connection, so it stays denied. The PowerShell claude
   starts for commands phoned dc.services.visualstudio.com (PowerShell's own
-  telemetry): POWERSHELL_TELEMETRY_OPTOUT=1 / POWERSHELL_UPDATECHECK=Off in the
-  env (claude: settings.json; codex: the launch env).
+  telemetry, version and OS only). v0.89 set POWERSHELL_TELEMETRY_OPTOUT=1 /
+  POWERSHELL_UPDATECHECK=Off; v0.91 dropped them on Luca's call (overkill: no
+  conversation content), and the README tells how to turn it off by hand.
 - Auto mode on a local model: the classifier runs on the same local model
   (its error names it); qwen3.8:27b took over the 60 s claude allows on
   GRINDELWALD ("temporarily unavailable (timed out)") and the command was

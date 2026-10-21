@@ -38,7 +38,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.90"
+VERSION = "0.91"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -425,9 +425,6 @@ LOCAL_CLAUDE_ENV = {
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1", "DISABLE_AUTOUPDATER": "1", "ENABLE_CLAUDEAI_MCP_SERVERS": "false",
     "DISABLE_ERROR_REPORTING": "1", "DISABLE_FEEDBACK_COMMAND": "1", "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
     "CLAUDE_CODE_AUTO_MODE_SERVER": "0", "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
-    # The PowerShell claude starts for commands phones its own telemetry and
-    # update check (dc.services.visualstudio.com) unless told not to.
-    "POWERSHELL_TELEMETRY_OPTOUT": "1", "POWERSHELL_UPDATECHECK": "Off",
 }
 # A local model can stay silent for many minutes: Ollama streams nothing while
 # it reads the whole conversation again (after unloading the model, or a cache
@@ -729,11 +726,9 @@ def local_args(tool: str, root_path: str, model: str) -> list:
 def local_env(tool: str, model: str) -> dict:
     """...and with this environment besides the account's dir: claude's
     model tiers all set to the model, so subagents and its small background
-    calls run it too (Ollama has nothing else to answer them with); codex's
-    shell without PowerShell's own telemetry and update check (claude's
-    settings.json has them)."""
+    calls run it too (Ollama has nothing else to answer them with)."""
     if tool != "claude":
-        return {"POWERSHELL_TELEMETRY_OPTOUT": "1", "POWERSHELL_UPDATECHECK": "Off"}
+        return {}
     return {k: model for k in ("ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
                                "ANTHROPIC_DEFAULT_HAIKU_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL")}
 

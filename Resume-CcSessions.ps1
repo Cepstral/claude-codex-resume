@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.90'
+$script:CcrVersion = '0.91'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -330,9 +330,6 @@ $script:CcrLocalClaudeEnv = [ordered]@{
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1'; DISABLE_AUTOUPDATER = '1'; ENABLE_CLAUDEAI_MCP_SERVERS = 'false'; DISABLE_ERROR_REPORTING = '1'
     DISABLE_FEEDBACK_COMMAND = '1'; CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY = '1'; CLAUDE_CODE_AUTO_MODE_SERVER = '0'
     CLAUDE_CODE_ATTRIBUTION_HEADER = '0'
-    # The PowerShell claude starts for commands phones its own telemetry and
-    # update check (dc.services.visualstudio.com) unless told not to.
-    POWERSHELL_TELEMETRY_OPTOUT = '1'; POWERSHELL_UPDATECHECK = 'Off'
 }
 # A local model can stay silent for many minutes: Ollama streams nothing while
 # it reads the whole conversation again (after unloading the model, or a cache
@@ -484,14 +481,12 @@ function Get-CcrLocalArgs([string]$Tool, [string]$RootPath, [string]$Model) {
 
 # ...and with this environment besides the account's dir: claude's model
 # tiers all set to the model, so subagents and its small background calls run
-# it too (Ollama has nothing else to answer them with); codex's shell without
-# PowerShell's own telemetry and update check (claude's settings.json has them).
+# it too (Ollama has nothing else to answer them with).
 function Get-CcrLocalEnv([string]$Tool, [string]$Model) {
     $e = [ordered]@{}
     if ($Tool -eq 'claude') {
         foreach ($k in 'ANTHROPIC_DEFAULT_OPUS_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL', 'CLAUDE_CODE_SUBAGENT_MODEL') { $e[$k] = $Model }
     }
-    else { $e['POWERSHELL_TELEMETRY_OPTOUT'] = '1'; $e['POWERSHELL_UPDATECHECK'] = 'Off' }
     $e
 }
 
