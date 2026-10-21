@@ -192,23 +192,7 @@ esc_bind; verified with fzf 0.74 in a pty). Consequence in ccr.py: the
 default account's label is no longer on the row, so typing it no longer
 narrows to it (the PowerShell filter still matches it); `-Root` does.
 
-**To verify on Windows (v0.87 was made on a Mac).** The PowerShell side
-was only parse-checked (pwsh 7.4, 0 errors) and its new `$rootW` expression
-run alone (10 with a second account, 0 without); the picker itself was never
-drawn on a Windows console. A Claude working on a Windows PC should, before
-anything else in this repo, check with `CCR_AUTO_UPDATE=0` and `-WhatIf`:
-1. one account only: no account column, the titles and folders aligned as
-   in v0.86, no "Multi-account mode active." line;
-2. two or more accounts: the default account's rows have a blank account
-   cell of the right width (folders still aligned), other accounts show
-   their label in magenta, the key line says `Tab mark/account`;
-3. Tab still marks / cycles the account; Esc with a typed filter clears it,
-   a second Esc leaves;
-4. Ctrl+G: the Tab entry reads "mark a row, and press again to open it
-   under another account", the Del and Ctrl+G entries have no terminal
-   notes.
-Fix what breaks in both scripts (parity), bump the version, and replace
-this paragraph with one line saying it was verified (date, pwsh version).
+v0.87 verified on Windows on 2026-10-21 (pwsh 7.6.7, the real picker in a console with keys injected and the screen read back): all four checks Jacopo listed pass with one and with two accounts, nothing to fix.
 
 ## Working rules
 
