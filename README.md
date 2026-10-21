@@ -215,31 +215,34 @@ From the command line the same is `ccr -AddAccount work -Tool claude` (`--add-ac
 
 The account page, the keys of each side, the `ccr.json` format and what is shared between accounts: [docs/multi-account.md](docs/multi-account.md).
 
-### Local accounts: Ollama on this computer only
+### Local accounts: Ollama on this computer, or another one of yours
 
 **For work that must not leave the computer** (a confidentiality agreement, say), an account can be **local**: its conversations only ever reach the [Ollama](https://ollama.com) server running on this computer. They never go to Anthropic, OpenAI, ollama.com or a synced folder, and need no login.
 
 ```
 ccr -AddAccount local -Local              # both tools; -Tool claude / -Tool codex for one
 ccr --add-account local --local           # the same, GNU spelling
+ccr -AddAccount albus -Ollama http://192.168.0.40:11434   # the Ollama of another computer
 ```
 
 or `Ctrl+A` → add → tool → label → tick **Local**. ccr creates the account's dirs outside any synced folder (`%LOCALAPPDATA%\ccr-local\<label>\claude` and `\codex`; macOS / Linux `~/.local/share/ccr-local/...`). It points them at Ollama and lists them in `ccr.json` under `claudeLocalRoots` / `codexLocalRoots`. A ccr older than 0.88 does not read those keys, so it cannot start the plain tools there.
 
+**Another computer's Ollama** (0.92), a GPU box on the home network for example: `-Ollama <address>` (`--ollama`; on the account page, the address asked after **Local**). The dirs and the conversations stay on this computer; only the requests go to that address. `ccr.json` lists the account under `claudeOllamaRoots` / `codexOllamaRoots`, with the dir and the address, keys that 0.88-0.91 do not read. The account table shows where each local account's Ollama is: this computer, the LAN (a private address, or a `.local` / `.lan` / one-word name), or the internet. That Ollama's cloud must be off too, on that computer.
+
 - **Starting:** `Ctrl+N` → folder → tool → the local account → the **model**, among those installed in Ollama (`ollama pull <model>` adds one), with the last one picked first. A resume uses the model the conversation last ran with; `Shift+Enter` / `Ctrl+E` picks another (no effort for these rows).
 - **What ccr checks before every start**, refusing with the fix when something is off:
-  - Ollama answers on `127.0.0.1:11434`;
-  - Ollama's cloud is off, in its settings (`OLLAMA_NO_CLOUD=1`, or `"disable_ollama_cloud": true` in `~/.ollama/server.json`) and on the running server, which must refuse a cloud model. Otherwise a model picked inside the session (`/model something:cloud`) would reach ollama.com;
+  - the account's Ollama answers (this computer's: `127.0.0.1:11434`);
+  - Ollama's cloud is off, in its settings (`OLLAMA_NO_CLOUD=1`, or `"disable_ollama_cloud": true` in `~/.ollama/server.json`) and on the running server, which must refuse a cloud model. Otherwise a model picked inside the session (`/model something:cloud`) would reach ollama.com. For another computer's Ollama only that answer can be checked: while its cloud is on, the made-up name of the check reaches ollama.com;
   - the account's dir still points at Ollama;
   - the model is installed and is not a cloud one.
 - **How the dir keeps the tools local**, even when started by hand:
-  - **Claude:** its `settings.json` sets `ANTHROPIC_BASE_URL` to Ollama and turns off non-essential traffic, the auto-updater, error reporting and claude.ai MCP servers. ccr passes the file again with `--settings`, so a project's own `.claude/settings*.json` cannot redirect it.
+  - **Claude:** its `settings.json` sets `ANTHROPIC_BASE_URL` to Ollama and turns off non-essential traffic, the auto-updater, error reporting, claude.ai MCP servers and the automatic registration of the official plugin marketplace. ccr passes the file again with `--settings`, so a project's own `.claude/settings*.json` cannot redirect it.
   - **WebFetch works**: the page is downloaded from this computer and read by the local model. `skipWebFetchPreflight` keeps claude from first sending the site's name to Anthropic for a blocklist check. **WebSearch is denied**: the model provider runs it on its own servers, and Ollama has no search engine.
   - **Codex:** its `config.toml` has Ollama as the model provider. Plugins, apps, web search, the update check, usage metrics, feedback uploads and the start-up tips are off. ccr passes the provider again with `-c`.
   - **Long waits are allowed:** Ollama sends nothing while it reads a long conversation again, after it unloads an idle model (5 minutes by default) or misses its cache. On a laptop that can take several minutes. Both tools give up after 5 minutes of silence by default. The account's files raise that to 30 minutes, the most claude allows: `API_FORCE_IDLE_TIMEOUT=0`, `CLAUDE_STREAM_IDLE_TIMEOUT_MS` and `API_TIMEOUT_MS` in claude's `settings.json`, and `stream_idle_timeout_ms` in codex's provider table. ccr adds them before every start where they are missing, accounts made by 0.88-0.89 included, and keeps a value changed by hand. A running conversation picks them up when reopened. For fewer re-reads, `OLLAMA_KEEP_ALIVE=2h` keeps the model loaded between turns; it takes effect after an Ollama restart.
-  - Checked with Claude Code 2.1.306, Codex 0.160 and Ollama 0.40.7, both in their own UI and headless: the only connection either tool opened was `127.0.0.1:11434`. PowerShell, when the agent runs commands in it, sends Microsoft its own usage telemetry: its version and the OS, nothing of the conversation. `POWERSHELL_TELEMETRY_OPTOUT=1` in the account's `env` turns that off.
+  - Checked with Claude Code 2.1.306, Codex 0.160 and Ollama 0.40.7, both in their own UI and headless: the only connection either tool opened was `127.0.0.1:11434`. Except once: at the first interactive start in a new dir, Claude Code registered the official plugin marketplace, a clone from `github.com` (HTTPS and SSH) plus `downloads.claude.ai`, with nothing of the conversation. Since 0.92 `CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL=1` stops that; ccr adds it to older accounts at their next start, and a marketplace already registered is not refreshed (the auto-updater is off). PowerShell, when the agent runs commands in it, sends Microsoft its own usage telemetry: its version and the OS, nothing of the conversation. `POWERSHELL_TELEMETRY_OPTOUT=1` in the account's `env` turns that off.
 - **Kept apart:**
-  - `Tab` never moves a conversation into or out of a local account;
+  - `Tab` (`Ctrl-O` in ccr.py) moves a conversation only between local accounts, never to or from one that talks to a cloud. When the move sends it further than before (this computer → LAN → internet), ccr says where its whole history will go from the next turn and asks first;
   - a MAP never uses one, since its agents share what they find with cloud agents;
   - a local account takes no copied settings and has no usage limits;
   - removing it (`-RemoveAccount local`, `Ctrl+A` → `Del`) only forgets the entry. The conversations stay in its dir.

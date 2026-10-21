@@ -267,6 +267,36 @@ codex 0.160, Ollama 0.40.7), and why it is built this way:
   waited the 400 s. 30 minutes is the byte-level watchdog's cap (docs:
   network-config, "Streaming idle watchdogs"). ccr adds the keys where missing
   before every start and keeps hand-set values, so it never fights an edit.
+- Another computer's Ollama (v0.92, Luca: one account per machine, a GPU box
+  on the home network; LAN only, chosen over his authenticated public
+  endpoint, whose TLS ends on a cloud VM). Keys of their own,
+  `claudeOllamaRoots` / `codexOllamaRoots` with `{dir, url}`: v0.88-0.91 read
+  `claudeLocalRoots` as label -> dir, and their "Fix" (-AddAccount -Local)
+  would re-point such an account at this PC. Roots carry `OllamaUrl`; every
+  check, pin and launch flag takes the account's address. A remote Ollama's
+  settings cannot be read, so only the live probe says its cloud is off;
+  with the cloud on, Ollama 0.35 answered the probe with 404 "model
+  'ccr-check' not found. Try gemma4:31b-cloud" - it had asked ollama.com
+  (the made-up name is all that goes). Tab/Ctrl-O now move conversations
+  between local accounts (never across kinds); a move to a wider reach
+  (loopback < private address / .local / .lan / one-word name < anything
+  else) prints where the history goes and asks y/N (Read-Host / ask), not
+  under -WhatIf / --dry-run. Tested 2026-10-21 with a TCP forwarder on this
+  PC's LAN address standing in for the other computer, in the real picker
+  (keys injected): decline leaves the transcript, accept moves it and claude
+  talks only to that address.
+- Official plugin marketplace (found v0.92): at the first interactive start
+  in a new claude dir, after the trust prompt, claude registered
+  anthropics/claude-plugins-official - CONNECTs to downloads.claude.ai and
+  github.com and an ssh.exe to github.com:22 - despite
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC (the docs say it is not covered).
+  The v0.88 network checks missed it (that dir was not new). The pin now sets
+  CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL=1, and the start-time
+  top-up (Add-CcrLocalWaits / add_local_waits) adds any pinned env key an
+  older account lacks, never changing a value. Verified through a logging
+  proxy: a new dir then contacts only its Ollama; an account whose
+  marketplace was registered (Luca's, at its first start) and dated a month
+  back does not refresh it at start (DISABLE_AUTOUPDATER).
 - Testing ccr.py on Windows: a claude transcript path over 260 characters (a
   long scratch cwd) is invisible to Python's directory listing, not to pwsh.
   Use a short working folder for py tests there.

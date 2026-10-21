@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.91'
+$script:CcrVersion = '0.92'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -183,17 +183,20 @@ function Expand-CcrPath([string]$Path) {
 #     "codexRoots":  { "personal": "~/.codex",   "work": "~/.codex-work" },
 #     "defaultRoot": "personal" }
 # "~" and %VAR% expand; a missing dir is kept (it may exist on another PC).
-# The local accounts (Ollama only, below) follow, with Local = $true; one
-# with the label of an ordinary account of the same tool is left out.
+# The local accounts (Ollama only, below) follow, with Local = $true and
+# the Ollama they talk to in OllamaUrl: this PC's for claudeLocalRoots /
+# codexLocalRoots, another computer's for claudeOllamaRoots /
+# codexOllamaRoots. One with the label of an account already listed for the
+# same tool is left out.
 function Get-CcrRoots {
     param([Parameter(Mandatory)][ValidateSet('claude', 'codex')][string]$Tool)
     $defaultPath = if ($Tool -eq 'claude') { Get-CcrClaudeRoot } else { Get-CcrCodexRoot }
-    $roots = @([pscustomobject]@{ Label = ''; Path = $defaultPath; Default = $true; Local = $false })
+    $roots = @([pscustomobject]@{ Label = ''; Path = $defaultPath; Default = $true; Local = $false; OllamaUrl = '' })
     $cfg = Get-CcrConfig
     $map = if ($cfg) { if ($Tool -eq 'claude') { $cfg.claudeRoots } else { $cfg.codexRoots } }
     if ($map) {
         $mapped = @(foreach ($p in $map.PSObject.Properties) {
-                [pscustomobject]@{ Label = $p.Name; Path = (Expand-CcrPath ([string]$p.Value)); Default = ($p.Name -eq [string]$cfg.defaultRoot); Local = $false }
+                [pscustomobject]@{ Label = $p.Name; Path = (Expand-CcrPath ([string]$p.Value)); Default = ($p.Name -eq [string]$cfg.defaultRoot); Local = $false; OllamaUrl = '' }
             })
         if ($mapped.Count) {
             if (-not ($mapped | Where-Object Default)) { $mapped[0].Default = $true }
@@ -205,7 +208,15 @@ function Get-CcrRoots {
         $taken = @($roots | ForEach-Object { $_.Label })
         $roots += @(foreach ($p in $local.PSObject.Properties) {
                 if ($p.Name -in $taken) { continue }
-                [pscustomobject]@{ Label = $p.Name; Path = (Expand-CcrPath ([string]$p.Value)); Default = $false; Local = $true }
+                [pscustomobject]@{ Label = $p.Name; Path = (Expand-CcrPath ([string]$p.Value)); Default = $false; Local = $true; OllamaUrl = $script:CcrOllamaUrl }
+            })
+    }
+    $remote = if ($cfg) { if ($Tool -eq 'claude') { $cfg.claudeOllamaRoots } else { $cfg.codexOllamaRoots } }
+    if ($remote) {
+        $taken = @($roots | ForEach-Object { $_.Label })
+        $roots += @(foreach ($p in $remote.PSObject.Properties) {
+                if ($p.Name -in $taken -or -not "$($p.Value.dir)" -or -not "$($p.Value.url)") { continue }
+                [pscustomobject]@{ Label = $p.Name; Path = (Expand-CcrPath ([string]$p.Value.dir)); Default = $false; Local = $true; OllamaUrl = "$($p.Value.url)".TrimEnd('/') }
             })
     }
     $roots
@@ -228,13 +239,46 @@ function Get-CcrCodexRoots { Get-CcrRoots -Tool codex }
 # web search off. Before every start ccr checks that Ollama answers here, that
 # its cloud is off (a model picked inside the session could otherwise reach
 # ollama.com), that the dir still points at Ollama, and that the model is
-# installed and not a cloud one. A local account never takes part in Tab's
-# account cycling, a MAP, copied settings or the usage limits, and removing it
-# moves nothing. Verified with claude 2.1.306, codex 0.160 and Ollama 0.40.7,
-# headless and in each tool's own UI: the only TCP endpoint either tool opened
-# was 127.0.0.1:11434.
+# installed and not a cloud one. A local account never takes part in a MAP,
+# copied settings or the usage limits, and removing it moves nothing.
+# Verified with claude 2.1.306, codex 0.160 and Ollama 0.40.7, headless and
+# in each tool's own UI: the only TCP endpoint either tool opened was
+# 127.0.0.1:11434.
+# v0.92: the Ollama can also be another computer's (ALBUS, a GPU box on the
+# home network), listed under claudeOllamaRoots / codexOllamaRoots with the
+# dir (still on this PC) and the address:
+#   "claudeOllamaRoots": { "albus": { "dir": "%LOCALAPPDATA%\\ccr-local\\albus\\claude",
+#                                     "url": "http://192.168.0.40:11434" } }
+# Keys of their own again: v0.88-0.91 read claudeLocalRoots as label -> dir
+# and would take such an account for one of this PC's. The same checks run
+# against that address. Tab moves a conversation between the local accounts
+# of its tool (never to or from an account that talks to a cloud), asking
+# first when it would go further than before (Get-CcrOllamaReach).
 $script:CcrOllamaUrl = 'http://127.0.0.1:11434'
 $script:CcrOllamaProvider = 'ccr-ollama'
+
+# How far a local account's conversations travel, from its Ollama address:
+# 0 = this PC (loopback), 1 = the local network (a private address, or a
+# .local / .lan / one-word name), 2 = the internet.
+function Get-CcrOllamaReachRank([string]$Url) {
+    $h = try { ([uri]$Url).Host } catch { '' }
+    if ($h -match '^(localhost|127\.\d+\.\d+\.\d+|\[?::1\]?)$') { return 0 }
+    if ($h -match '^(10\.\d+|192\.168|172\.(1[6-9]|2\d|3[01])|169\.254)\.' -or $h -match '\.(local|lan|home\.arpa)$' -or $h -notmatch '\.') { return 1 }
+    2
+}
+function Get-CcrOllamaReach([string]$Url) { @('this PC', 'LAN', 'internet')[(Get-CcrOllamaReachRank $Url)] }
+# Where a local account's Ollama is, for the account table and messages:
+# "this PC", or "192.168.0.40 (LAN)".
+function Get-CcrOllamaPlace([string]$Url) {
+    if ((Get-CcrOllamaReachRank $Url) -eq 0) { return 'this PC' }
+    $h = try { ([uri]$Url).Host } catch { $Url }
+    "$h ($(Get-CcrOllamaReach $Url))"
+}
+# The command that sets a local account up again (its fix).
+function Get-CcrLocalFix([string]$Tool, [object]$Root) {
+    $u = "$($Root.OllamaUrl)"
+    if ($u -and $u -ne $script:CcrOllamaUrl) { "ccr -AddAccount $($Root.Label) -Tool $Tool -Ollama $u" } else { "ccr -AddAccount $($Root.Label) -Tool $Tool -Local" }
+}
 
 # Where -AddAccount -Local puts a new local account: per machine, outside
 # any synced folder. Written to ccr.json with the variable, so the same entry
@@ -275,8 +319,21 @@ function Test-CcrCloudModel([object]$Model) {
 # settings first: while they allow the cloud, nothing is sent. Then the
 # running server must refuse a cloud model on its own (403 "ollama cloud is
 # disabled", answered locally), which catches a setting made after Ollama
-# started.
-function Get-CcrOllamaCloudProblem {
+# started. Another computer's Ollama: only that answer can be asked for (its
+# settings are not readable from here; while its cloud is on, the made-up
+# name ccr-check reaches ollama.com).
+function Get-CcrOllamaCloudProblem([string]$Url = $script:CcrOllamaUrl) {
+    if ($Url -ne $script:CcrOllamaUrl) {
+        $fix = "on that computer set OLLAMA_NO_CLOUD=1 or `"disable_ollama_cloud`": true in ~/.ollama/server.json, then restart Ollama there"
+        try {
+            $null = Invoke-RestMethod -Uri "$Url/api/show" -Method Post -Body '{"model":"ccr-check:cloud"}' -ContentType 'application/json' -TimeoutSec 8 -NoProxy
+            return "Ollama's cloud is on at $Url, so a model picked inside the session could reach ollama.com - $fix."
+        }
+        catch {
+            if ("$($_.ErrorDetails.Message)" -match 'cloud is disabled') { return '' }
+            return "Ollama at $Url did not confirm that its cloud is off - $fix."
+        }
+    }
     $off = $false
     try {
         $sj = Join-Path (Join-Path $HOME '.ollama') 'server.json'
@@ -290,7 +347,7 @@ function Get-CcrOllamaCloudProblem {
     else { '"disable_ollama_cloud": true in ~/.ollama/server.json, then restart Ollama' }
     if (-not $off) { return "Ollama's cloud is on on this PC, so a model picked inside the session could reach ollama.com. Turn it off: $fix" }
     try {
-        $null = Invoke-RestMethod -Uri "$script:CcrOllamaUrl/api/show" -Method Post -Body '{"model":"ccr-check:cloud"}' -ContentType 'application/json' -TimeoutSec 5
+        $null = Invoke-RestMethod -Uri "$script:CcrOllamaUrl/api/show" -Method Post -Body '{"model":"ccr-check:cloud"}' -ContentType 'application/json' -TimeoutSec 5 -NoProxy
         return "Ollama's cloud is off in its settings, but the running Ollama still serves cloud models - restart Ollama."
     }
     catch {
@@ -299,19 +356,21 @@ function Get-CcrOllamaCloudProblem {
     }
 }
 
-# What this PC's Ollama says, asked once per run: Answers, Models (installed,
-# cloud ones left out, by name) and Cloud ('' = off, else why not).
-function Get-CcrOllamaState([switch]$Refresh) {
-    if ($script:CcrOllamaState -and -not $Refresh) { return $script:CcrOllamaState }
+# What an Ollama says (this PC's unless -Url), asked once per run and
+# address: Answers, Models (installed, cloud ones left out, by name) and
+# Cloud ('' = off, else why not).
+$script:CcrOllamaStates = @{}
+function Get-CcrOllamaState([string]$Url = $script:CcrOllamaUrl, [switch]$Refresh) {
+    if ($script:CcrOllamaStates.ContainsKey($Url) -and -not $Refresh) { return $script:CcrOllamaStates[$Url] }
     $st = [pscustomobject]@{ Answers = $false; Models = @(); Cloud = '' }
     try {
-        $tags = Invoke-RestMethod -Uri "$script:CcrOllamaUrl/api/tags" -TimeoutSec 3
+        $tags = Invoke-RestMethod -Uri "$Url/api/tags" -TimeoutSec $(if ($Url -eq $script:CcrOllamaUrl) { 3 } else { 5 }) -NoProxy
         $st.Answers = $true
         $st.Models = @($tags.models | Where-Object { $_ -and -not (Test-CcrCloudModel $_) } | ForEach-Object { "$($_.name)" } | Sort-Object)
-        $st.Cloud = Get-CcrOllamaCloudProblem
+        $st.Cloud = Get-CcrOllamaCloudProblem $Url
     }
     catch { }
-    $script:CcrOllamaState = $st
+    $script:CcrOllamaStates[$Url] = $st
     $st
 }
 
@@ -330,6 +389,10 @@ $script:CcrLocalClaudeEnv = [ordered]@{
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1'; DISABLE_AUTOUPDATER = '1'; ENABLE_CLAUDEAI_MCP_SERVERS = 'false'; DISABLE_ERROR_REPORTING = '1'
     DISABLE_FEEDBACK_COMMAND = '1'; CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY = '1'; CLAUDE_CODE_AUTO_MODE_SERVER = '0'
     CLAUDE_CODE_ATTRIBUTION_HEADER = '0'
+    # Not covered by the variable above: at the first interactive start in a
+    # new dir claude registers the official plugin marketplace - a clone from
+    # github.com (https and ssh) plus downloads.claude.ai (seen v0.92).
+    CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL = '1'
 }
 # A local model can stay silent for many minutes: Ollama streams nothing while
 # it reads the whole conversation again (after unloading the model, or a cache
@@ -341,10 +404,11 @@ $script:CcrLocalClaudeEnv = [ordered]@{
 # so accounts made by v0.88-0.89 get them too; a value changed by hand stays.
 $script:CcrLocalClaudeWaitEnv = [ordered]@{ API_FORCE_IDLE_TIMEOUT = '0'; CLAUDE_STREAM_IDLE_TIMEOUT_MS = '1800000'; API_TIMEOUT_MS = '1800000' }
 $script:CcrLocalCodexIdleMs = 1800000
-function Get-CcrLocalCodexToml {
+function Get-CcrLocalCodexToml([string]$Url = $script:CcrOllamaUrl) {
+    $where = if ($Url -eq $script:CcrOllamaUrl) { 'this PC' } else { $Url }
     @"
-# ccr local account: everything goes to the Ollama server of this PC.
-# Written by ccr (-AddAccount -Local), checked before every start.
+# ccr local account: everything goes to the Ollama server of $where.
+# Written by ccr (-AddAccount -Local / -Ollama), checked before every start.
 model_provider = "$script:CcrOllamaProvider"
 check_for_update_on_startup = false
 web_search = "disabled"
@@ -370,22 +434,26 @@ metrics_exporter = "none"
 show_tooltips = false
 
 [model_providers.$script:CcrOllamaProvider]
-name = "Ollama (this PC)"
-base_url = "$script:CcrOllamaUrl/v1"
+name = "Ollama ($where)"
+base_url = "$Url/v1"
 wire_api = "responses"
 # Ollama may stay silent for minutes while it reads a long conversation.
 stream_idle_timeout_ms = $script:CcrLocalCodexIdleMs
 "@
 }
 
-# Add the long waits above to a local account's files where they are missing.
+# Add the long waits above to a local account's files where they are missing,
+# and in claude's env any key a newer ccr pins (an account made by an older
+# one lacks it). A value already there is never changed.
 function Add-CcrLocalWaits([string]$Tool, [string]$Dir) {
     if ($Tool -eq 'claude') {
         $sj = Join-Path $Dir 'settings.json'
         $cfg = Get-Content -LiteralPath $sj -Raw | ConvertFrom-Json
-        $miss = @($script:CcrLocalClaudeWaitEnv.Keys | Where-Object { -not $cfg.env.PSObject.Properties[$_] })
+        $want = [ordered]@{}
+        foreach ($m in $script:CcrLocalClaudeEnv, $script:CcrLocalClaudeWaitEnv) { foreach ($k in $m.Keys) { $want[$k] = $m[$k] } }
+        $miss = @($want.Keys | Where-Object { -not $cfg.env.PSObject.Properties[$_] })
         if (-not $miss.Count) { return }
-        foreach ($k in $miss) { $cfg.env | Add-Member -NotePropertyName $k -NotePropertyValue $script:CcrLocalClaudeWaitEnv[$k] }
+        foreach ($k in $miss) { $cfg.env | Add-Member -NotePropertyName $k -NotePropertyValue $want[$k] }
         $cfg | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath $sj -Encoding utf8NoBOM
         return
     }
@@ -401,8 +469,9 @@ function Add-CcrLocalWaits([string]$Tool, [string]$Dir) {
 # block and the denies merged in (other keys kept); codex's config.toml is
 # written whole, the previous one kept as config.toml.bak-<date> when it did
 # not point at Ollama. Plus the long waits where missing, and claude's
-# first-start flag, as Add-CcrAccount.
-function Set-CcrLocalPin([string]$Tool, [string]$Dir) {
+# first-start flag, as Add-CcrAccount. -Url: the Ollama it talks to (this
+# PC's unless given).
+function Set-CcrLocalPin([string]$Tool, [string]$Dir, [string]$Url = $script:CcrOllamaUrl) {
     New-Item -ItemType Directory -Path $Dir -Force | Out-Null
     if ($Tool -eq 'claude') {
         $sj = Join-Path $Dir 'settings.json'
@@ -410,6 +479,7 @@ function Set-CcrLocalPin([string]$Tool, [string]$Dir) {
         if (-not $cfg) { $cfg = [pscustomobject]@{} }
         $envObj = if ($cfg.PSObject.Properties['env'] -and $cfg.env) { $cfg.env } else { [pscustomobject]@{} }
         foreach ($k in $script:CcrLocalClaudeEnv.Keys) { $envObj | Add-Member -NotePropertyName $k -NotePropertyValue $script:CcrLocalClaudeEnv[$k] -Force }
+        $envObj.ANTHROPIC_BASE_URL = $Url
         $cfg | Add-Member -NotePropertyName env -NotePropertyValue $envObj -Force
         $perm = if ($cfg.PSObject.Properties['permissions'] -and $cfg.permissions) { $cfg.permissions } else { [pscustomobject]@{} }
         # v0.88 denied WebFetch too; since v0.89 it is allowed (asked like any tool).
@@ -423,29 +493,30 @@ function Set-CcrLocalPin([string]$Tool, [string]$Dir) {
     }
     else {
         $ct = Join-Path $Dir 'config.toml'
-        if ((Test-Path -LiteralPath $ct) -and (Get-CcrLocalPinProblem codex $Dir)) {
+        if ((Test-Path -LiteralPath $ct) -and (Get-CcrLocalPinProblem codex $Dir $Url)) {
             Copy-Item -LiteralPath $ct -Destination "$ct.bak-$(Get-Date -Format 'yyyy-MM-dd-HHmmss')"
         }
-        if (-not (Test-Path -LiteralPath $ct) -or (Get-CcrLocalPinProblem codex $Dir)) {
-            Set-Content -LiteralPath $ct -Value (Get-CcrLocalCodexToml) -Encoding utf8NoBOM
+        if (-not (Test-Path -LiteralPath $ct) -or (Get-CcrLocalPinProblem codex $Dir $Url)) {
+            Set-Content -LiteralPath $ct -Value (Get-CcrLocalCodexToml $Url) -Encoding utf8NoBOM
         }
     }
     Add-CcrLocalWaits $Tool $Dir
 }
 
-# '' when a local account's dir still sends everything to this PC's Ollama.
-function Get-CcrLocalPinProblem([string]$Tool, [string]$Dir) {
+# '' when a local account's dir still sends everything to its Ollama (-Url,
+# this PC's unless given).
+function Get-CcrLocalPinProblem([string]$Tool, [string]$Dir, [string]$Url = $script:CcrOllamaUrl) {
     if (Test-CcrSyncedPath $Dir) { return "its dir $Dir is inside a synced folder" }
     if ($Tool -eq 'claude') {
         $sj = Join-Path $Dir 'settings.json'
         try { $e = (Get-Content -LiteralPath $sj -Raw -ErrorAction Stop | ConvertFrom-Json).env } catch { return "no readable settings.json in $Dir" }
-        if ("$($e.ANTHROPIC_BASE_URL)" -ne $script:CcrOllamaUrl -or "$($e.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC)" -ne '1' -or "$($e.DISABLE_AUTOUPDATER)" -ne '1' -or
+        if ("$($e.ANTHROPIC_BASE_URL)" -ne $Url -or "$($e.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC)" -ne '1' -or "$($e.DISABLE_AUTOUPDATER)" -ne '1' -or
             (Get-Content -LiteralPath $sj -Raw | ConvertFrom-Json).skipWebFetchPreflight -ne $true) { return "settings.json in $Dir no longer keeps claude on Ollama only" }
         return ''
     }
     $t = try { Get-Content -LiteralPath (Join-Path $Dir 'config.toml') -Raw -ErrorAction Stop } catch { '' }
     $prov = [regex]::Escape($script:CcrOllamaProvider)
-    if ($t -notmatch "(?m)^\s*model_provider\s*=\s*`"$prov`"" -or $t -notmatch "(?ms)^\[model_providers\.$prov\][^\[]*?^\s*base_url\s*=\s*`"$([regex]::Escape($script:CcrOllamaUrl))/v1/?`"" -or
+    if ($t -notmatch "(?m)^\s*model_provider\s*=\s*`"$prov`"" -or $t -notmatch "(?ms)^\[model_providers\.$prov\][^\[]*?^\s*base_url\s*=\s*`"$([regex]::Escape($Url))/v1/?`"" -or
         $t -notmatch '(?ms)^\[otel\][^\[]*?^\s*metrics_exporter\s*=\s*"none"' -or $t -notmatch '(?ms)^\[analytics\][^\[]*?^\s*enabled\s*=\s*false') {
         return "config.toml in $Dir no longer keeps codex on Ollama only"
     }
@@ -455,17 +526,23 @@ function Get-CcrLocalPinProblem([string]$Tool, [string]$Dir) {
 # '' when a conversation of a local account may start now with this model,
 # else the reason and the fix. Model '' checks everything but the model.
 function Get-CcrLocalProblem([string]$Tool, [object]$Root, [string]$Model) {
-    $fix = "ccr -AddAccount $($Root.Label) -Tool $Tool -Local"
+    $fix = Get-CcrLocalFix $Tool $Root
+    $url = if ("$($Root.OllamaUrl)") { "$($Root.OllamaUrl)" } else { $script:CcrOllamaUrl }
+    $here = $url -eq $script:CcrOllamaUrl
     if (Test-CcrSyncedPath $Root.Path) { return "ccr: the local $Tool account '$($Root.Label)' has its dir in a synced folder ($($Root.Path)) - a local account's dir must stay on this PC: change it in $($script:CcrConfigPath)" }
     if (-not (Test-Path -LiteralPath $Root.Path -PathType Container)) { return "ccr: the local $Tool account '$($Root.Label)' is not on this PC - $($Root.Path) does not exist. Fix: $fix" }
-    $pin = Get-CcrLocalPinProblem $Tool $Root.Path
+    $pin = Get-CcrLocalPinProblem $Tool $Root.Path $url
     if ($pin) { return "ccr: local $Tool account '$($Root.Label)': $pin. Fix: $fix (points it at Ollama again)" }
-    $st = Get-CcrOllamaState
-    if (-not $st.Answers) { return "ccr: Ollama does not answer on $script:CcrOllamaUrl - start Ollama, then try again." }
+    $st = Get-CcrOllamaState $url
+    if (-not $st.Answers) {
+        if ($here) { return "ccr: Ollama does not answer on $url - start Ollama, then try again." }
+        return "ccr: Ollama does not answer on $url ('$($Root.Label)') - is that computer on, with Ollama running, and on this network?"
+    }
     if ($st.Cloud) { return "ccr: $($st.Cloud)" }
     if (-not $Model) { return '' }
-    if (Test-CcrCloudModel $Model) { return "ccr: '$Model' is an Ollama cloud model - a local account only runs models on this PC." }
-    if ($Model -notin $st.Models) { return "ccr: the model '$Model' is not installed in this PC's Ollama - ollama pull $Model, or Ctrl+E picks another one." }
+    $where = if ($here) { "this PC's Ollama" } else { "the Ollama of '$($Root.Label)' ($url)" }
+    if (Test-CcrCloudModel $Model) { return "ccr: '$Model' is an Ollama cloud model - a local account only runs models on its own Ollama." }
+    if ($Model -notin $st.Models) { return "ccr: the model '$Model' is not installed in $where - ollama pull $Model there, or Shift+Enter (Ctrl+E) picks another one." }
     ''
 }
 
@@ -473,10 +550,10 @@ function Get-CcrLocalProblem([string]$Tool, [object]$Root, [string]$Model) {
 # settings.json again as --settings (above a project's own settings), and the
 # model. Codex: Ollama as provider on the command line (above any
 # config.toml), the model, and plugins, apps and web search off.
-function Get-CcrLocalArgs([string]$Tool, [string]$RootPath, [string]$Model) {
+function Get-CcrLocalArgs([string]$Tool, [string]$RootPath, [string]$Model, [string]$Url = $script:CcrOllamaUrl) {
     if ($Tool -eq 'claude') { return @('--settings', (Join-Path $RootPath 'settings.json'), '--model', $Model) }
     $p = $script:CcrOllamaProvider
-    @('-m', $Model, '-c', "model_provider=$p", '-c', "model_providers.$p.base_url=$script:CcrOllamaUrl/v1", '-c', 'web_search=disabled', '--disable', 'plugins', '--disable', 'apps')
+    @('-m', $Model, '-c', "model_provider=$p", '-c', "model_providers.$p.base_url=$Url/v1", '-c', 'web_search=disabled', '--disable', 'plugins', '--disable', 'apps')
 }
 
 # ...and with this environment besides the account's dir: claude's model
@@ -526,37 +603,67 @@ function Set-CcrLocalLastModel([string]$Tool, [string]$Label, [string]$Model) {
 # machine outside any synced folder (Get-CcrLocalDirSpec), pointed at Ollama,
 # recorded under claudeLocalRoots / codexLocalRoots. No login. Run again on a
 # known label it creates the dir on this PC, or points it at Ollama again.
+# -Url: the Ollama of another computer (http://192.168.0.40:11434), recorded
+# under claudeOllamaRoots / codexOllamaRoots with the dir; given again on a
+# known label it changes the address, left out it keeps the one recorded.
 function Add-CcrLocalAccount {
     param(
         [Parameter(Mandatory)][string]$Label,
-        [ValidateSet('claude', 'codex', 'all')][string]$Tool = 'all'
+        [ValidateSet('claude', 'codex', 'all')][string]$Tool = 'all',
+        [string]$Url = ''
     )
     if ($Label -notmatch '^[A-Za-z0-9_-]{1,12}$') { throw "ccr: account label must be 1-12 letters/digits/_/- (got '$Label')" }
     if ($Label -eq $script:CcrDefaultLabel) { throw "ccr: '$Label' is the label of the dirs in use today - pick another one" }
+    $Url = $Url.Trim().TrimEnd('/')
+    if ($Url -and $Url -notmatch '^https?://[^/\s]+$') { throw "ccr: an Ollama address looks like http://192.168.0.40:11434 (got '$Url')" }
+    if ($Url -eq $script:CcrOllamaUrl) { $Url = '' }   # this PC's: a plain local account
     $tools = if ($Tool -eq 'all') { @('claude', 'codex') } else { @($Tool) }
     foreach ($t in $tools) {
         if (@(Get-CcrRoots -Tool $t | Where-Object { $_.Label -eq $Label -and -not $_.Local }).Count) { throw "ccr: '$Label' is already an ordinary $t account - pick another label" }
     }
     $cfg = Enable-CcrMultiAccount
+    $urls = @()
     foreach ($t in $tools) {
-        $key = "${t}LocalRoots"
-        if (-not $cfg.PSObject.Properties[$key] -or -not $cfg.$key) { $cfg | Add-Member -NotePropertyName $key -NotePropertyValue ([pscustomobject]@{}) -Force }
-        $known = $cfg.$key.PSObject.Properties[$Label]
-        $spec = if ($known) { [string]$known.Value } else { Get-CcrLocalDirSpec $Label $t }
+        $lkey = "${t}LocalRoots"; $okey = "${t}OllamaRoots"
+        $inLocal = if ($cfg.PSObject.Properties[$lkey] -and $cfg.$lkey) { $cfg.$lkey.PSObject.Properties[$Label] }
+        $inOllama = if ($cfg.PSObject.Properties[$okey] -and $cfg.$okey) { $cfg.$okey.PSObject.Properties[$Label] }
+        if ($Url -and $inLocal) { throw "ccr: '$Label' is a local $t account on this PC's Ollama - pick another label for $Url" }
+        $u = if ($Url) { $Url } elseif ($inOllama) { "$($inOllama.Value.url)".TrimEnd('/') } else { '' }
+        if (-not $u) {
+            if (-not $cfg.PSObject.Properties[$lkey] -or -not $cfg.$lkey) { $cfg | Add-Member -NotePropertyName $lkey -NotePropertyValue ([pscustomobject]@{}) -Force }
+            $spec = if ($inLocal) { [string]$inLocal.Value } else { Get-CcrLocalDirSpec $Label $t }
+            $dir = Expand-CcrPath $spec
+            if (Test-CcrSyncedPath $dir) { throw "ccr: $dir is inside a synced folder - a local account's dir must stay on this PC" }
+            Set-CcrLocalPin $t $dir
+            if (-not $inLocal) {
+                $cfg.$lkey | Add-Member -NotePropertyName $Label -NotePropertyValue $spec
+                Save-CcrConfig $cfg
+            }
+            $urls += $script:CcrOllamaUrl
+            Write-Host "ccr: local $t account '$Label' -> $dir  - Ollama on this PC only, no login" -ForegroundColor Green
+            continue
+        }
+        $spec = if ($inOllama -and "$($inOllama.Value.dir)") { "$($inOllama.Value.dir)" } else { Get-CcrLocalDirSpec $Label $t }
         $dir = Expand-CcrPath $spec
         if (Test-CcrSyncedPath $dir) { throw "ccr: $dir is inside a synced folder - a local account's dir must stay on this PC" }
-        Set-CcrLocalPin $t $dir
-        if (-not $known) {
-            $cfg.$key | Add-Member -NotePropertyName $Label -NotePropertyValue $spec
+        Set-CcrLocalPin $t $dir $u
+        if (-not $inOllama -or "$($inOllama.Value.url)".TrimEnd('/') -ne $u) {
+            if (-not $cfg.PSObject.Properties[$okey] -or -not $cfg.$okey) { $cfg | Add-Member -NotePropertyName $okey -NotePropertyValue ([pscustomobject]@{}) -Force }
+            $cfg.$okey | Add-Member -NotePropertyName $Label -NotePropertyValue ([pscustomobject][ordered]@{ dir = $spec; url = $u }) -Force
             Save-CcrConfig $cfg
         }
-        Write-Host "ccr: local $t account '$Label' -> $dir  - Ollama on this PC only, no login" -ForegroundColor Green
+        $urls += $u
+        Write-Host "ccr: local $t account '$Label' -> $dir  - Ollama at $(Get-CcrOllamaPlace $u), no login" -ForegroundColor Green
+        if ((Get-CcrOllamaReachRank $u) -ge 2) { Write-Warning "ccr: $u is not on this PC or its local network - the conversations of '$Label' will travel over the internet." }
     }
-    $st = Get-CcrOllamaState -Refresh
-    if (-not $st.Answers) { Write-Warning "ccr: Ollama does not answer on $script:CcrOllamaUrl yet - start it before using the account." }
-    elseif ($st.Cloud) { Write-Warning "ccr: $($st.Cloud)" }
-    elseif (-not $st.Models.Count) { Write-Warning 'ccr: Ollama has no local model yet - ollama pull <model>' }
-    else { Write-Host "ccr: models it can use: $($st.Models -join ', ')" }
+    foreach ($u in @($urls | Select-Object -Unique)) {
+        $st = Get-CcrOllamaState $u -Refresh
+        $at = if ($u -eq $script:CcrOllamaUrl) { '' } else { " at $u" }
+        if (-not $st.Answers) { Write-Warning "ccr: Ollama does not answer on $u yet - start it before using the account." }
+        elseif ($st.Cloud) { Write-Warning "ccr: $($st.Cloud)" }
+        elseif (-not $st.Models.Count) { Write-Warning "ccr: Ollama$at has no local model yet - ollama pull <model>" }
+        else { Write-Host "ccr: models it can use$at`: $($st.Models -join ', ')" }
+    }
 }
 
 # --- account management (ccr -Accounts / -AddAccount / -RemoveAccount) -------
@@ -629,7 +736,7 @@ function Get-CcrQuickIdentity {
 function Get-CcrWhoAt([string]$Tool, [string]$RootPath) {
     $q = Get-CcrQuickIdentity -Tool $Tool -RootPath $RootPath
     if ($q) { $q } elseif (-not (Test-Path -LiteralPath $RootPath)) { 'not on this PC' }
-    elseif (@(Get-CcrRoots -Tool $Tool | Where-Object { $_.Local -and $_.Path -eq $RootPath }).Count) { 'Ollama on this PC (local)' }
+    elseif (($lr = @(Get-CcrRoots -Tool $Tool | Where-Object { $_.Local -and $_.Path -eq $RootPath })[0])) { "Ollama on $(Get-CcrOllamaPlace $lr.OllamaUrl) (local)" }
     else { 'not logged in' }
 }
 
@@ -864,7 +971,7 @@ function Remove-CcrAccount {
     foreach ($t in $tools) {
         $src = @(Get-CcrRoots -Tool $t | Where-Object { $_.Local -and $_.Label -eq $Label })
         if (-not $src.Count) { continue }
-        $cfg."${t}LocalRoots".PSObject.Properties.Remove($Label)
+        foreach ($key in "${t}LocalRoots", "${t}OllamaRoots") { if ($cfg.PSObject.Properties[$key] -and $cfg.$key) { $cfg.$key.PSObject.Properties.Remove($Label) } }
         $forgot = $true
         Write-Host "ccr: local $t account '$Label' removed from ccr.json - its conversations stay in $(Format-CcrCwd $src[0].Path 50) and moved nowhere."
     }
@@ -915,7 +1022,7 @@ function Disable-CcrMultiAccount {
     foreach ($key in 'claudeRoots', 'codexRoots', 'defaultRoot') { if ($cfg.PSObject.Properties[$key]) { $cfg.PSObject.Properties.Remove($key) } }
     if (@($cfg.PSObject.Properties).Count -eq 0) { Remove-Item -LiteralPath $script:CcrConfigPath -Force } else { Save-CcrConfig $cfg }
     Write-Host 'ccr: multi-account mode is off - claude and codex are back to their single default dirs.' -ForegroundColor Green
-    if ($cfg.PSObject.Properties['claudeLocalRoots'] -or $cfg.PSObject.Properties['codexLocalRoots']) {
+    if (@('claudeLocalRoots', 'codexLocalRoots', 'claudeOllamaRoots', 'codexOllamaRoots' | Where-Object { $cfg.PSObject.Properties[$_] }).Count) {
         Write-Host 'ccr: the local accounts (Ollama) stay; ccr -RemoveAccount <label> forgets one.'
     }
 }
@@ -2013,8 +2120,9 @@ function Restore-CcrCodexArchived([object]$Session) {
 
 function Move-CcrSessionToRoot {
     param([Parameter(Mandatory)][object]$Session, [Parameter(Mandatory)][object]$TargetRoot)
-    # Local accounts (Ollama only) neither give nor take conversations.
-    if ($Session.Local -or $TargetRoot.Local) { throw "ccr: a local account's conversations never move between accounts ('$($Session.Root)' -> '$($TargetRoot.Label)')" }
+    # Local accounts (Ollama only) give and take conversations among
+    # themselves only, never to or from an account that talks to a cloud.
+    if ([bool]$Session.Local -ne [bool]$TargetRoot.Local) { throw "ccr: conversations never move between a local account (Ollama) and one that talks to a cloud ('$($Session.Root)' -> '$($TargetRoot.Label)')" }
     $src = Get-Item -LiteralPath $Session.Source
     if ($Session.Tool -eq 'claude') {
         $slug = Split-Path -Leaf $src.DirectoryName
@@ -2258,14 +2366,23 @@ function Show-CcrAccountPage {
             $copySettings = $false
             $defRoot = @(@(if ($tool -eq 'claude') { $ClaudeRoots } else { $CodexRoots }) | Where-Object Default)[0]
             $defPath = if ($defRoot) { $defRoot.Path } elseif ($tool -eq 'claude') { Get-CcrClaudeRoot } else { Get-CcrCodexRoot }
-            $items = @([pscustomobject]@{ Key = 'local'; Text = 'Local: Ollama on this PC only'; Note = 'no login; never Anthropic, OpenAI or a synced folder'; Checked = $false })
+            $items = @([pscustomobject]@{ Key = 'local'; Text = 'Local: Ollama only, on this PC or another computer of yours'; Note = 'no login; never Anthropic, OpenAI or a synced folder'; Checked = $false })
             if (Test-CcrSettings $tool $defPath) {
                 $info = Get-CcrSettingsInfo $tool
                 $items += [pscustomobject]@{ Key = 'settings'; Text = $info.Text; Note = "$($info.Note) (not for a local account)"; Checked = $true }
             }
             $opts = Select-CcrChecklist -Title "options for the new $tool account '$label'" -Items $items
             if ($null -eq $opts) { return $null }
-            if ($opts['local']) { return [pscustomobject]@{ Action = 'add-local'; Tool = $tool; Label = $label } }
+            if ($opts['local']) {
+                # Which Ollama: this PC's, or another computer's on the network.
+                while ($true) {
+                    $url = Read-CcrInput -Prompt 'Ollama address> ' -Hint "Enter = this PC's Ollama $dot another computer: e.g. http://192.168.0.40:11434 $dot Esc back"
+                    if ($null -eq $url) { return $null }
+                    $url = $url.Trim().TrimEnd('/')
+                    if ($url -and $url -notmatch '^https?://[^/\s]+$') { Show-CcrNotice "ccr: an Ollama address looks like http://192.168.0.40:11434 (got '$url')" '33'; continue }
+                    return [pscustomobject]@{ Action = 'add-local'; Tool = $tool; Label = $label; Url = $url }
+                }
+            }
             $copySettings = [bool]$opts['settings']
             return [pscustomobject]@{ Action = 'add'; Tool = $tool; Label = $label; CopySettings = $copySettings }
         }
@@ -2276,7 +2393,7 @@ function Show-CcrAccountPage {
     $rows = @(foreach ($lbl in $labels) {
             foreach ($t in 'claude', 'codex') {
                 foreach ($r in @(@(if ($t -eq 'claude') { $ClaudeRoots } else { $CodexRoots }) | Where-Object { $_.Label -eq $lbl })) {
-                    [pscustomobject]@{ Tool = $t; Label = $r.Label; Path = $r.Path; Default = $r.Default; Local = [bool]$r.Local }
+                    [pscustomobject]@{ Tool = $t; Label = $r.Label; Path = $r.Path; Default = $r.Default; Local = [bool]$r.Local; OllamaUrl = "$($r.OllamaUrl)" }
                 }
             }
         })
@@ -2349,10 +2466,10 @@ function Show-CcrAccountPage {
                     Write-CcrScreen @(
                         "`e[1mRemove local account`e[22m",
                         '',
-                        "    $($r.Tool) $dot `e[1m$($r.Label)`e[22m  $(Format-CcrCwd $r.Path 60)  (Ollama on this PC)",
+                        "    $($r.Tool) $dot `e[1m$($r.Label)`e[22m  $(Format-CcrCwd $r.Path 60)  (Ollama on $(Get-CcrOllamaPlace $r.OllamaUrl))",
                         '',
                         '  ccr forgets it. Its conversations move nowhere: they stay in its dir, where',
-                        "  ccr -AddAccount $($r.Label) -Tool $($r.Tool) -Local finds them again.",
+                        "  $(Get-CcrLocalFix $r.Tool $r) finds them again.",
                         '',
                         "  `e[31m[y]`e[39m remove    `e[2many other key: cancel`e[22m")
                     $c = [Console]::ReadKey($true)
@@ -2384,14 +2501,14 @@ function Show-CcrAccountPage {
                         Write-CcrScreen @(
                             "`e[1mSet up on this PC`e[22m",
                             '',
-                            "    $($r.Tool) $dot `e[1m$($r.Label)`e[22m  $(Format-CcrCwd $r.Path 60)  (Ollama on this PC)",
+                            "    $($r.Tool) $dot `e[1m$($r.Label)`e[22m  $(Format-CcrCwd $r.Path 60)  (Ollama on $(Get-CcrOllamaPlace $r.OllamaUrl))",
                             '',
                             '  A local account has no login. ccr creates its dir if needed and points it at',
-                            "  this PC's Ollama again (the same as ccr -AddAccount $($r.Label) -Tool $($r.Tool) -Local).",
+                            "  its Ollama again (the same as $(Get-CcrLocalFix $r.Tool $r)).",
                             '',
                             "  `e[32m[y]`e[39m set up    `e[2many other key: cancel`e[22m")
                         $c = [Console]::ReadKey($true)
-                        if ($c.KeyChar -in 'y', 'Y') { return [pscustomobject]@{ Action = 'add-local'; Tool = $r.Tool; Label = $r.Label } }
+                        if ($c.KeyChar -in 'y', 'Y') { return [pscustomobject]@{ Action = 'add-local'; Tool = $r.Tool; Label = $r.Label; Url = '' } }
                         continue
                     }
                     $state = if (-not (Test-Path -LiteralPath $r.Path)) { 'does not exist on this PC yet' }
@@ -2519,20 +2636,21 @@ function Select-CcrRoot {
 }
 
 # Model chooser for a local account (Ollama only): the models installed in
-# this PC's Ollama, cloud ones left out, the one picked last time first.
+# its Ollama, cloud ones left out, the one picked last time first.
 # Checks the account and Ollama first (a notice instead when something is
 # wrong). Returns the model, or $null on Esc. Inside the caller's alt buffer.
 function Select-CcrOllamaModel {
     param([Parameter(Mandatory)][object]$Root, [Parameter(Mandatory)][ValidateSet('claude', 'codex')][string]$Tool, [string]$Current = '')
     $bad = Get-CcrLocalProblem $Tool $Root ''
     if ($bad) { Show-CcrNotice $bad; return $null }
-    $models = @((Get-CcrOllamaState).Models)
-    if (-not $models.Count) { Show-CcrNotice 'ccr: Ollama has no local model on this PC - ollama pull <model>'; return $null }
+    $url = if ("$($Root.OllamaUrl)") { "$($Root.OllamaUrl)" } else { $script:CcrOllamaUrl }
+    $models = @((Get-CcrOllamaState $url).Models)
+    if (-not $models.Count) { Show-CcrNotice "ccr: Ollama on $(Get-CcrOllamaPlace $url) has no local model - ollama pull <model> there"; return $null }
     if (-not $Current) { $Current = Get-CcrLocalLastModel $Tool $Root.Label }
     $cursor = [Math]::Max(0, [array]::IndexOf($models, $Current))
     while ($true) {
         $sb = [System.Text.StringBuilder]::new()
-        [void]$sb.Append("`e[H").Append("model for the local $Tool account '$($Root.Label)' $([char]0x00B7) Ollama on this PC").Append("`e[K`n")
+        [void]$sb.Append("`e[H").Append("model for the local $Tool account '$($Root.Label)' $([char]0x00B7) Ollama on $(Get-CcrOllamaPlace $url)").Append("`e[K`n")
         [void]$sb.Append("`e[2m$([char]0x2191)$([char]0x2193) move $([char]0x00B7) Enter choose $([char]0x00B7) Esc back`e[22m`e[K")
         for ($i = 0; $i -lt $models.Count; $i++) {
             $row = "  $($models[$i])$(if ($models[$i] -eq $Current) { "  `e[2m(last used)`e[22m" })"
@@ -2893,7 +3011,7 @@ function Get-CcrInstallPlan {
 function Get-CcrAccountMissing([string]$Tool, [object]$Root) {
     if (-not $Root -or -not $Root.Path -or (Test-Path -LiteralPath $Root.Path -PathType Container)) { return '' }
     $fix = if ($Root.Default) { if ($Tool -eq 'claude') { 'claude auth login' } else { 'codex login' } }
-    elseif ($Root.Local) { "ccr -AddAccount $($Root.Label) -Tool $Tool -Local" }
+    elseif ($Root.Local) { Get-CcrLocalFix $Tool $Root }
     else { "ccr -AddAccount $($Root.Label) -Tool $Tool   (or Ctrl+A in the picker, then L on its row)" }
     "ccr: $Tool account '$($Root.Label)' is not on this PC - $($Root.Path) does not exist. Fix: $fix"
 }
@@ -4984,7 +5102,12 @@ function Get-CcrRunRootPath([object]$Session, [object[]]$Roots) {
 # picker's alternate screen buffer. The rows of a local account (Ollama
 # only) get a section of their own, keyed "<tool>@<label>" (Get-CcrLaunchKey):
 # a model only, from this PC's Ollama, and no effort.
-function Get-CcrLaunchKey([object]$Session) { if ($Session.Local) { "$($Session.Tool)@$($Session.Root)" } else { $Session.Tool } }
+# A row Tab sends to another local account takes that account's section.
+function Get-CcrLaunchKey([object]$Session) {
+    if (-not $Session.Local) { return $Session.Tool }
+    $to = if ($Session.PSObject.Properties['TargetRoot'] -and "$($Session.TargetRoot)") { "$($Session.TargetRoot)" } else { "$($Session.Root)" }
+    "$($Session.Tool)@$to"
+}
 function Show-CcrLaunchOptions {
     param([Parameter(Mandatory)][object[]]$Sessions, [object[]]$ClaudeRoots = @(), [object[]]$CodexRoots = @())
     $dot = [char]0x00B7
@@ -5004,13 +5127,17 @@ function Show-CcrLaunchOptions {
                 Effort     = ''
             }
         }
-        foreach ($lbl in @($Sessions | Where-Object { $_.Tool -eq $t -and $_.Local } | ForEach-Object { "$($_.Root)" } | Select-Object -Unique)) {
-            $sec["$t@$lbl"] = [pscustomobject]@{
+        foreach ($lk in @($Sessions | Where-Object { $_.Tool -eq $t -and $_.Local } | ForEach-Object { Get-CcrLaunchKey $_ } | Select-Object -Unique)) {
+            $lbl = $lk.Substring($t.Length + 1)
+            $lr = @(@(if ($t -eq 'claude') { $ClaudeRoots } else { $CodexRoots }) | Where-Object { $_.Local -and $_.Label -eq $lbl })[0]
+            $url = if ($lr -and "$($lr.OllamaUrl)") { "$($lr.OllamaUrl)" } else { $script:CcrOllamaUrl }
+            $sec[$lk] = [pscustomobject]@{
                 Tool       = $t
                 Local      = $true
                 Label      = $lbl
-                Count      = @($Sessions | Where-Object { $_.Tool -eq $t -and $_.Local -and "$($_.Root)" -eq $lbl }).Count
-                Choices    = @((Get-CcrOllamaState).Models | ForEach-Object { [pscustomobject]@{ Value = $_; Note = 'Ollama on this PC' } })
+                Place      = (Get-CcrOllamaPlace $url)
+                Count      = @($Sessions | Where-Object { $_.Tool -eq $t -and $_.Local -and (Get-CcrLaunchKey $_) -eq $lk }).Count
+                Choices    = @((Get-CcrOllamaState $url).Models | ForEach-Object { [pscustomobject]@{ Value = $_; Note = "Ollama on $(Get-CcrOllamaPlace $url)" } })
                 Configured = [pscustomobject]@{ Model = ''; Effort = ''; PerModel = $false }
                 Model      = ''
                 Effort     = ''
@@ -5029,7 +5156,7 @@ function Show-CcrLaunchOptions {
             $tc = if ($x.Tool -eq 'claude') { "`e[38;5;208m" } else { "`e[36m" }
             $src = if ($x.Local) { 'the model it last ran with' } elseif ($t -eq 'claude') { 'settings' } else { 'config.toml' }
             $lines.Add('')
-            $lines.Add("  $tc$($x.Tool)`e[39m$(if ($x.Local) { " `e[35m$($x.Label)`e[39m `e[2m(local, Ollama on this PC)`e[22m" })  `e[2m$($x.Count) conversation$(if ($x.Count -ne 1) { 's' })`e[22m")
+            $lines.Add("  $tc$($x.Tool)`e[39m$(if ($x.Local) { " `e[35m$($x.Label)`e[39m `e[2m(local, Ollama on $($x.Place))`e[22m" })  `e[2m$($x.Count) conversation$(if ($x.Count -ne 1) { 's' })`e[22m")
             foreach ($kind in @(if ($x.Local) { 'model' } else { 'model', 'effort' })) {
                 $val = if ($kind -eq 'model') { $x.Model } else { $x.Effort }
                 $note = if ($val) {
@@ -5133,7 +5260,7 @@ function Get-CcrPickerGuide([int]$Width, [bool]$AcctMode, [bool]$LimitsOn) {
             @('(archived)', 'a Codex conversation put away with codex archive: opening it unarchives it'))
         , @('The table on top',
             @('one line per account', "its folder, who is logged in there and its usage limits: 5h and week used, the reset after $([char]0x2192); yellow from 70%, red from 90%"),
-            @('a local account', 'Ollama on this PC only (ccr -AddAccount <label> -Local): never the cloud, no limits, not in Tab''s cycling or a MAP'))
+            @('a local account', 'Ollama only, on this PC (ccr -AddAccount <label> -Local) or another computer (-Ollama <address>): never the cloud, no limits, not in a MAP; Tab moves its conversations only to another local account'))
     )
     if ($LimitsOn) { $sections[2] += , @('Ctrl+L', 'ask every account for its usage limits again (otherwise those of the last 5 minutes)') }
     $keyW = 26
@@ -5635,8 +5762,7 @@ function Select-CcrSession {
     # A local account (Ollama only) gives and takes no conversation: its rows
     # cycle through their own account only, and no other row goes there.
     function Get-CcrAcctAvail([object]$row) {
-        if ($row.Local) { return @() }
-        @($entries | Where-Object { $_.Tool -eq $row.Tool -and -not $_.Local } | ForEach-Object { $_.Label })
+        @($entries | Where-Object { $_.Tool -eq $row.Tool -and [bool]$_.Local -eq [bool]$row.Local } | ForEach-Object { $_.Label })
     }
     function Get-CcrAcctNumber([string]$tool, [string]$label) {
         $e = @($entries | Where-Object { $_.Tool -eq $tool -and $_.Label -eq $label })
@@ -5863,7 +5989,7 @@ function Select-CcrSession {
                             'add' { Add-CcrAccount -Label $act.Label -Tool $act.Tool -CopySettings:([bool]$act.CopySettings) }
                             'settings' { Copy-CcrSettings $act.Tool $act.From $act.To }
                             'login' { Add-CcrAccount -Label $act.Label -Tool $act.Tool }
-                            'add-local' { Add-CcrLocalAccount -Label $act.Label -Tool $act.Tool }
+                            'add-local' { Add-CcrLocalAccount -Label $act.Label -Tool $act.Tool -Url "$($act.Url)" }
                             'remove' { Remove-CcrAccount -Label $act.Label -Tool $act.Tool }
                             'disable' { Disable-CcrMultiAccount }
                         }
@@ -6337,9 +6463,19 @@ function Resume-CcSessions {
         uses the model the conversation last ran with (Shift+Enter picks
         another). Before every start ccr checks that Ollama answers here,
         that its cloud is off, that the dir still points at Ollama and that
-        the model is a local one. A local account is never in Tab's
-        account cycling, a MAP or the usage limits, takes no copied
-        settings, and ccr -RemoveAccount local only forgets it.
+        the model is a local one. A local account is never in a MAP or the
+        usage limits, takes no copied settings, and ccr -RemoveAccount local
+        only forgets it. Tab moves its conversations only to another local
+        account.
+    .EXAMPLE
+        ccr -AddAccount albus -Ollama http://192.168.0.40:11434
+        A local account on the Ollama of another computer of the network
+        (a GPU box): the conversations stay in this PC's dir and go to that
+        address only. ccr.json lists it under claudeOllamaRoots /
+        codexOllamaRoots; the same checks run against that Ollama, whose
+        cloud must be off. Tab moves a conversation between 'local' and
+        'albus', asking first when it goes further (this PC -> LAN ->
+        internet).
     .EXAMPLE
         ccr   then Ctrl+A
         The account page. The first time it explains that the dirs in use
@@ -6495,6 +6631,9 @@ function Resume-CcSessions {
         # With -AddAccount: a local account - Ollama on this PC only, never
         # Anthropic, OpenAI or a synced folder; no login.
         [switch]$Local,
+        # With -AddAccount: a local account on the Ollama of another computer
+        # (http://192.168.0.40:11434); implies -Local.
+        [string]$Ollama = '',
         # Start the picker with the token-usage column on (Ctrl+K toggles
         # it); ccr.json "usageColumn": true makes that the default.
         [switch]$Usage,
@@ -6516,10 +6655,10 @@ function Resume-CcSessions {
     if ($Filter -and @($Filter | Where-Object { $_ -like '--*' }).Count) {
         $map = @{ update = 'Update'; channel = 'Channel'; root = 'Root'; accounts = 'Accounts'; 'add-account' = 'AddAccount'
             'remove-account' = 'RemoveAccount'; 'disable-accounts' = 'DisableAccounts'; 'copy-settings' = 'CopySettings'
-            'copy-statusline' = 'CopySettings'; local = 'Local'; tool = 'Tool'; top = 'Top'; new = 'New'; 'new-window' = 'NewWindow'
+            'copy-statusline' = 'CopySettings'; local = 'Local'; ollama = 'Ollama'; tool = 'Tool'; top = 'Top'; new = 'New'; 'new-window' = 'NewWindow'
             'dry-run' = 'WhatIf'; dryrun = 'WhatIf'; whatif = 'WhatIf'; 'usage-hours' = 'UsageHours'; usage = 'Usage'; install = 'Install'; panel = 'Panel'; map = 'Panel'; continue = 'Continue'
             version = 'Version'; filter = '' }
-        $takesValue = 'Channel', 'Root', 'AddAccount', 'RemoveAccount', 'Tool', 'Top', 'UsageHours', 'Install'
+        $takesValue = 'Channel', 'Root', 'AddAccount', 'RemoveAccount', 'Tool', 'Top', 'UsageHours', 'Install', 'Ollama'
         $again = @{} + $PSBoundParameters
         $again.Remove('Filter')
         $rest = @()
@@ -6582,6 +6721,7 @@ function Resume-CcSessions {
             if ($AddAccount) { $inv += " -AddAccount '$AddAccount'" }
             if ($CopySettings) { $inv += ' -CopySettings' }
             if ($Local) { $inv += ' -Local' }
+            if ($Ollama) { $inv += " -Ollama '$($Ollama -replace "'", "''")'" }
             if ($RemoveAccount) { $inv += " -RemoveAccount '$RemoveAccount'" }
             if ($DisableAccounts) { $inv += ' -DisableAccounts' }
             if ($Root) { $inv += " -Root '$($Root -replace "'", "''")'" }
@@ -6613,14 +6753,15 @@ function Resume-CcSessions {
         if ($WhatIfPreference) {
             # The login flows are external processes, so -WhatIf must stop
             # here (the same notice the picker's account page prints).
-            $what = if ($AddAccount -and $Local) { "add the local $Tool account '$AddAccount' (Ollama on this PC only) in $(Expand-CcrPath (Get-CcrLocalDirSpec $AddAccount '<tool>'))" }
+            $what = if ($AddAccount -and $Ollama) { "add the local $Tool account '$AddAccount' (Ollama at $Ollama only) in $(Expand-CcrPath (Get-CcrLocalDirSpec $AddAccount '<tool>'))" }
+            elseif ($AddAccount -and $Local) { "add the local $Tool account '$AddAccount' (Ollama on this PC only) in $(Expand-CcrPath (Get-CcrLocalDirSpec $AddAccount '<tool>'))" }
             elseif ($AddAccount) { "add $Tool account '$AddAccount'$(if ($CopySettings) { ' (copying the default account settings)' })" }
             elseif ($RemoveAccount) { "remove $Tool account '$RemoveAccount'" } else { 'disable multi-account mode' }
             Write-Host "WhatIf: would $what." -ForegroundColor Yellow
             return
         }
         try {
-            if ($AddAccount -and $Local) { Add-CcrLocalAccount -Label $AddAccount -Tool $Tool }
+            if ($AddAccount -and ($Local -or $Ollama)) { Add-CcrLocalAccount -Label $AddAccount -Tool $Tool -Url $Ollama }
             elseif ($AddAccount) { Add-CcrAccount -Label $AddAccount -Tool $Tool -CopySettings:$CopySettings }
             elseif ($RemoveAccount) { Remove-CcrAccount -Label $RemoveAccount -Tool $Tool }
             else { Disable-CcrMultiAccount }
@@ -6648,8 +6789,8 @@ function Resume-CcSessions {
         }
         # Copies, not the same objects: the narrowed entry is shown as the
         # default of the listing, while the full lists keep the real default.
-        $claudeRoots = @($allClaudeRoots | Where-Object { $_.Label -eq $Root } | ForEach-Object { [pscustomobject]@{ Label = $_.Label; Path = $_.Path; Default = $true; Local = $_.Local } })
-        $codexRoots = @($allCodexRoots | Where-Object { $_.Label -eq $Root } | ForEach-Object { [pscustomobject]@{ Label = $_.Label; Path = $_.Path; Default = $true; Local = $_.Local } })
+        $claudeRoots = @($allClaudeRoots | Where-Object { $_.Label -eq $Root } | ForEach-Object { [pscustomobject]@{ Label = $_.Label; Path = $_.Path; Default = $true; Local = $_.Local; OllamaUrl = $_.OllamaUrl } })
+        $codexRoots = @($allCodexRoots | Where-Object { $_.Label -eq $Root } | ForEach-Object { [pscustomobject]@{ Label = $_.Label; Path = $_.Path; Default = $true; Local = $_.Local; OllamaUrl = $_.OllamaUrl } })
     }
 
     $sessions = [System.Collections.Generic.List[object]]::new()
@@ -6790,7 +6931,7 @@ function Resume-CcSessions {
             if (-not $bad -and -not $newModel) { $bad = "ccr: no model chosen for the local $newTool account '$($newRoot.Label)'" }
             if ($bad) { Write-Warning $bad; return }
             if (-not $WhatIfPreference) { Add-CcrLocalWaits $newTool $newRoot.Path }
-            $newArgs += @(Get-CcrLocalArgs $newTool $newRoot.Path $newModel)
+            $newArgs += @(Get-CcrLocalArgs $newTool $newRoot.Path $newModel $newRoot.OllamaUrl)
             $newVars = Get-CcrLocalEnv $newTool $newModel
             if (Test-CcrSyncedPath $dir) {
                 Write-Host "ccr: $dir is inside a synced folder - the files the agent writes there sync too (the conversation itself stays on this PC)." -ForegroundColor Yellow
@@ -6848,37 +6989,48 @@ function Resume-CcSessions {
         $lm = if ($s.PSObject.Properties['LaunchModel']) { "$($s.LaunchModel)" } else { '' }
         $le = if ($s.PSObject.Properties['LaunchEffort']) { "$($s.LaunchEffort)" } else { '' }
         $vars = $null
-        if ($s.PSObject.Properties['Local'] -and $s.Local) {
+        $isLocal = [bool]($s.PSObject.Properties['Local'] -and $s.Local)
+        $pool = if ($s.Tool -eq 'codex') { $allCodexRoots } else { $allClaudeRoots }
+        $rootPath = if ($s.PSObject.Properties['RootPath']) { $s.RootPath } else { $null }
+        # Account mode: a TargetRoot label different from the row's own account
+        # means "move this conversation there, then open it there" - between
+        # local accounts (Ollama), or between accounts that talk to a cloud,
+        # never from one kind to the other.
+        $moveTo = $null
+        $tgt = if ($s.PSObject.Properties['TargetRoot']) { "$($s.TargetRoot)" } else { '' }
+        if ($tgt -and $tgt -ne "$($s.Root)") {
+            $moveTo = @($pool | Where-Object { $_.Label -eq $tgt } | Select-Object -First 1)[0]
+            if ($moveTo -and [bool]$moveTo.Local -ne $isLocal) { Write-Warning "ccr: '$($s.Title)' - conversations never move between a local account (Ollama) and one that talks to a cloud; skipped"; continue }
+            if (-not $moveTo) { Write-Warning "ccr: no $($s.Tool) dir for account '$tgt' - '$($s.Title)' stays under '$($s.Root)'" }
+            elseif ($s.Running) { Write-Warning "ccr: '$($s.Title)' is running - close it before moving it to '$tgt'; skipped"; continue }
+            elseif ($s.RunningOn) { Write-Warning "ccr: '$($s.Title)' is open on $($s.RunningOn) - close it there before moving it to '$tgt'; skipped"; continue }
+            elseif (-not $isLocal -and (Get-CcrAccountMissing $s.Tool $moveTo)) { Write-Warning "$(Get-CcrAccountMissing $s.Tool $moveTo)   '$($s.Title)' skipped, not moved."; continue }
+            else { $rootPath = $moveTo.Path }
+        }
+        if ($isLocal) {
             # A local account (Ollama only): the model the conversation last
-            # ran with, unless Shift+Enter picked another; checked here.
+            # ran with, unless Shift+Enter picked another; checked here against
+            # the account it opens under - the one Tab moves it to, if any.
             if (-not $lm) { $lm = Get-CcrSessionModel $s }
-            $lroot = @(@(if ($s.Tool -eq 'codex') { $allCodexRoots } else { $allClaudeRoots }) | Where-Object { $_.Local -and $_.Label -eq $s.Root })[0]
+            $own = @($pool | Where-Object { $_.Local -and $_.Label -eq $s.Root })[0]
+            $lroot = if ($moveTo) { $moveTo } else { $own }
             $bad = if (-not $lroot) { "ccr: the local account '$($s.Root)' is no longer in ccr.json" }
             elseif (-not $lm) { "ccr: no model found in the transcript - Shift+Enter (or Ctrl+E) picks one" }
             else { Get-CcrLocalProblem $s.Tool $lroot $lm }
-            if ($bad) { Write-Warning "$bad   '$($s.Title)' skipped."; continue }
+            if ($bad) { Write-Warning "$bad   '$($s.Title)' skipped$(if ($moveTo) { ', not moved' })."; continue }
+            # Moving it where it travels further than before: from its next
+            # turn the whole conversation goes there, so ask first.
+            if ($moveTo -and $own -and (Get-CcrOllamaReachRank $moveTo.OllamaUrl) -gt (Get-CcrOllamaReachRank $own.OllamaUrl)) {
+                Write-Host "ccr: '$($s.Title)' moves from '$($own.Label)' (Ollama on $(Get-CcrOllamaPlace $own.OllamaUrl)) to '$($moveTo.Label)' (Ollama on $(Get-CcrOllamaPlace $moveTo.OllamaUrl)): from its next turn the whole conversation is sent to $($moveTo.OllamaUrl)." -ForegroundColor Yellow
+                if (-not $WhatIfPreference -and (Read-Host 'Move it? [y/N]') -notmatch '^\s*(y|yes)\s*$') { Write-Host "ccr: '$($s.Title)' not moved, not opened."; continue }
+            }
             if (-not $WhatIfPreference) { Add-CcrLocalWaits $s.Tool $lroot.Path }
-            $argv += @(Get-CcrLocalArgs $s.Tool $s.RootPath $lm)
+            $argv += @(Get-CcrLocalArgs $s.Tool $lroot.Path $lm $lroot.OllamaUrl)
             $vars = Get-CcrLocalEnv $s.Tool $lm
         }
         else { $argv += @(Get-CcrOverrideArgs $s.Tool $lm $le) }
         $cmd = Join-CcrArgv $argv 'pwsh'
         $cmdSh = Join-CcrArgv $argv 'sh'
-        $rootPath = if ($s.PSObject.Properties['RootPath']) { $s.RootPath } else { $null }
-        # Account mode: a TargetRoot label different from the row's own account
-        # means "move this conversation there, then open it there".
-        $moveTo = $null
-        $tgt = if ($s.PSObject.Properties['TargetRoot']) { "$($s.TargetRoot)" } else { '' }
-        if ($tgt -and $tgt -ne "$($s.Root)") {
-            $pool = if ($s.Tool -eq 'codex') { $allCodexRoots } else { $allClaudeRoots }
-            $moveTo = @($pool | Where-Object { $_.Label -eq $tgt } | Select-Object -First 1)[0]
-            if ($s.Local -or ($moveTo -and $moveTo.Local)) { Write-Warning "ccr: '$($s.Title)' - a local account's conversations never move between accounts; skipped"; continue }
-            if (-not $moveTo) { Write-Warning "ccr: no $($s.Tool) dir for account '$tgt' - '$($s.Title)' stays under '$($s.Root)'" }
-            elseif ($s.Running) { Write-Warning "ccr: '$($s.Title)' is running - close it before moving it to '$tgt'; skipped"; continue }
-            elseif ($s.RunningOn) { Write-Warning "ccr: '$($s.Title)' is open on $($s.RunningOn) - close it there before moving it to '$tgt'; skipped"; continue }
-            elseif (Get-CcrAccountMissing $s.Tool $moveTo) { Write-Warning "$(Get-CcrAccountMissing $s.Tool $moveTo)   '$($s.Title)' skipped, not moved."; continue }
-            else { $rootPath = $moveTo.Path }
-        }
         $launch.Add([pscustomobject]@{ Tool = $s.Tool; Title = $s.Title; Cwd = $cwd; Command = $cmd; CommandSh = $cmdSh; Argv = $argv; RootPath = $rootPath; Session = $s; MoveTo = $moveTo; Vars = $vars })
     }
     if ($launch.Count -eq 0) { Write-Warning 'ccr: nothing to open.'; return }

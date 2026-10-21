@@ -38,7 +38,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.91"
+VERSION = "0.92"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -304,12 +304,13 @@ class Session:
 # ----------------------------------------------------------------------------
 class Root:
     """One configured data dir of a tool: label ('' = the single default),
-    absolute path, whether it is the default account, and whether it is a
-    local account (Ollama on this PC only)."""
-    __slots__ = ("label", "path", "default", "local")
+    absolute path, whether it is the default account, whether it is a
+    local account (Ollama only) and, for one, the Ollama it talks to."""
+    __slots__ = ("label", "path", "default", "local", "ollama_url")
 
-    def __init__(self, label: str, path: str, default: bool, local: bool = False):
+    def __init__(self, label: str, path: str, default: bool, local: bool = False, ollama_url: str = ""):
         self.label, self.path, self.default, self.local = label, path, default, local
+        self.ollama_url = ollama_url
 
 
 def acct_label(label: str, is_default: bool) -> str:
@@ -369,7 +370,10 @@ def get_roots(tool: str) -> list:
         "defaultRoot": "default" }
     "~" and $VAR expand; a missing dir is kept (it may exist on another PC).
     The local accounts (Ollama only, see LOCAL ACCOUNTS) follow, with local
-    = True; one with the label of an ordinary account of the tool is left out."""
+    = True and the Ollama they talk to in ollama_url: this computer's for
+    claudeLocalRoots / codexLocalRoots, another computer's for
+    claudeOllamaRoots / codexOllamaRoots. One with the label of an account
+    already listed for the tool is left out."""
     roots = [Root("", tool_default_root(tool), True)]
     cfg = load_config() or {}
     m = cfg.get(tool + "Roots")
@@ -381,7 +385,12 @@ def get_roots(tool: str) -> list:
     loc = cfg.get(tool + "LocalRoots")
     if isinstance(loc, dict):
         taken = {r.label for r in roots}
-        roots += [Root(k, expand_path(str(v)), False, True) for k, v in loc.items() if k not in taken]
+        roots += [Root(k, expand_path(str(v)), False, True, OLLAMA_URL) for k, v in loc.items() if k not in taken]
+    rem = cfg.get(tool + "OllamaRoots")
+    if isinstance(rem, dict):
+        taken = {r.label for r in roots}
+        roots += [Root(k, expand_path(str(v["dir"])), False, True, str(v["url"]).rstrip("/"))
+                  for k, v in rem.items() if k not in taken and isinstance(v, dict) and v.get("dir") and v.get("url")]
     return roots
 
 
@@ -413,18 +422,71 @@ def tool_env(tool: str, path: str) -> dict:
 # Ollama answers here, that its cloud is off (a model picked inside the
 # session could otherwise reach ollama.com), that the dir still points at
 # Ollama, and that the model is installed and not a cloud one. A local
-# account never takes part in Tab's account cycling, a MAP, copied settings
-# or the usage limits, and removing it moves nothing. Same as
-# Resume-CcSessions.ps1, where it was verified with claude 2.1.306, codex
-# 0.160 and Ollama 0.40.7: the only TCP endpoint either tool opened, in its
-# own UI too, was 127.0.0.1:11434.
+# account never takes part in a MAP, copied settings or the usage limits,
+# and removing it moves nothing. Same as Resume-CcSessions.ps1, where it was
+# verified with claude 2.1.306, codex 0.160 and Ollama 0.40.7: the only TCP
+# endpoint either tool opened, in its own UI too, was 127.0.0.1:11434.
+# v0.92: the Ollama can also be another computer's (a GPU box on the home
+# network), listed under claudeOllamaRoots / codexOllamaRoots with the dir
+# (still on this computer) and the address:
+#   "claudeOllamaRoots": { "albus": { "dir": "~/.local/share/ccr-local/albus/claude",
+#                                     "url": "http://192.168.0.40:11434" } }
+# Keys of their own again: v0.88-0.91 read claudeLocalRoots as label -> dir
+# and would take such an account for one of this computer's. The same checks
+# run against that address. Ctrl-O moves a conversation between the local
+# accounts of its tool (never to or from an account that talks to a cloud),
+# asking first when it would go further than before (ollama_reach).
 OLLAMA_URL = "http://127.0.0.1:11434"
 OLLAMA_PROVIDER = "ccr-ollama"
+
+
+def ollama_reach_rank(url: str) -> int:
+    """How far a local account's conversations travel, from its Ollama
+    address: 0 = this computer (loopback), 1 = the local network (a private
+    address, or a .local / .lan / one-word name), 2 = the internet."""
+    try:
+        h = urllib.parse.urlsplit(url).hostname or ""
+    except Exception:
+        h = ""
+    if re.match(r"^(localhost|127\.\d+\.\d+\.\d+|::1)$", h):
+        return 0
+    if (re.match(r"^(10\.\d+|192\.168|172\.(1[6-9]|2\d|3[01])|169\.254)\.", h)
+            or re.search(r"\.(local|lan|home\.arpa)$", h) or "." not in h):
+        return 1
+    return 2
+
+
+def ollama_reach(url: str) -> str:
+    return ("this computer", "LAN", "internet")[ollama_reach_rank(url)]
+
+
+def ollama_place(url: str) -> str:
+    """Where a local account's Ollama is, for the account table and
+    messages: "this computer", or "192.168.0.40 (LAN)"."""
+    if ollama_reach_rank(url) == 0:
+        return "this computer"
+    try:
+        h = urllib.parse.urlsplit(url).hostname or url
+    except Exception:
+        h = url
+    return f"{h} ({ollama_reach(url)})"
+
+
+def local_fix(tool: str, root) -> str:
+    """The command that sets a local account up again (its fix)."""
+    u = getattr(root, "ollama_url", "") or ""
+    if u and u != OLLAMA_URL:
+        return f"ccr --add-account {root.label} --tool {tool} --ollama {u}"
+    return f"ccr --add-account {root.label} --tool {tool} --local"
 LOCAL_CLAUDE_ENV = {
     "ANTHROPIC_BASE_URL": OLLAMA_URL, "ANTHROPIC_AUTH_TOKEN": "ollama", "ANTHROPIC_API_KEY": "",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1", "DISABLE_AUTOUPDATER": "1", "ENABLE_CLAUDEAI_MCP_SERVERS": "false",
     "DISABLE_ERROR_REPORTING": "1", "DISABLE_FEEDBACK_COMMAND": "1", "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
     "CLAUDE_CODE_AUTO_MODE_SERVER": "0", "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
+    # Not covered by the variable above: at the first interactive start in a
+    # new dir claude registers the official plugin marketplace - a clone from
+    # github.com (https and ssh) plus downloads.claude.ai (seen v0.92).
+    "CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL": "1",
 }
 # A local model can stay silent for many minutes: Ollama streams nothing while
 # it reads the whole conversation again (after unloading the model, or a cache
@@ -437,8 +499,13 @@ LOCAL_CLAUDE_ENV = {
 LOCAL_CLAUDE_WAIT_ENV = {"API_FORCE_IDLE_TIMEOUT": "0", "CLAUDE_STREAM_IDLE_TIMEOUT_MS": "1800000",
                          "API_TIMEOUT_MS": "1800000"}
 LOCAL_CODEX_IDLE_MS = 1800000
-LOCAL_CODEX_TOML = f"""# ccr local account: everything goes to the Ollama server of this computer.
-# Written by ccr (--add-account --local), checked before every start.
+
+
+def local_codex_toml(url: str = OLLAMA_URL) -> str:
+    """A local account's config.toml, for the Ollama at url."""
+    here = url == OLLAMA_URL
+    return f"""# ccr local account: everything goes to the Ollama server of {"this computer" if here else url}.
+# Written by ccr (--add-account --local / --ollama), checked before every start.
 model_provider = "{OLLAMA_PROVIDER}"
 check_for_update_on_startup = false
 web_search = "disabled"
@@ -464,8 +531,8 @@ metrics_exporter = "none"
 show_tooltips = false
 
 [model_providers.{OLLAMA_PROVIDER}]
-name = "Ollama (this PC)"
-base_url = "{OLLAMA_URL}/v1"
+name = "Ollama ({"this PC" if here else url})"
+base_url = "{url}/v1"
 wire_api = "responses"
 # Ollama may stay silent for minutes while it reads a long conversation.
 stream_idle_timeout_ms = {LOCAL_CODEX_IDLE_MS}
@@ -510,9 +577,10 @@ def cloud_model(m) -> bool:
     return not isinstance(m, str) and bool(m.get("remote_host") or m.get("remote_model"))
 
 
-def _ollama(path: str, body=None, timeout: float = 3):
-    """One request to this computer's Ollama, never through a proxy."""
-    req = urllib.request.Request(OLLAMA_URL + path, data=None if body is None else json.dumps(body).encode(),
+def _ollama(path: str, body=None, timeout: float = 3, url: str = OLLAMA_URL):
+    """One request to an Ollama (this computer's unless url), never through
+    a proxy."""
+    req = urllib.request.Request(url + path, data=None if body is None else json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
     with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8") or "{}")
@@ -540,12 +608,30 @@ def _no_cloud_var() -> bool:
     return any(v in ("1", "true") for v in vals)
 
 
-def ollama_cloud_problem() -> str:
+def ollama_cloud_problem(url: str = OLLAMA_URL) -> str:
     """'' when Ollama's cloud is off on this computer, else why not and the
     fix. The settings first: while they allow the cloud, nothing is sent.
     Then the running server must refuse a cloud model on its own (403
     "ollama cloud is disabled", answered locally), which catches a setting
-    made after Ollama started."""
+    made after Ollama started. Another computer's Ollama: only that answer
+    can be asked for (its settings are not readable from here; while its
+    cloud is on, the made-up name ccr-check reaches ollama.com)."""
+    if url != OLLAMA_URL:
+        fix = ('on that computer set OLLAMA_NO_CLOUD=1 or "disable_ollama_cloud": true in ~/.ollama/server.json, '
+               "then restart Ollama there")
+        try:
+            _ollama("/api/show", {"model": "ccr-check:cloud"}, 8, url)
+            return f"Ollama's cloud is on at {url}, so a model picked inside the session could reach ollama.com - {fix}."
+        except urllib.error.HTTPError as e:
+            try:
+                body = e.read().decode("utf-8", "replace")
+            except Exception:
+                body = ""
+            if "cloud is disabled" in body:
+                return ""
+        except Exception:
+            pass
+        return f"Ollama at {url} did not confirm that its cloud is off - {fix}."
     off = False
     try:
         sj = HOME / ".ollama" / "server.json"
@@ -575,30 +661,30 @@ def ollama_cloud_problem() -> str:
         return f"the running Ollama did not confirm that its cloud is off ({e}) - restart Ollama."
 
 
-_OLLAMA_STATE = None
+_OLLAMA_STATES = {}
 
 
-def ollama_state(refresh: bool = False) -> dict:
-    """What this computer's Ollama says, asked once per run: answers, models
-    (installed, cloud ones left out, by name) and cloud ('' = off, else why not)."""
-    global _OLLAMA_STATE
-    if _OLLAMA_STATE is not None and not refresh:
-        return _OLLAMA_STATE
+def ollama_state(refresh: bool = False, url: str = OLLAMA_URL) -> dict:
+    """What an Ollama says (this computer's unless url), asked once per run
+    and address: answers, models (installed, cloud ones left out, by name)
+    and cloud ('' = off, else why not)."""
+    if url in _OLLAMA_STATES and not refresh:
+        return _OLLAMA_STATES[url]
     st = {"answers": False, "models": [], "cloud": ""}
     try:
-        tags = _ollama("/api/tags")
+        tags = _ollama("/api/tags", timeout=3 if url == OLLAMA_URL else 5, url=url)
         st["answers"] = True
         st["models"] = sorted(str(m.get("name")) for m in tags.get("models") or [] if m and not cloud_model(m))
-        st["cloud"] = ollama_cloud_problem()
+        st["cloud"] = ollama_cloud_problem(url)
     except Exception:
         pass
-    _OLLAMA_STATE = st
+    _OLLAMA_STATES[url] = st
     return st
 
 
-def local_pin_problem(tool: str, d: str) -> str:
-    """'' when a local account's dir still sends everything to this
-    computer's Ollama."""
+def local_pin_problem(tool: str, d: str, url: str = OLLAMA_URL) -> str:
+    """'' when a local account's dir still sends everything to its Ollama
+    (url, this computer's unless given)."""
     if synced_path(d):
         return f"its dir {d} is inside a synced folder"
     if tool == "claude":
@@ -607,7 +693,7 @@ def local_pin_problem(tool: str, d: str) -> str:
             e = sj.get("env") or {}
         except Exception:
             return f"no readable settings.json in {d}"
-        if (str(e.get("ANTHROPIC_BASE_URL")) != OLLAMA_URL or str(e.get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC")) != "1"
+        if (str(e.get("ANTHROPIC_BASE_URL")) != url or str(e.get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC")) != "1"
                 or str(e.get("DISABLE_AUTOUPDATER")) != "1" or sj.get("skipWebFetchPreflight") is not True):
             return f"settings.json in {d} no longer keeps claude on Ollama only"
         return ""
@@ -617,7 +703,7 @@ def local_pin_problem(tool: str, d: str) -> str:
         t = ""
     prov = re.escape(OLLAMA_PROVIDER)
     if (not re.search(rf'(?m)^\s*model_provider\s*=\s*"{prov}"', t)
-            or not re.search(rf'(?ms)^\[model_providers\.{prov}\][^\[]*?^\s*base_url\s*=\s*"{re.escape(OLLAMA_URL)}/v1/?"', t)
+            or not re.search(rf'(?ms)^\[model_providers\.{prov}\][^\[]*?^\s*base_url\s*=\s*"{re.escape(url)}/v1/?"', t)
             or not re.search(r'(?ms)^\[otel\][^\[]*?^\s*metrics_exporter\s*=\s*"none"', t)
             or not re.search(r'(?ms)^\[analytics\][^\[]*?^\s*enabled\s*=\s*false', t)):
         return f"config.toml in {d} no longer keeps codex on Ollama only"
@@ -626,13 +712,15 @@ def local_pin_problem(tool: str, d: str) -> str:
 
 def add_local_waits(tool: str, d: str):
     """Add the long waits above to a local account's files where they are
-    missing."""
+    missing, and in claude's env any key a newer ccr pins (an account made
+    by an older one lacks it). A value already there is never changed."""
     if tool == "claude":
         sj = Path(d) / "settings.json"
         cfg = json.loads(sj.read_text(encoding="utf-8"))
-        miss = [k for k in LOCAL_CLAUDE_WAIT_ENV if k not in cfg["env"]]
+        want = {**LOCAL_CLAUDE_ENV, **LOCAL_CLAUDE_WAIT_ENV}
+        miss = [k for k in want if k not in cfg["env"]]
         if miss:
-            cfg["env"].update({k: LOCAL_CLAUDE_WAIT_ENV[k] for k in miss})
+            cfg["env"].update({k: want[k] for k in miss})
             sj.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
         return
     ct = Path(d) / "config.toml"
@@ -645,12 +733,13 @@ def add_local_waits(tool: str, d: str):
     ct.write_text(t, encoding="utf-8")
 
 
-def set_local_pin(tool: str, d: str):
+def set_local_pin(tool: str, d: str, url: str = OLLAMA_URL):
     """Point a local account's dir at Ollama: claude's settings.json gets the
     env block and the denies merged in (other keys kept); codex's config.toml
     is written whole, the previous one kept as config.toml.bak-<date> when it
     did not point at Ollama. Plus the long waits where missing, and claude's
-    first-start flag."""
+    first-start flag. url: the Ollama it talks to (this computer's unless
+    given)."""
     Path(d).mkdir(parents=True, exist_ok=True)
     if tool == "claude":
         sj = Path(d) / "settings.json"
@@ -658,6 +747,7 @@ def set_local_pin(tool: str, d: str):
         cfg = cfg if isinstance(cfg, dict) else {}
         env = cfg.get("env") if isinstance(cfg.get("env"), dict) else {}
         env.update(LOCAL_CLAUDE_ENV)
+        env["ANTHROPIC_BASE_URL"] = url
         cfg["env"] = env
         # WebFetch downloads the page from this computer and the local model
         # reads it, but without skipWebFetchPreflight claude first sends the
@@ -677,41 +767,47 @@ def set_local_pin(tool: str, d: str):
             cj.write_text(json.dumps({"hasCompletedOnboarding": True}, indent=2) + "\n", encoding="utf-8")
     else:
         ct = Path(d) / "config.toml"
-        if ct.is_file() and local_pin_problem("codex", d):
+        if ct.is_file() and local_pin_problem("codex", d, url):
             shutil.copy2(ct, f"{ct}.bak-{datetime.now().strftime('%Y-%m-%d-%H%M%S')}")
-        if not ct.is_file() or local_pin_problem("codex", d):
-            ct.write_text(LOCAL_CODEX_TOML, encoding="utf-8")
+        if not ct.is_file() or local_pin_problem("codex", d, url):
+            ct.write_text(local_codex_toml(url), encoding="utf-8")
     add_local_waits(tool, d)
 
 
 def local_problem(tool: str, root, model: str) -> str:
     """'' when a conversation of a local account may start now with this
     model, else the reason and the fix. model '' checks all but the model."""
-    fix = f"ccr --add-account {root.label} --tool {tool} --local"
+    fix = local_fix(tool, root)
+    url = getattr(root, "ollama_url", "") or OLLAMA_URL
+    here = url == OLLAMA_URL
     if synced_path(root.path):
         return (f"ccr: the local {tool} account '{root.label}' has its dir in a synced folder ({root.path}) - a local "
                 f"account's dir must stay on this computer: change it in {CONFIG_PATH}")
     if not os.path.isdir(root.path):
         return f"ccr: the local {tool} account '{root.label}' is not on this computer - {root.path} does not exist. Fix: {fix}"
-    pin = local_pin_problem(tool, root.path)
+    pin = local_pin_problem(tool, root.path, url)
     if pin:
         return f"ccr: local {tool} account '{root.label}': {pin}. Fix: {fix} (points it at Ollama again)"
-    st = ollama_state()
+    st = ollama_state(url=url)
     if not st["answers"]:
-        return f"ccr: Ollama does not answer on {OLLAMA_URL} - start Ollama, then try again."
+        if here:
+            return f"ccr: Ollama does not answer on {url} - start Ollama, then try again."
+        return (f"ccr: Ollama does not answer on {url} ('{root.label}') - is that computer on, with Ollama "
+                "running, and on this network?")
     if st["cloud"]:
         return f"ccr: {st['cloud']}"
     if not model:
         return ""
+    where = "this computer's Ollama" if here else f"the Ollama of '{root.label}' ({url})"
     if cloud_model(model):
-        return f"ccr: '{model}' is an Ollama cloud model - a local account only runs models on this computer."
+        return f"ccr: '{model}' is an Ollama cloud model - a local account only runs models on its own Ollama."
     if model not in st["models"]:
-        return (f"ccr: the model '{model}' is not installed in this computer's Ollama - ollama pull {model}, "
+        return (f"ccr: the model '{model}' is not installed in {where} - ollama pull {model} there, "
                 "or Ctrl-E picks another one.")
     return ""
 
 
-def local_args(tool: str, root_path: str, model: str) -> list:
+def local_args(tool: str, root_path: str, model: str, url: str = OLLAMA_URL) -> list:
     """A local account's tool starts with these flags. Claude: the account's
     settings.json again as --settings (above a project's own settings), and
     the model. Codex: Ollama as provider on the command line (above any
@@ -719,7 +815,7 @@ def local_args(tool: str, root_path: str, model: str) -> list:
     if tool == "claude":
         return ["--settings", str(Path(root_path) / "settings.json"), "--model", model]
     p = OLLAMA_PROVIDER
-    return ["-m", model, "-c", f"model_provider={p}", "-c", f"model_providers.{p}.base_url={OLLAMA_URL}/v1",
+    return ["-m", model, "-c", f"model_provider={p}", "-c", f"model_providers.{p}.base_url={url}/v1",
             "-c", "web_search=disabled", "--disable", "plugins", "--disable", "apps"]
 
 
@@ -769,42 +865,80 @@ def set_local_last_model(tool: str, label: str, model: str, dry: bool = False):
         set_channel_state("localModels", **{f"{tool}|{label}": model})
 
 
-def add_local_account(label: str, tool: str = "all"):
+OLLAMA_URL_RE = re.compile(r"^https?://[^/\s]+$")
+
+
+def add_local_account(label: str, tool: str = "all", url: str = ""):
     """Register a local account (Ollama only) for one tool or both: a dir per
     machine outside any synced folder (local_dir_spec), pointed at Ollama,
     recorded under claudeLocalRoots / codexLocalRoots. No login. Run again on
-    a known label it creates the dir here, or points it at Ollama again."""
+    a known label it creates the dir here, or points it at Ollama again.
+    url: the Ollama of another computer (http://192.168.0.40:11434),
+    recorded under claudeOllamaRoots / codexOllamaRoots with the dir; given
+    again on a known label it changes the address, left out it keeps the one
+    recorded."""
     if not LABEL_RE.match(label):
         raise RuntimeError(f"ccr: account label must be {LABEL_HINT} (got '{label}')")
     if label == DEFAULT_LABEL:
         raise RuntimeError(f"ccr: '{label}' is the label of the dirs in use today - pick another one")
+    url = (url or "").strip().rstrip("/")
+    if url and not OLLAMA_URL_RE.match(url):
+        raise RuntimeError(f"ccr: an Ollama address looks like http://192.168.0.40:11434 (got '{url}')")
+    if url == OLLAMA_URL:
+        url = ""   # this computer's: a plain local account
     tools = ("claude", "codex") if tool == "all" else (tool,)
     for t in tools:
         if any(r.label == label and not r.local for r in get_roots(t)):
             raise RuntimeError(f"ccr: '{label}' is already an ordinary {t} account - pick another label")
     cfg = enable_multi_account()
+    urls = []
     for t in tools:
-        m = cfg.get(t + "LocalRoots") if isinstance(cfg.get(t + "LocalRoots"), dict) else {}
-        cfg[t + "LocalRoots"] = m
-        known = label in m
-        spec = str(m[label]) if known else local_dir_spec(label, t)
+        lm = cfg.get(t + "LocalRoots") if isinstance(cfg.get(t + "LocalRoots"), dict) else {}
+        om = cfg.get(t + "OllamaRoots") if isinstance(cfg.get(t + "OllamaRoots"), dict) else {}
+        in_local, in_ollama = label in lm, isinstance(om.get(label), dict)
+        if url and in_local:
+            raise RuntimeError(f"ccr: '{label}' is a local {t} account on this computer's Ollama - pick another "
+                               f"label for {url}")
+        u = url or (str(om[label].get("url") or "").rstrip("/") if in_ollama else "")
+        if not u:
+            cfg[t + "LocalRoots"] = lm
+            spec = str(lm[label]) if in_local else local_dir_spec(label, t)
+            d = expand_path(spec)
+            if synced_path(d):
+                raise RuntimeError(f"ccr: {d} is inside a synced folder - a local account's dir must stay on this computer")
+            set_local_pin(t, d)
+            if not in_local:
+                lm[label] = spec
+                save_config(cfg)
+            urls.append(OLLAMA_URL)
+            print(f"{GREEN}ccr: local {t} account '{label}' -> {d}  - Ollama on this computer only, no login{RESET}")
+            continue
+        spec = str(om[label].get("dir") or "") if in_ollama else ""
+        spec = spec or local_dir_spec(label, t)
         d = expand_path(spec)
         if synced_path(d):
             raise RuntimeError(f"ccr: {d} is inside a synced folder - a local account's dir must stay on this computer")
-        set_local_pin(t, d)
-        if not known:
-            m[label] = spec
+        set_local_pin(t, d, u)
+        if not in_ollama or str(om[label].get("url") or "").rstrip("/") != u:
+            om[label] = {"dir": spec, "url": u}
+            cfg[t + "OllamaRoots"] = om
             save_config(cfg)
-        print(f"{GREEN}ccr: local {t} account '{label}' -> {d}  - Ollama on this computer only, no login{RESET}")
-    st = ollama_state(refresh=True)
-    if not st["answers"]:
-        print(f"ccr: Ollama does not answer on {OLLAMA_URL} yet - start it before using the account.", file=sys.stderr)
-    elif st["cloud"]:
-        print(f"ccr: {st['cloud']}", file=sys.stderr)
-    elif not st["models"]:
-        print("ccr: Ollama has no local model yet - ollama pull <model>", file=sys.stderr)
-    else:
-        print(f"ccr: models it can use: {', '.join(st['models'])}")
+        urls.append(u)
+        print(f"{GREEN}ccr: local {t} account '{label}' -> {d}  - Ollama at {ollama_place(u)}, no login{RESET}")
+        if ollama_reach_rank(u) >= 2:
+            print(f"{YELLOW}ccr: {u} is not on this computer or its local network - the conversations of "
+                  f"'{label}' will travel over the internet.{RESET}", file=sys.stderr)
+    for u in dict.fromkeys(urls):
+        st = ollama_state(refresh=True, url=u)
+        at = "" if u == OLLAMA_URL else f" at {u}"
+        if not st["answers"]:
+            print(f"ccr: Ollama does not answer on {u} yet - start it before using the account.", file=sys.stderr)
+        elif st["cloud"]:
+            print(f"ccr: {st['cloud']}", file=sys.stderr)
+        elif not st["models"]:
+            print(f"ccr: Ollama{at} has no local model yet - ollama pull <model>", file=sys.stderr)
+        else:
+            print(f"ccr: models it can use{at}: {', '.join(st['models'])}")
 
 
 def login_identity(tool: str, path: str) -> str:
@@ -871,8 +1005,9 @@ def who_at(tool: str, path: str) -> str:
         return q
     if not os.path.isdir(path):
         return "not on this PC"
-    if any(r.local and r.path == path for r in get_roots(tool)):
-        return "Ollama on this computer (local)"
+    lr = next((r for r in get_roots(tool) if r.local and r.path == path), None)
+    if lr:
+        return f"Ollama on {ollama_place(lr.ollama_url)} (local)"
     return "not logged in"
 
 
@@ -1080,7 +1215,9 @@ def remove_account(label: str, tool: str = "all"):
         src = [r for r in get_roots(t) if r.local and r.label == label]
         if not src:
             continue
-        cfg[t + "LocalRoots"].pop(label, None)
+        for key in (t + "LocalRoots", t + "OllamaRoots"):
+            if isinstance(cfg.get(key), dict):
+                cfg[key].pop(label, None)
         forgot = True
         print(f"ccr: local {t} account '{label}' removed from ccr.json - its conversations stay in "
               f"{fmt_cwd(src[0].path, 50)} and moved nowhere.")
@@ -1144,7 +1281,7 @@ def disable_multi_account():
     else:
         CONFIG_PATH.unlink(missing_ok=True)
     print(f"{GREEN}ccr: multi-account mode is off - claude and codex are back to their single default dirs.{RESET}")
-    if "claudeLocalRoots" in cfg or "codexLocalRoots" in cfg:
+    if any(k in cfg for k in ("claudeLocalRoots", "codexLocalRoots", "claudeOllamaRoots", "codexOllamaRoots")):
         print("ccr: the local accounts (Ollama) stay; ccr --remove-account <label> forgets one.")
 
 
@@ -1173,10 +1310,11 @@ def move_session_to_root(s: Session, target: Root) -> str:
     """Re-home a conversation: move its files into another account's data
     dir. Transcripts are not account-bound and both tools resume a moved
     file (a codex home indexes it on first resume). Returns the new path.
-    Local accounts (Ollama only) neither give nor take conversations."""
-    if s.local or getattr(target, "local", False):
-        raise RuntimeError(f"ccr: a local account's conversations never move between accounts "
-                           f"('{s.root}' -> '{target.label}')")
+    Local accounts (Ollama only) give and take conversations among
+    themselves only, never to or from an account that talks to a cloud."""
+    if bool(s.local) != bool(getattr(target, "local", False)):
+        raise RuntimeError(f"ccr: conversations never move between a local account (Ollama) and one that talks "
+                           f"to a cloud ('{s.root}' -> '{target.label}')")
     src = Path(s.source)
     if s.tool == "claude":
         dst_dir = Path(target.path) / "projects" / src.parent.name
@@ -1847,12 +1985,12 @@ class TabMarks:
         meta, tg = {}, {}
         for i, s in index.items():
             own = s.root or "*"
-            # A local account (Ollama only) gives and takes no conversation:
-            # its rows cycle through their own account only, and no other
-            # row goes there.
+            # A local account (Ollama only) gives and takes conversations
+            # among the local accounts only: a row cycles through the
+            # accounts of its own kind.
             cycle = [own] + ([r.label for _, t, r in ctx.entries
-                              if t == s.tool and r.label and r.label != s.root and not r.local]
-                             if ctx.multi_root and not s.local else [])
+                              if t == s.tool and r.label and r.label != s.root and bool(r.local) == bool(s.local)]
+                             if ctx.multi_root else [])
             marks = {l: (f"{GREEN}●{RESET}" if l == own else
                          next((f"{TOOL_COLOR[s.tool]}{BOLD}{n}{RESET}" for n, t, r in ctx.entries
                                if t == s.tool and r.label == l), "?"))
@@ -1972,8 +2110,8 @@ class Ctx:
                 sys.exit(f"ccr: no account '{root_filter}' in {CONFIG_PATH} (known: {', '.join(known)})")
             # Copies, not the same objects: the narrowed entry is shown as
             # the default of the listing, the full lists keep the real one.
-            self.claude = [Root(r.label, r.path, True, r.local) for r in self.all_claude if r.label == root_filter]
-            self.codex = [Root(r.label, r.path, True, r.local) for r in self.all_codex if r.label == root_filter]
+            self.claude = [Root(r.label, r.path, True, r.local, r.ollama_url) for r in self.all_claude if r.label == root_filter]
+            self.codex = [Root(r.label, r.path, True, r.local, r.ollama_url) for r in self.all_codex if r.label == root_filter]
         # Account mode = multi-account is on (several dirs listed for a tool).
         self.multi_root = len(self.claude) > 1 or len(self.codex) > 1
         self.def_label = {"claude": next((r.label for r in self.claude if r.default), ""),
@@ -2498,8 +2636,9 @@ def picker_guide(ctx, lim=None, width: int = 0) -> list:
         ("The table on top", [
             ("one line per account", "its folder, who is logged in there and its usage limits: 5h and week used, "
                                      "the reset after →; yellow from 70%, red from 90%"),
-            ("a local account", "Ollama on this computer only (ccr --add-account <label> --local): never the cloud, "
-                                "no limits, not in Tab's cycling or a MAP"),
+            ("a local account", "Ollama only, on this computer (ccr --add-account <label> --local) or another one "
+                                "(--ollama <address>): never the cloud, no limits, not in a MAP; Tab moves its "
+                                "conversations only to another local account"),
         ]),
     ]
     key_w = 26
@@ -2590,12 +2729,22 @@ def read_new_account(ctx: Ctx, dry: bool):
         # Options for the new dir: a local account (Ollama on this computer
         # only, no login); else the default account's settings, offered when
         # it has some to copy (claude: status line, codex: config.toml).
-        ans = ask(f"  Local: Ollama on this computer only? {DIM}(no login; never Anthropic, OpenAI or a synced "
-                  f"folder){RESET}  y: yes  {GREEN}[N]{RESET} no  Esc: back > ")
+        ans = ask(f"  Local: Ollama only, on this computer or another computer of yours? {DIM}(no login; never "
+                  f"Anthropic, OpenAI or a synced folder){RESET}  y: yes  {GREEN}[N]{RESET} no  Esc: back > ")
         if ans is None:
             return None
         if ans.strip().lower() in ("y", "yes"):
-            return {"action": "add-local", "tool": tool, "label": label}
+            # Which Ollama: this computer's, or another computer's on the network.
+            while True:
+                url = ask(f"  Ollama address {DIM}(Enter = this computer's Ollama; another computer: e.g. "
+                          f"http://192.168.0.40:11434){RESET} > ")
+                if url is None:
+                    return None
+                url = url.strip().rstrip("/")
+                if url and not OLLAMA_URL_RE.match(url):
+                    print(f"{YELLOW}ccr: an Ollama address looks like http://192.168.0.40:11434 (got '{url}'){RESET}")
+                    continue
+                return {"action": "add-local", "tool": tool, "label": label, "url": url}
         copy = False
         def_root = next((r for r in ctx.roots(tool, all_=True) if r.default), None)
         def_path = def_root.path if def_root else tool_default_root(tool)
@@ -2686,9 +2835,9 @@ def account_page(ctx: Ctx, dry: bool):
             return None
         if r.local:
             print(f"\n{BOLD}Remove local account{RESET}\n")
-            print(f"    {t} · {BOLD}{r.label}{RESET}  {fmt_cwd(r.path, 60)}  (Ollama on this computer)\n")
+            print(f"    {t} · {BOLD}{r.label}{RESET}  {fmt_cwd(r.path, 60)}  (Ollama on {ollama_place(r.ollama_url)})\n")
             print("  ccr forgets it. Its conversations move nowhere: they stay in its dir, where")
-            print(f"  ccr --add-account {r.label} --tool {t} --local finds them again.\n")
+            print(f"  {local_fix(t, r)} finds them again.\n")
             ans = ask(f"  {RED}[y]{RESET} remove    {DIM}anything else: cancel{RESET} > ")
             return {"action": "remove", "tool": t, "label": r.label} if ans and ans.strip().lower() == "y" else None
         print(f"\n{BOLD}Remove account{RESET}\n")
@@ -2703,9 +2852,9 @@ def account_page(ctx: Ctx, dry: bool):
             # A local account has no login: Ctrl-L sets its dir up here,
             # pointed at Ollama.
             print(f"\n{BOLD}Set up on this computer{RESET}\n")
-            print(f"    {t} · {BOLD}{r.label}{RESET}  {fmt_cwd(r.path, 60)}  (Ollama on this computer)\n")
+            print(f"    {t} · {BOLD}{r.label}{RESET}  {fmt_cwd(r.path, 60)}  (Ollama on {ollama_place(r.ollama_url)})\n")
             print("  A local account has no login. ccr creates its dir if needed and points it at")
-            print(f"  this computer's Ollama again (the same as ccr --add-account {r.label} --tool {t} --local).\n")
+            print(f"  its Ollama again (the same as {local_fix(t, r)}).\n")
             ans = ask(f"  {GREEN}[y]{RESET} set up    {DIM}anything else: cancel{RESET} > ")
             return {"action": "add-local", "tool": t, "label": r.label} if ans and ans.strip().lower() == "y" else None
         # Log in on this PC: an account added elsewhere (synced ccr.json)
@@ -2764,7 +2913,7 @@ def run_account_action(act: dict, dry: bool):
         elif act["action"] == "login":
             add_account(act["label"], act["tool"], False)
         elif act["action"] == "add-local":
-            add_local_account(act["label"], act["tool"])
+            add_local_account(act["label"], act["tool"], act.get("url") or "")
         elif act["action"] == "remove":
             remove_account(act["label"], act["tool"])
         elif act["action"] == "disable":
@@ -3498,7 +3647,7 @@ def account_missing(tool: str, root) -> str:
     if not root or not root.path or Path(root.path).is_dir():
         return ""
     fix = ("claude auth login" if tool == "claude" else "codex login") if root.default \
-        else f"ccr --add-account {root.label} --tool {tool} --local" if getattr(root, "local", False) \
+        else local_fix(tool, root) if getattr(root, "local", False) \
         else f"ccr --add-account {root.label} --tool {tool}   (or Ctrl-A in the picker, then Ctrl-L on its row)"
     return f"ccr: {tool} account '{root.label}' is not on this PC - {root.path} does not exist. Fix: {fix}"
 
@@ -3798,15 +3947,17 @@ def launch_options(picked: list, ctx):
     for each tool in the selection. Both start at "no override" (no flag,
     the tool's own setting). Returns {tool: (model, effort)}, or None when
     backed out. The rows of a local account (Ollama only) get a menu of
-    their own, keyed "<tool>@<label>" (launch_key): a model only, from this
-    computer's Ollama, and no effort."""
+    their own, keyed "<tool>@<label>" (launch_key): a model only, from that
+    account's Ollama - the one Ctrl-O moves them to, if any - and no effort."""
     out = {}
     for key in dict.fromkeys(launch_key(x) for x in picked if x.local):
         rows_l = [x for x in picked if launch_key(x) == key]
-        tool, label = rows_l[0].tool, rows_l[0].root
+        tool, label = rows_l[0].tool, key.split("@", 1)[1]
+        lr = next((r for r in get_roots(tool) if r.local and r.label == label), None)
         n = len(rows_l)
         title = (f"{BOLD}Resume with a model{RESET}  {TOOL_COLOR[tool]}{tool}{RESET} {MAGENTA}{label}{RESET} "
-                 f"{DIM}(local, Ollama on this computer) · {n} conversation{'' if n == 1 else 's'}{RESET}")
+                 f"{DIM}(local, Ollama on {ollama_place(lr.ollama_url if lr else OLLAMA_URL)}) · "
+                 f"{n} conversation{'' if n == 1 else 's'}{RESET}")
         model = choose_ollama_model(tool, label, title, "back to the list", none_note="the model it last ran with")
         if model is None:
             return None
@@ -3833,13 +3984,13 @@ def launch_options(picked: list, ctx):
 
 def launch_key(s) -> str:
     """The Ctrl-E menu a row belongs to: its tool, or "<tool>@<label>" for a
-    local account."""
-    return f"{s.tool}@{s.root}" if s.local else s.tool
+    local account - the one Ctrl-O moves it to, if any."""
+    return f"{s.tool}@{s.target_root or s.root}" if s.local else s.tool
 
 
 def choose_ollama_model(tool: str, label: str, title: str, back: str = "back", none_note: str = None,
                         current: str = ""):
-    """The models installed in this computer's Ollama, cloud ones left out,
+    """The models installed in the account's Ollama, cloud ones left out,
     as an fzf menu, the one picked last time first. With none_note a first
     row keeps the conversation's own model (''). After a check of the
     account and Ollama: a notice instead when something is wrong. Returns
@@ -3850,16 +4001,18 @@ def choose_ollama_model(tool: str, label: str, title: str, back: str = "back", n
         print(bad, file=sys.stderr)
         pause()
         return None
-    models = ollama_state()["models"]
+    url = root.ollama_url or OLLAMA_URL
+    place = ollama_place(url)
+    models = ollama_state(url=url)["models"]
     if not models:
-        print("ccr: Ollama has no local model on this computer - ollama pull <model>", file=sys.stderr)
+        print(f"ccr: Ollama on {place} has no local model - ollama pull <model> there", file=sys.stderr)
         pause()
         return None
     current = current or local_last_model(tool, label)
     if current in models:
         models = [current] + [m for m in models if m != current]
     rows = [f"0\t{'(no override)':<26}{DIM}{none_note}{RESET}"] if none_note else []
-    rows += [f"{i}\t{m:<26}{DIM}{'last used' if m == current else 'Ollama on this computer'}{RESET}"
+    rows += [f"{i}\t{m:<26}{DIM}{'last used' if m == current else 'Ollama on ' + place}{RESET}"
              for i, m in enumerate(models, 1)]
     res = run_fzf(rows, title + "\n" + hint(("Enter", "choose"), ("Esc", back), tail="model"),
                   multi=False, preview=False, prompt=f"{tool} model> ")
@@ -3958,30 +4111,17 @@ def launch(picked: list, new_window: bool, dry: bool, ctx: Ctx, terminal: bool =
                   file=sys.stderr)
             cwd = str(HOME)
         # Account mode: a target label different from the row's own account
-        # means "move this conversation there, then open it there".
+        # means "move this conversation there, then open it there" - between
+        # local accounts (Ollama), or between accounts that talk to a cloud,
+        # never from one kind to the other.
         root_path, move_to = s.root_path, None
         tgt = s.target_root or ""
         argv, extra = resume_argv(s), None
-        if s.local:
-            # A local account (Ollama only): the model the conversation last
-            # ran with, unless Ctrl-E picked another; checked here.
-            model = s.model_override or session_model(s)
-            lroot = next((r for r in ctx.roots(s.tool, all_=True) if r.local and r.label == s.root), None)
-            bad = (f"ccr: the local account '{s.root}' is no longer in ccr.json" if not lroot
-                   else "ccr: no model found in the transcript - Ctrl-E picks one" if not model
-                   else local_problem(s.tool, lroot, model))
-            if bad:
-                print(f"{bad}   '{s.title}' skipped.", file=sys.stderr)
-                continue
-            if not dry:
-                add_local_waits(s.tool, lroot.path)
-            argv = resume_argv(s, local=True) + local_args(s.tool, s.root_path, model)
-            extra = local_env(s.tool, model)
         if tgt and tgt != s.root:
             move_to = next((r for r in ctx.roots(s.tool, all_=True) if r.label == tgt), None)
-            if s.local or (move_to and move_to.local):
-                print(f"ccr: '{s.title}' - a local account's conversations never move between accounts; skipped",
-                      file=sys.stderr)
+            if move_to and bool(move_to.local) != bool(s.local):
+                print(f"ccr: '{s.title}' - conversations never move between a local account (Ollama) and one that "
+                      "talks to a cloud; skipped", file=sys.stderr)
                 continue
             if not move_to:
                 print(f"ccr: no {s.tool} dir for account '{tgt}' - '{s.title}' stays under '{s.root}'", file=sys.stderr)
@@ -3992,11 +4132,39 @@ def launch(picked: list, new_window: bool, dry: bool, ctx: Ctx, terminal: bool =
                 print(f"ccr: '{s.title}' is open on {s.running_on} - close it there before moving it to '{tgt}'; skipped",
                       file=sys.stderr)
                 continue
-            elif account_missing(s.tool, move_to):
+            elif not s.local and account_missing(s.tool, move_to):
                 print(f"{account_missing(s.tool, move_to)}   '{s.title}' skipped, not moved.", file=sys.stderr)
                 continue
             else:
                 root_path = move_to.path
+        if s.local:
+            # A local account (Ollama only): the model the conversation last
+            # ran with, unless Ctrl-E picked another; checked here against the
+            # account it opens under - the one Ctrl-O moves it to, if any.
+            model = s.model_override or session_model(s)
+            own = next((r for r in ctx.roots(s.tool, all_=True) if r.local and r.label == s.root), None)
+            lroot = move_to or own
+            bad = (f"ccr: the local account '{s.root}' is no longer in ccr.json" if not lroot
+                   else "ccr: no model found in the transcript - Ctrl-E picks one" if not model
+                   else local_problem(s.tool, lroot, model))
+            if bad:
+                print(f"{bad}   '{s.title}' skipped{', not moved' if move_to else ''}.", file=sys.stderr)
+                continue
+            # Moving it where it travels further than before: from its next
+            # turn the whole conversation goes there, so ask first.
+            if move_to and own and ollama_reach_rank(move_to.ollama_url) > ollama_reach_rank(own.ollama_url):
+                print(f"{YELLOW}ccr: '{s.title}' moves from '{own.label}' (Ollama on {ollama_place(own.ollama_url)}) "
+                      f"to '{move_to.label}' (Ollama on {ollama_place(move_to.ollama_url)}): from its next turn the "
+                      f"whole conversation is sent to {move_to.ollama_url}.{RESET}")
+                if not dry:
+                    ans = ask("Move it? [y/N] ")
+                    if not ans or ans.strip().lower() not in ("y", "yes"):
+                        print(f"ccr: '{s.title}' not moved, not opened.")
+                        continue
+            if not dry:
+                add_local_waits(s.tool, lroot.path)
+            argv = resume_argv(s, local=True) + local_args(s.tool, lroot.path, model, lroot.ollama_url or OLLAMA_URL)
+            extra = local_env(s.tool, model)
         launch_list.append({"s": s, "cwd": cwd, "argv": argv, "root_path": root_path, "move_to": move_to, "env": extra})
     if not app_list and not launch_list:
         print("ccr: nothing to open.")
@@ -4285,7 +4453,7 @@ def _new_in_folder(folder: str, sessions: list, initial_name: str, dry: bool, ct
         # checked again right before the start; what the agent writes in a
         # synced folder syncs.
         model = choose_ollama_model(tool, root.label, f"{BOLD}model for the local {tool} account "
-                                    f"'{root.label}'{RESET} {DIM}· Ollama on this computer{RESET}")
+                                    f"'{root.label}'{RESET} {DIM}· Ollama on {ollama_place(root.ollama_url)}{RESET}")
         if not model:
             return "tool"
         bad = local_problem(tool, root, model)
@@ -4294,7 +4462,7 @@ def _new_in_folder(folder: str, sessions: list, initial_name: str, dry: bool, ct
             return False
         if not dry:
             add_local_waits(tool, rp)
-        argv += local_args(tool, rp, model)
+        argv += local_args(tool, rp, model, root.ollama_url or OLLAMA_URL)
         extra = local_env(tool, model)
         if synced_path(folder):
             print(f"{YELLOW}ccr: {folder} is inside a synced folder - the files the agent writes there sync too "
@@ -6407,7 +6575,8 @@ def auto_update(channel: str, me: str):
 # names are touched; anything else stays a filter word or an argparse error.
 PS_FLAGS = {"update": "--update", "channel": "--channel", "root": "--root", "accounts": "--accounts",
             "addaccount": "--add-account", "removeaccount": "--remove-account", "disableaccounts": "--disable-accounts",
-            "copysettings": "--copy-settings", "copystatusline": "--copy-settings", "local": "--local", "tool": "--tool",
+            "copysettings": "--copy-settings", "copystatusline": "--copy-settings", "local": "--local", "ollama": "--ollama",
+            "tool": "--tool",
             "top": "--top",
             "new": "--new", "newwindow": "--new-window", "whatif": "--dry-run", "dryrun": "--dry-run",
             "usagehours": "--usage-hours", "usage": "--usage", "tabs": "--tabs", "terminal": "--terminal", "version": "--version",
@@ -6479,6 +6648,9 @@ def main():
     acc.add_argument("--local", action="store_true",
                      help="with --add-account: a local account - Ollama on this computer only, never Anthropic, "
                           "OpenAI or a synced folder; no login")
+    acc.add_argument("--ollama", metavar="URL", default="",
+                     help="with --add-account: a local account on the Ollama of another computer "
+                          "(http://192.168.0.40:11434); implies --local")
     acc.add_argument("--remove-account", metavar="LABEL", default="",
                      help="move its sessions to the default account and forget the entry (nothing deleted)")
     acc.add_argument("--disable-accounts", action="store_true",
@@ -6543,15 +6715,16 @@ def main():
         if a.dry_run:
             # The login flows are external processes, so --dry-run must stop
             # here (the same notice the picker's account page prints).
-            act = ({"action": "add-local", "tool": a.tool, "label": a.add_account} if a.add_account and a.local
+            act = ({"action": "add-local", "tool": a.tool, "label": a.add_account, "url": a.ollama}
+                   if a.add_account and (a.local or a.ollama)
                    else {"action": "add", "tool": a.tool, "label": a.add_account, "copy": a.copy_settings} if a.add_account
                    else {"action": "remove", "tool": a.tool, "label": a.remove_account} if a.remove_account
                    else {"action": "disable"})
             run_account_action(act, True)
             return
         try:
-            if a.add_account and a.local:
-                add_local_account(a.add_account, a.tool)
+            if a.add_account and (a.local or a.ollama):
+                add_local_account(a.add_account, a.tool, a.ollama)
             elif a.add_account:
                 add_account(a.add_account, a.tool, a.copy_settings)
             elif a.remove_account:
@@ -6822,9 +6995,10 @@ def main():
                 # other tool without a dir for that label is reported at
                 # launch and stays where it is).
                 tools = {s.tool for s in picked}
+                kinds = {bool(s.local) for s in picked}   # local rows go to local accounts only, and back
                 rows = [f"{n}\t{TOOL_COLOR[t]}{BOLD}{n}{RESET} {MAGENTA}{acct_label(r.label, r.default):<14}{RESET} "
                         f"{TOOL_COLOR[t]}{t:<6}{RESET} {fmt_cwd(r.path, 40):<40}  {DIM}{who_at(t, r.path)}{RESET}\t{r.path}"
-                        for n, t, r in ctx.entries if t in tools and not r.local]   # never into a local account
+                        for n, t, r in ctx.entries if t in tools and bool(r.local) in kinds]
                 cnt = len(picked)
                 res = run_fzf(rows, hint(("Enter", "choose"), ("Esc", "back"),
                                          tail=f"open {cnt} conversation{'' if cnt == 1 else 's'} under which account?"),
