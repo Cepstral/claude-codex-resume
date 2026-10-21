@@ -290,13 +290,15 @@ codex 0.160, Ollama 0.40.7), and why it is built this way:
   anthropics/claude-plugins-official - CONNECTs to downloads.claude.ai and
   github.com and an ssh.exe to github.com:22 - despite
   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC (the docs say it is not covered).
-  The v0.88 network checks missed it (that dir was not new). The pin now sets
-  CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL=1, and the start-time
-  top-up (Add-CcrLocalWaits / add_local_waits) adds any pinned env key an
-  older account lacks, never changing a value. Verified through a logging
-  proxy: a new dir then contacts only its Ollama; an account whose
-  marketplace was registered (Luca's, at its first start) and dated a month
-  back does not refresh it at start (DISABLE_AUTOUPDATER).
+  The v0.88 network checks missed it (that dir was not new). v0.92 pinned
+  CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL=1 (verified through a
+  logging proxy: a new dir then contacted only its Ollama); v0.93 dropped it
+  on Luca's call - traffic that carries nothing of the conversation is fine
+  (as PowerShell's telemetry, v0.91). An account whose marketplace was
+  registered and dated a month back does not refresh it at start
+  (DISABLE_AUTOUPDATER). Kept from v0.92: the start-time top-up
+  (Add-CcrLocalWaits / add_local_waits) adds any pinned env key an older
+  account lacks, never changing a value.
 - Testing ccr.py on Windows: a claude transcript path over 260 characters (a
   long scratch cwd) is invisible to Python's directory listing, not to pwsh.
   Use a short working folder for py tests there.

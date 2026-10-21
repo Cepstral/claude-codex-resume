@@ -38,7 +38,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.92"
+VERSION = "0.93"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -483,10 +483,6 @@ LOCAL_CLAUDE_ENV = {
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1", "DISABLE_AUTOUPDATER": "1", "ENABLE_CLAUDEAI_MCP_SERVERS": "false",
     "DISABLE_ERROR_REPORTING": "1", "DISABLE_FEEDBACK_COMMAND": "1", "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
     "CLAUDE_CODE_AUTO_MODE_SERVER": "0", "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
-    # Not covered by the variable above: at the first interactive start in a
-    # new dir claude registers the official plugin marketplace - a clone from
-    # github.com (https and ssh) plus downloads.claude.ai (seen v0.92).
-    "CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL": "1",
 }
 # A local model can stay silent for many minutes: Ollama streams nothing while
 # it reads the whole conversation again (after unloading the model, or a cache

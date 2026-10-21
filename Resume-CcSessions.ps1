@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.92'
+$script:CcrVersion = '0.93'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -389,10 +389,6 @@ $script:CcrLocalClaudeEnv = [ordered]@{
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1'; DISABLE_AUTOUPDATER = '1'; ENABLE_CLAUDEAI_MCP_SERVERS = 'false'; DISABLE_ERROR_REPORTING = '1'
     DISABLE_FEEDBACK_COMMAND = '1'; CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY = '1'; CLAUDE_CODE_AUTO_MODE_SERVER = '0'
     CLAUDE_CODE_ATTRIBUTION_HEADER = '0'
-    # Not covered by the variable above: at the first interactive start in a
-    # new dir claude registers the official plugin marketplace - a clone from
-    # github.com (https and ssh) plus downloads.claude.ai (seen v0.92).
-    CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL = '1'
 }
 # A local model can stay silent for many minutes: Ollama streams nothing while
 # it reads the whole conversation again (after unloading the model, or a cache
