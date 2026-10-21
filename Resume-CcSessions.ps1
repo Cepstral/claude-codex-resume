@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.88'
+$script:CcrVersion = '0.89'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -317,14 +317,22 @@ function Get-CcrOllamaState([switch]$Refresh) {
 
 # The files that point a local account's dir at Ollama. Claude: env in
 # settings.json (the variables `ollama launch claude` sets, plus no
-# non-essential traffic) and WebFetch / WebSearch denied. Codex: Ollama as
-# the model provider; plugins, apps, web search, the update check, usage
-# metrics, feedback uploads and the start-up tips off.
+# non-essential traffic) and skipWebFetchPreflight: WebFetch downloads the page
+# from this PC and the local model reads it, but without that setting claude
+# first sends the site's name to api.anthropic.com/api/web/domain_info (a
+# blocklist check). WebSearch stays denied: it is a tool the model provider
+# runs on its servers (web_search_20250305), which Ollama on this PC is not.
+# Codex: Ollama as the model provider; plugins, apps, web search (the same
+# kind of server-side tool), the update check, usage metrics, feedback
+# uploads and the start-up tips off.
 $script:CcrLocalClaudeEnv = [ordered]@{
     ANTHROPIC_BASE_URL = $script:CcrOllamaUrl; ANTHROPIC_AUTH_TOKEN = 'ollama'; ANTHROPIC_API_KEY = ''
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1'; DISABLE_AUTOUPDATER = '1'; ENABLE_CLAUDEAI_MCP_SERVERS = 'false'; DISABLE_ERROR_REPORTING = '1'
     DISABLE_FEEDBACK_COMMAND = '1'; CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY = '1'; CLAUDE_CODE_AUTO_MODE_SERVER = '0'
     CLAUDE_CODE_ATTRIBUTION_HEADER = '0'
+    # The PowerShell claude starts for commands phones its own telemetry and
+    # update check (dc.services.visualstudio.com) unless told not to.
+    POWERSHELL_TELEMETRY_OPTOUT = '1'; POWERSHELL_UPDATECHECK = 'Off'
 }
 function Get-CcrLocalCodexToml {
     @"
@@ -375,9 +383,11 @@ function Set-CcrLocalPin([string]$Tool, [string]$Dir) {
         foreach ($k in $script:CcrLocalClaudeEnv.Keys) { $envObj | Add-Member -NotePropertyName $k -NotePropertyValue $script:CcrLocalClaudeEnv[$k] -Force }
         $cfg | Add-Member -NotePropertyName env -NotePropertyValue $envObj -Force
         $perm = if ($cfg.PSObject.Properties['permissions'] -and $cfg.permissions) { $cfg.permissions } else { [pscustomobject]@{} }
-        $deny = @(if ($perm.PSObject.Properties['deny']) { @($perm.deny) }) + @('WebFetch', 'WebSearch') | Select-Object -Unique
+        # v0.88 denied WebFetch too; since v0.89 it is allowed (asked like any tool).
+        $deny = @(@(if ($perm.PSObject.Properties['deny']) { @($perm.deny) }) | Where-Object { $_ -ne 'WebFetch' }) + @('WebSearch') | Select-Object -Unique
         $perm | Add-Member -NotePropertyName deny -NotePropertyValue @($deny) -Force
         $cfg | Add-Member -NotePropertyName permissions -NotePropertyValue $perm -Force
+        $cfg | Add-Member -NotePropertyName skipWebFetchPreflight -NotePropertyValue $true -Force
         $cfg | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath $sj -Encoding utf8NoBOM
         $cj = Join-Path $Dir '.claude.json'
         if (-not (Test-Path -LiteralPath $cj)) { [ordered]@{ hasCompletedOnboarding = $true } | ConvertTo-Json | Set-Content -LiteralPath $cj -Encoding utf8NoBOM }
@@ -399,7 +409,8 @@ function Get-CcrLocalPinProblem([string]$Tool, [string]$Dir) {
     if ($Tool -eq 'claude') {
         $sj = Join-Path $Dir 'settings.json'
         try { $e = (Get-Content -LiteralPath $sj -Raw -ErrorAction Stop | ConvertFrom-Json).env } catch { return "no readable settings.json in $Dir" }
-        if ("$($e.ANTHROPIC_BASE_URL)" -ne $script:CcrOllamaUrl -or "$($e.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC)" -ne '1' -or "$($e.DISABLE_AUTOUPDATER)" -ne '1') { return "settings.json in $Dir no longer keeps claude on Ollama only" }
+        if ("$($e.ANTHROPIC_BASE_URL)" -ne $script:CcrOllamaUrl -or "$($e.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC)" -ne '1' -or "$($e.DISABLE_AUTOUPDATER)" -ne '1' -or
+            (Get-Content -LiteralPath $sj -Raw | ConvertFrom-Json).skipWebFetchPreflight -ne $true) { return "settings.json in $Dir no longer keeps claude on Ollama only" }
         return ''
     }
     $t = try { Get-Content -LiteralPath (Join-Path $Dir 'config.toml') -Raw -ErrorAction Stop } catch { '' }
@@ -440,12 +451,14 @@ function Get-CcrLocalArgs([string]$Tool, [string]$RootPath, [string]$Model) {
 
 # ...and with this environment besides the account's dir: claude's model
 # tiers all set to the model, so subagents and its small background calls run
-# it too (Ollama has nothing else to answer them with).
+# it too (Ollama has nothing else to answer them with); codex's shell without
+# PowerShell's own telemetry and update check (claude's settings.json has them).
 function Get-CcrLocalEnv([string]$Tool, [string]$Model) {
     $e = [ordered]@{}
     if ($Tool -eq 'claude') {
         foreach ($k in 'ANTHROPIC_DEFAULT_OPUS_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL', 'CLAUDE_CODE_SUBAGENT_MODEL') { $e[$k] = $Model }
     }
+    else { $e['POWERSHELL_TELEMETRY_OPTOUT'] = '1'; $e['POWERSHELL_UPDATECHECK'] = 'Off' }
     $e
 }
 

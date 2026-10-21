@@ -233,7 +233,8 @@ or `Ctrl+A` → add → tool → label → tick **Local**. ccr creates the accou
   - the account's dir still points at Ollama;
   - the model is installed and is not a cloud one.
 - **How the dir keeps the tools local**, even when started by hand:
-  - **Claude:** its `settings.json` sets `ANTHROPIC_BASE_URL` to Ollama and turns off non-essential traffic, the auto-updater, error reporting and claude.ai MCP servers, and it denies `WebFetch` / `WebSearch`. ccr passes the file again with `--settings`, so a project's own `.claude/settings*.json` cannot redirect it.
+  - **Claude:** its `settings.json` sets `ANTHROPIC_BASE_URL` to Ollama and turns off non-essential traffic, the auto-updater, error reporting, claude.ai MCP servers and the telemetry of the PowerShell it runs commands in. ccr passes the file again with `--settings`, so a project's own `.claude/settings*.json` cannot redirect it.
+  - **WebFetch works**: the page is downloaded from this computer and read by the local model. `skipWebFetchPreflight` keeps claude from first sending the site's name to Anthropic for a blocklist check. **WebSearch is denied**: the model provider runs it on its own servers, and Ollama has no search engine.
   - **Codex:** its `config.toml` has Ollama as the model provider. Plugins, apps, web search, the update check, usage metrics, feedback uploads and the start-up tips are off. ccr passes the provider again with `-c`.
   - Checked with Claude Code 2.1.306, Codex 0.160 and Ollama 0.40.7, both in their own UI and headless: the only connection either tool opened was `127.0.0.1:11434`.
 - **Kept apart:**
@@ -242,6 +243,7 @@ or `Ctrl+A` → add → tool → label → tick **Local**. ccr creates the accou
   - a local account takes no copied settings and has no usage limits;
   - removing it (`-RemoveAccount local`, `Ctrl+A` → `Del`) only forgets the entry. The conversations stay in its dir.
 - **Not covered:** what the agent writes into the working folder lives there. `Ctrl+N` warns when that folder is inside OneDrive, Dropbox, Google Drive or iCloud.
+- **Commands the agent runs reach the network as usual**: `npm install`, `pip install`, `dotnet restore`, `git pull`. A download tells the registry which packages the project uses, not its code. To let the agent fetch dependencies without asking, allow those commands in the account's `settings.json`, for example `"permissions": { "allow": ["Bash(npm install *)", "PowerShell(npm install *)", "PowerShell(dotnet restore *)"] }`. ccr keeps them when it points the dir at Ollama again. Auto mode would have the local model judge every command: a large model can take longer than the 60 s Claude Code allows, and then the command is blocked.
 
 ### Usage limits and token usage
 

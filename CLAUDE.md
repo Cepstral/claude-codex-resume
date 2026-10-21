@@ -224,6 +224,23 @@ codex 0.160, Ollama 0.40.7), and why it is built this way:
   127.0.0.1:11434 only, headless and in both UIs. The model requests in
   codex's logs_2.sqlite all went to 127.0.0.1. (pwsh itself phones its own
   telemetry at start; not ccr's, and no content.)
+- WebFetch / WebSearch (v0.89, on Luca's request; he approves commands by
+  hand): WebFetch fetches the page from this PC and the local model reads it,
+  but before that claude sends the site's name to
+  `https://api.anthropic.com/api/web/domain_info?domain=` (a blocklist
+  check) unless settings.json has `skipWebFetchPreflight: true` - found in the
+  2.1.306 binary, verified through a logging proxy: with it, example.com was
+  the only external target. WebSearch is a server tool
+  (`web_search_20250305`) run by the model provider: through Ollama it returns
+  nothing and opens no connection, so it stays denied. The PowerShell claude
+  starts for commands phoned dc.services.visualstudio.com (PowerShell's own
+  telemetry): POWERSHELL_TELEMETRY_OPTOUT=1 / POWERSHELL_UPDATECHECK=Off in the
+  env (claude: settings.json; codex: the launch env).
+- Auto mode on a local model: the classifier runs on the same local model
+  (its error names it); qwen3.8:27b took over the 60 s claude allows on
+  GRINDELWALD ("temporarily unavailable (timed out)") and the command was
+  blocked - fails closed, never asks a server. lfm2.5 answered in time.
+  Subagents and /compact ran on the local model too.
 - Ollama's cloud: off when `~/.ollama/server.json` has `disable_ollama_cloud`
   or OLLAMA_NO_CLOUD=1; the running server then answers a cloud model with 403
   "ollama cloud is disabled", locally - ccr checks the settings first (nothing

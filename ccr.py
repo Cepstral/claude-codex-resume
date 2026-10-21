@@ -38,7 +38,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.88"
+VERSION = "0.89"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -425,6 +425,9 @@ LOCAL_CLAUDE_ENV = {
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1", "DISABLE_AUTOUPDATER": "1", "ENABLE_CLAUDEAI_MCP_SERVERS": "false",
     "DISABLE_ERROR_REPORTING": "1", "DISABLE_FEEDBACK_COMMAND": "1", "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
     "CLAUDE_CODE_AUTO_MODE_SERVER": "0", "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
+    # The PowerShell claude starts for commands phones its own telemetry and
+    # update check (dc.services.visualstudio.com) unless told not to.
+    "POWERSHELL_TELEMETRY_OPTOUT": "1", "POWERSHELL_UPDATECHECK": "Off",
 }
 LOCAL_CODEX_TOML = f"""# ccr local account: everything goes to the Ollama server of this computer.
 # Written by ccr (--add-account --local), checked before every start.
@@ -590,11 +593,12 @@ def local_pin_problem(tool: str, d: str) -> str:
         return f"its dir {d} is inside a synced folder"
     if tool == "claude":
         try:
-            e = json.loads((Path(d) / "settings.json").read_text(encoding="utf-8")).get("env") or {}
+            sj = json.loads((Path(d) / "settings.json").read_text(encoding="utf-8"))
+            e = sj.get("env") or {}
         except Exception:
             return f"no readable settings.json in {d}"
         if (str(e.get("ANTHROPIC_BASE_URL")) != OLLAMA_URL or str(e.get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC")) != "1"
-                or str(e.get("DISABLE_AUTOUPDATER")) != "1"):
+                or str(e.get("DISABLE_AUTOUPDATER")) != "1" or sj.get("skipWebFetchPreflight") is not True):
             return f"settings.json in {d} no longer keeps claude on Ollama only"
         return ""
     try:
@@ -623,11 +627,18 @@ def set_local_pin(tool: str, d: str):
         env = cfg.get("env") if isinstance(cfg.get("env"), dict) else {}
         env.update(LOCAL_CLAUDE_ENV)
         cfg["env"] = env
+        # WebFetch downloads the page from this computer and the local model
+        # reads it, but without skipWebFetchPreflight claude first sends the
+        # site's name to api.anthropic.com/api/web/domain_info (a blocklist
+        # check). WebSearch stays denied: the model provider runs it on its
+        # servers (web_search_20250305), which Ollama here is not. v0.88
+        # denied WebFetch too.
         perm = cfg.get("permissions") if isinstance(cfg.get("permissions"), dict) else {}
-        deny = list(perm.get("deny") or [])
-        deny += [x for x in ("WebFetch", "WebSearch") if x not in deny]
+        deny = [x for x in (perm.get("deny") or []) if x != "WebFetch"]
+        deny += [x for x in ("WebSearch",) if x not in deny]
         perm["deny"] = deny
         cfg["permissions"] = perm
+        cfg["skipWebFetchPreflight"] = True
         sj.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
         cj = Path(d) / ".claude.json"
         if not cj.exists():
@@ -682,9 +693,11 @@ def local_args(tool: str, root_path: str, model: str) -> list:
 def local_env(tool: str, model: str) -> dict:
     """...and with this environment besides the account's dir: claude's
     model tiers all set to the model, so subagents and its small background
-    calls run it too (Ollama has nothing else to answer them with)."""
+    calls run it too (Ollama has nothing else to answer them with); codex's
+    shell without PowerShell's own telemetry and update check (claude's
+    settings.json has them)."""
     if tool != "claude":
-        return {}
+        return {"POWERSHELL_TELEMETRY_OPTOUT": "1", "POWERSHELL_UPDATECHECK": "Off"}
     return {k: model for k in ("ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
                                "ANTHROPIC_DEFAULT_HAIKU_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL")}
 
