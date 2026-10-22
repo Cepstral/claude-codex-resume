@@ -124,8 +124,8 @@ A `ccr.json` with only those keys does not turn multi-account mode on.
 
 ## What the picker shows
 
-An **account column** appears between the tool and the age (magenta), for both tools; it is
-blank for the default account, so the rows of the other accounts stand out; above the rows, the account table lists the accounts (see
+An **account column** appears between the tool and the age (magenta), for both tools: every row
+names its account, the default one in parentheses (`(default)`); above the rows, the account table lists the accounts (see
 [Tab](#opening-a-conversation-under-another-account--tab) below) with each one's usage limits:
 
 ```
@@ -136,7 +136,7 @@ filter>                                                 88/121 · 2 marked
           4 work       ~\.codex-work   me@company.com  week 27% → Sun 4 21:02
 ↑↓ move · Tab mark/account · Enter open · Ctrl+N new · Ctrl+G/F1 guide: all the keys · Esc cancel · type to filter
 ● claude work       1h  Billing API pagination          D:\repos\api-server
-  claude            3h  Home automation bridge          D:\repos\home
+  claude (default)  3h  Home automation bridge          D:\repos\home
   codex  work       5h  migrate build to vite           D:\repos\web-app
 ● claude            1d  Physics simulation viral videos D:\repos\sim-shorts
   codex             2d  sono affidabili i nebulizzatori ~

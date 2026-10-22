@@ -38,7 +38,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.94"
+VERSION = "0.95"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -2525,9 +2525,9 @@ def account_table(ctx, lim: Limits = None) -> list:
 def session_rows(sessions, index, ctx: Ctx, usage: dict = None):
     """usage: "tool|id" -> Usage or None, when the Ctrl-K column is on."""
     rows = []
-    # Account column: blank for the default account, so the rows of the
-    # other accounts stand out (the table on top names the default).
-    root_w = min(14, max((len(r.label) for r in ctx.claude + ctx.codex if not r.default), default=0)) \
+    # Account column: every row names its account, the default one in
+    # parentheses. v0.87 left the default blank; Luca wants to see it (v0.95).
+    root_w = min(14, max((len(acct_label(r.label, r.default)) for r in ctx.claude + ctx.codex), default=0)) \
         if ctx.multi_root else 0
     # Title column of a fixed width, so the folders line up as in the
     # PowerShell picker: the longest title (and its tags), at most 50.
@@ -2556,7 +2556,7 @@ def session_rows(sessions, index, ctx: Ctx, usage: dict = None):
         # lives in; the label is part of the text fzf matches on.
         acct = ""
         if ctx.multi_root:
-            lbl = ("" if s.root == ctx.def_label[s.tool] else s.root)[:root_w]
+            lbl = acct_label(s.root, s.root == ctx.def_label[s.tool])[:root_w]
             acct = f"{MAGENTA}{lbl:<{root_w}}{RESET} " if root_w else ""
         # Usage column (Ctrl-K): total tokens in the window and, in
         # parentheses, the session's share of the window's tokens across

@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.94'
+$script:CcrVersion = '0.95'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -5598,10 +5598,10 @@ function Select-CcrSession {
     if ($null -eq $AllCodexRoots) { $AllCodexRoots = $CodexRoots }
     $multiRoot = ($ClaudeRoots.Count -gt 1) -or ($CodexRoots.Count -gt 1)
     $defLabel = @{ claude = "$(@($ClaudeRoots | Where-Object Default)[0].Label)"; codex = "$(@($CodexRoots | Where-Object Default)[0].Label)" }
-    # Account column: blank for the default account, so the rows of the
-    # other accounts stand out (the table on top names the default).
+    # Account column: every row names its account, the default one in
+    # parentheses. v0.87 left the default blank; Luca wants to see it (v0.95).
     $rootW = if ($multiRoot) {
-        [int][Math]::Min(14, [int](@($ClaudeRoots) + @($CodexRoots) | Where-Object { -not $_.Default } | ForEach-Object { "$($_.Label)".Length } | Measure-Object -Maximum).Maximum)
+        [int][Math]::Min(14, [int](@($ClaudeRoots) + @($CodexRoots) | ForEach-Object { (Format-CcrAcctLabel "$($_.Label)" $_.Default).Length } | Measure-Object -Maximum).Maximum)
     }
     else { 0 }
 
@@ -5885,10 +5885,10 @@ function Select-CcrSession {
                 if ($suffix) { $titleTxt += $suffixTxt }
                 # Static: the "…\last\two" shortening; rotating: the whole path.
                 $cwdTxt = if ($scroll -ge 0) { Get-CcrCell (Format-CcrCwd $s.Cwd 100000) $cwdW $scroll } else { (Format-CcrCwd $s.Cwd $cwdW).PadRight($cwdW) }
-                # Account column (multi-root only): the config dir this claude
-                # session lives in; codex rows have none.
+                # Account column (multi-root only): the account whose dir the
+                # session lives in, "(default)" for the default one.
                 $rootTxt = if ($multiRoot -and $rootW) {
-                    $lbl = if ("$($s.Root)" -eq $defLabel[$s.Tool]) { '' } else { "$($s.Root)" }; if ($lbl.Length -gt $rootW) { $lbl = $lbl.Substring(0, $rootW) }
+                    $lbl = Format-CcrAcctLabel "$($s.Root)" ("$($s.Root)" -eq $defLabel[$s.Tool]); if ($lbl.Length -gt $rootW) { $lbl = $lbl.Substring(0, $rootW) }
                     "`e[35m $($lbl.PadRight($rootW))`e[39m"
                 }
                 else { '' }

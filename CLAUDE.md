@@ -178,9 +178,9 @@ also adds an account on the PowerShell account page; ccr.py says
 "computer" where PowerShell says "PC"; the install page's confirm is a key
 in PowerShell, a y/N line in ccr.py; `-WhatIf` lists no `unarchive:` lines.
 
-UI pass of v0.87 (both sides): the account column is blank for the default
-account (the table on top names it) and "Multi-account mode active." is
-gone; the key line says `Tab mark/account` in multi-account mode; the
+UI pass of v0.87 (both sides): the account column was left blank for the
+default account (v0.95 shows it again, "(default)": Luca could not tell
+which account a row used) and "Multi-account mode active." is gone; the key line says `Tab mark/account` in multi-account mode; the
 guide keeps the keys and drops the terminal notes (Ctrl+Backspace, ^H,
 Grammarly), which live in the README. ccr.py: the title column has a fixed
 width so the folders line up (PowerShell did already); the hidden filter
