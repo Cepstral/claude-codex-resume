@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.93'
+$script:CcrVersion = '0.94'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -356,9 +356,11 @@ function Get-CcrOllamaCloudProblem([string]$Url = $script:CcrOllamaUrl) {
     }
 }
 
-# What an Ollama says (this PC's unless -Url), asked once per run and
-# address: Answers, Models (installed, cloud ones left out, by name) and
-# Cloud ('' = off, else why not).
+# What an Ollama says (this PC's unless -Url), kept per run and address:
+# Answers, Models (installed, cloud ones left out, by name) and Cloud ('' =
+# off, else why not). -Refresh asks again: the model lists and the check
+# right before a start always do, so a model pulled or a cloud switched on
+# while the picker is open counts.
 $script:CcrOllamaStates = @{}
 function Get-CcrOllamaState([string]$Url = $script:CcrOllamaUrl, [switch]$Refresh) {
     if ($script:CcrOllamaStates.ContainsKey($Url) -and -not $Refresh) { return $script:CcrOllamaStates[$Url] }
@@ -521,7 +523,8 @@ function Get-CcrLocalPinProblem([string]$Tool, [string]$Dir, [string]$Url = $scr
 
 # '' when a conversation of a local account may start now with this model,
 # else the reason and the fix. Model '' checks everything but the model.
-function Get-CcrLocalProblem([string]$Tool, [object]$Root, [string]$Model) {
+# -Refresh asks Ollama again instead of using what it said earlier this run.
+function Get-CcrLocalProblem([string]$Tool, [object]$Root, [string]$Model, [switch]$Refresh) {
     $fix = Get-CcrLocalFix $Tool $Root
     $url = if ("$($Root.OllamaUrl)") { "$($Root.OllamaUrl)" } else { $script:CcrOllamaUrl }
     $here = $url -eq $script:CcrOllamaUrl
@@ -529,7 +532,7 @@ function Get-CcrLocalProblem([string]$Tool, [object]$Root, [string]$Model) {
     if (-not (Test-Path -LiteralPath $Root.Path -PathType Container)) { return "ccr: the local $Tool account '$($Root.Label)' is not on this PC - $($Root.Path) does not exist. Fix: $fix" }
     $pin = Get-CcrLocalPinProblem $Tool $Root.Path $url
     if ($pin) { return "ccr: local $Tool account '$($Root.Label)': $pin. Fix: $fix (points it at Ollama again)" }
-    $st = Get-CcrOllamaState $url
+    $st = Get-CcrOllamaState $url -Refresh:$Refresh
     if (-not $st.Answers) {
         if ($here) { return "ccr: Ollama does not answer on $url - start Ollama, then try again." }
         return "ccr: Ollama does not answer on $url ('$($Root.Label)') - is that computer on, with Ollama running, and on this network?"
@@ -2637,7 +2640,7 @@ function Select-CcrRoot {
 # wrong). Returns the model, or $null on Esc. Inside the caller's alt buffer.
 function Select-CcrOllamaModel {
     param([Parameter(Mandatory)][object]$Root, [Parameter(Mandatory)][ValidateSet('claude', 'codex')][string]$Tool, [string]$Current = '')
-    $bad = Get-CcrLocalProblem $Tool $Root ''
+    $bad = Get-CcrLocalProblem $Tool $Root '' -Refresh
     if ($bad) { Show-CcrNotice $bad; return $null }
     $url = if ("$($Root.OllamaUrl)") { "$($Root.OllamaUrl)" } else { $script:CcrOllamaUrl }
     $models = @((Get-CcrOllamaState $url).Models)
@@ -5133,7 +5136,7 @@ function Show-CcrLaunchOptions {
                 Label      = $lbl
                 Place      = (Get-CcrOllamaPlace $url)
                 Count      = @($Sessions | Where-Object { $_.Tool -eq $t -and $_.Local -and (Get-CcrLaunchKey $_) -eq $lk }).Count
-                Choices    = @((Get-CcrOllamaState $url).Models | ForEach-Object { [pscustomobject]@{ Value = $_; Note = "Ollama on $(Get-CcrOllamaPlace $url)" } })
+                Choices    = @((Get-CcrOllamaState $url -Refresh).Models | ForEach-Object { [pscustomobject]@{ Value = $_; Note = "Ollama on $(Get-CcrOllamaPlace $url)" } })
                 Configured = [pscustomobject]@{ Model = ''; Effort = ''; PerModel = $false }
                 Model      = ''
                 Effort     = ''
@@ -6644,6 +6647,10 @@ function Resume-CcSessions {
     )
     if ($DryRun) { $WhatIfPreference = $true }
     if ($Version) { "ccr $script:CcrVersion (powershell)"; return }
+    # What Ollama said is kept for one run only: a shell dot-sources this file
+    # once, so the empty cache set there would otherwise last as long as the
+    # tab (up to v0.93: models added since missing, an old "cloud off" trusted).
+    $script:CcrOllamaStates = @{}
     # --- GNU spellings (ccr --update, --root work, --dry-run ...) ------------
     # The ones ccr.py uses on macOS; PowerShell would take them as filter
     # words, so translate them and run again. One or two dashes and any
@@ -6923,7 +6930,7 @@ function Resume-CcSessions {
         $newVars = $null
         if ($newRoot -and $newRoot.Local) {
             $newModel = if ($single.PSObject.Properties['NewSessionModel']) { "$($single.NewSessionModel)" } else { '' }
-            $bad = Get-CcrLocalProblem $newTool $newRoot $newModel
+            $bad = Get-CcrLocalProblem $newTool $newRoot $newModel -Refresh
             if (-not $bad -and -not $newModel) { $bad = "ccr: no model chosen for the local $newTool account '$($newRoot.Label)'" }
             if ($bad) { Write-Warning $bad; return }
             if (-not $WhatIfPreference) { Add-CcrLocalWaits $newTool $newRoot.Path }
@@ -7012,7 +7019,7 @@ function Resume-CcSessions {
             $lroot = if ($moveTo) { $moveTo } else { $own }
             $bad = if (-not $lroot) { "ccr: the local account '$($s.Root)' is no longer in ccr.json" }
             elseif (-not $lm) { "ccr: no model found in the transcript - Shift+Enter (or Ctrl+E) picks one" }
-            else { Get-CcrLocalProblem $s.Tool $lroot $lm }
+            else { Get-CcrLocalProblem $s.Tool $lroot $lm -Refresh }
             if ($bad) { Write-Warning "$bad   '$($s.Title)' skipped$(if ($moveTo) { ', not moved' })."; continue }
             # Moving it where it travels further than before: from its next
             # turn the whole conversation goes there, so ask first.

@@ -38,7 +38,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.93"
+VERSION = "0.94"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -661,9 +661,11 @@ _OLLAMA_STATES = {}
 
 
 def ollama_state(refresh: bool = False, url: str = OLLAMA_URL) -> dict:
-    """What an Ollama says (this computer's unless url), asked once per run
-    and address: answers, models (installed, cloud ones left out, by name)
-    and cloud ('' = off, else why not)."""
+    """What an Ollama says (this computer's unless url), kept per run and
+    address: answers, models (installed, cloud ones left out, by name) and
+    cloud ('' = off, else why not). refresh asks again: the model lists and
+    the check right before a start always do, so a model pulled or a cloud
+    switched on while the picker is open counts."""
     if url in _OLLAMA_STATES and not refresh:
         return _OLLAMA_STATES[url]
     st = {"answers": False, "models": [], "cloud": ""}
@@ -770,9 +772,10 @@ def set_local_pin(tool: str, d: str, url: str = OLLAMA_URL):
     add_local_waits(tool, d)
 
 
-def local_problem(tool: str, root, model: str) -> str:
+def local_problem(tool: str, root, model: str, refresh: bool = False) -> str:
     """'' when a conversation of a local account may start now with this
-    model, else the reason and the fix. model '' checks all but the model."""
+    model, else the reason and the fix. model '' checks all but the model.
+    refresh asks Ollama again instead of using what it said earlier."""
     fix = local_fix(tool, root)
     url = getattr(root, "ollama_url", "") or OLLAMA_URL
     here = url == OLLAMA_URL
@@ -784,7 +787,7 @@ def local_problem(tool: str, root, model: str) -> str:
     pin = local_pin_problem(tool, root.path, url)
     if pin:
         return f"ccr: local {tool} account '{root.label}': {pin}. Fix: {fix} (points it at Ollama again)"
-    st = ollama_state(url=url)
+    st = ollama_state(refresh=refresh, url=url)
     if not st["answers"]:
         if here:
             return f"ccr: Ollama does not answer on {url} - start Ollama, then try again."
@@ -3992,7 +3995,7 @@ def choose_ollama_model(tool: str, label: str, title: str, back: str = "back", n
     account and Ollama: a notice instead when something is wrong. Returns
     the model, '' or None on Esc."""
     root = next((r for r in get_roots(tool) if r.local and r.label == label), None)
-    bad = local_problem(tool, root, "") if root else f"ccr: no local {tool} account '{label}'"
+    bad = local_problem(tool, root, "", refresh=True) if root else f"ccr: no local {tool} account '{label}'"
     if bad:
         print(bad, file=sys.stderr)
         pause()
@@ -4142,7 +4145,7 @@ def launch(picked: list, new_window: bool, dry: bool, ctx: Ctx, terminal: bool =
             lroot = move_to or own
             bad = (f"ccr: the local account '{s.root}' is no longer in ccr.json" if not lroot
                    else "ccr: no model found in the transcript - Ctrl-E picks one" if not model
-                   else local_problem(s.tool, lroot, model))
+                   else local_problem(s.tool, lroot, model, refresh=True))
             if bad:
                 print(f"{bad}   '{s.title}' skipped{', not moved' if move_to else ''}.", file=sys.stderr)
                 continue
@@ -4452,7 +4455,7 @@ def _new_in_folder(folder: str, sessions: list, initial_name: str, dry: bool, ct
                                     f"'{root.label}'{RESET} {DIM}· Ollama on {ollama_place(root.ollama_url)}{RESET}")
         if not model:
             return "tool"
-        bad = local_problem(tool, root, model)
+        bad = local_problem(tool, root, model, refresh=True)
         if bad:
             print(bad, file=sys.stderr)
             return False

@@ -299,6 +299,23 @@ codex 0.160, Ollama 0.40.7), and why it is built this way:
   (DISABLE_AUTOUPDATER). Kept from v0.92: the start-time top-up
   (Add-CcrLocalWaits / add_local_waits) adds any pinned env key an older
   account lacks, never changing a value.
+- Auto-update stays off in a local account (looked at 2026-10-22, when Luca
+  wanted it back): in the 2.1.306 binary every update path asks one function
+  that answers "off" for DISABLE_AUTOUPDATER and also for
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC. Dropping the second would also
+  turn back on file uploads to Anthropic, publishing, the built-in gh api and
+  Projects, which can carry conversation data. And the install is shared
+  (~/.local/share/claude/versions): the other accounts update it, and the
+  local account starts the new version next time.
+- What Ollama says (Get-CcrOllamaState / ollama_state) is kept per run
+  (v0.94). The script is dot-sourced once per pwsh tab, so the cache it set
+  at file level lived as long as the tab. Up to v0.93 a model created after
+  the tab opened never showed in the chooser, and the check before a start
+  trusted an old "cloud off". Now Resume-CcSessions empties it on every call.
+  The model lists (the chooser after Ctrl+N, Shift+Enter / Ctrl-E) and the
+  check right before a start ask again, which takes about 20 ms on this PC.
+  ccr.py runs a new process each time, but its picker stays open, so it
+  refreshes in the same places.
 - Testing ccr.py on Windows: a claude transcript path over 260 characters (a
   long scratch cwd) is invisible to Python's directory listing, not to pwsh.
   Use a short working folder for py tests there.
