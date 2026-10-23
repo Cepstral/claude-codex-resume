@@ -241,7 +241,19 @@ codex 0.160, Ollama 0.40.7), and why it is built this way:
   (its error names it); qwen3.8:27b took over the 60 s claude allows on
   GRINDELWALD ("temporarily unavailable (timed out)") and the command was
   blocked - fails closed, never asks a server. lfm2.5 answered in time.
-  Subagents and /compact ran on the local model too.
+  Subagents and /compact ran on the local model too. v0.96 turns auto mode
+  off. On 2026-10-22 a long conversation with qwen 27b had every command
+  blocked (the classifier reads the whole conversation again, and Ollama's
+  cache misses it). The account's settings.json now gets
+  `permissions.defaultMode: acceptEdits` and `permissions.disableAutoMode:
+  disable`, added where missing like the waits. Tested on claude 2.1.309
+  with a project whose .claude/settings.json says defaultMode auto. Before,
+  it started in auto and Shift+Tab cycled auto - manual - accept edits -
+  plan. After, it starts in accept edits and the cycle is accept edits -
+  plan - manual; `--permission-mode auto` falls back to default. Codex
+  (Luca's default account has `approvals_reviewer = "auto_review"`) gets
+  `-c approvals_reviewer=user` at every local start; codex 0.160 refuses a
+  bad value there, so the key is checked.
 - Ollama's cloud: off when `~/.ollama/server.json` has `disable_ollama_cloud`
   or OLLAMA_NO_CLOUD=1; the running server then answers a cloud model with 403
   "ollama cloud is disabled", locally - ccr checks the settings first (nothing

@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.95'
+$script:CcrVersion = '0.96'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -402,6 +402,15 @@ $script:CcrLocalClaudeEnv = [ordered]@{
 # so accounts made by v0.88-0.89 get them too; a value changed by hand stays.
 $script:CcrLocalClaudeWaitEnv = [ordered]@{ API_FORCE_IDLE_TIMEOUT = '0'; CLAUDE_STREAM_IDLE_TIMEOUT_MS = '1800000'; API_TIMEOUT_MS = '1800000' }
 $script:CcrLocalCodexIdleMs = 1800000
+# No auto mode (v0.96): its classifier would run on the local model too
+# (CLAUDE_CODE_AUTO_MODE_SERVER=0 keeps it off Anthropic's server), and it
+# must read the whole conversation again for every command: on a long one
+# it runs out of time and every command is blocked. Claude starts in accept
+# edits instead (edits in the folder go through, commands are asked), even
+# when a project asks for auto, and Shift+Tab skips auto. Added where
+# missing, as the waits. Codex: approvals_reviewer=user on the command line
+# (Get-CcrLocalArgs), so its auto review cannot take the model's place.
+$script:CcrLocalClaudePerms = [ordered]@{ defaultMode = 'acceptEdits'; disableAutoMode = 'disable' }
 function Get-CcrLocalCodexToml([string]$Url = $script:CcrOllamaUrl) {
     $where = if ($Url -eq $script:CcrOllamaUrl) { 'this PC' } else { $Url }
     @"
@@ -441,8 +450,8 @@ stream_idle_timeout_ms = $script:CcrLocalCodexIdleMs
 }
 
 # Add the long waits above to a local account's files where they are missing,
-# and in claude's env any key a newer ccr pins (an account made by an older
-# one lacks it). A value already there is never changed.
+# and in claude's env and permissions any key a newer ccr pins (an account
+# made by an older one lacks it). A value already there is never changed.
 function Add-CcrLocalWaits([string]$Tool, [string]$Dir) {
     if ($Tool -eq 'claude') {
         $sj = Join-Path $Dir 'settings.json'
@@ -450,8 +459,11 @@ function Add-CcrLocalWaits([string]$Tool, [string]$Dir) {
         $want = [ordered]@{}
         foreach ($m in $script:CcrLocalClaudeEnv, $script:CcrLocalClaudeWaitEnv) { foreach ($k in $m.Keys) { $want[$k] = $m[$k] } }
         $miss = @($want.Keys | Where-Object { -not $cfg.env.PSObject.Properties[$_] })
-        if (-not $miss.Count) { return }
+        if (-not $cfg.PSObject.Properties['permissions'] -or -not $cfg.permissions) { $cfg | Add-Member -NotePropertyName permissions -NotePropertyValue ([pscustomobject]@{}) -Force }
+        $missPerm = @($script:CcrLocalClaudePerms.Keys | Where-Object { -not $cfg.permissions.PSObject.Properties[$_] })
+        if (-not $miss.Count -and -not $missPerm.Count) { return }
         foreach ($k in $miss) { $cfg.env | Add-Member -NotePropertyName $k -NotePropertyValue $want[$k] }
+        foreach ($k in $missPerm) { $cfg.permissions | Add-Member -NotePropertyName $k -NotePropertyValue $script:CcrLocalClaudePerms[$k] }
         $cfg | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath $sj -Encoding utf8NoBOM
         return
     }
@@ -548,11 +560,13 @@ function Get-CcrLocalProblem([string]$Tool, [object]$Root, [string]$Model, [swit
 # A local account's tool starts with these flags. Claude: the account's
 # settings.json again as --settings (above a project's own settings), and the
 # model. Codex: Ollama as provider on the command line (above any
-# config.toml), the model, and plugins, apps and web search off.
+# config.toml), the model, plugins, apps and web search off, and approvals
+# asked of the user, never of codex's auto review (it would run on the local
+# model, as claude's auto mode).
 function Get-CcrLocalArgs([string]$Tool, [string]$RootPath, [string]$Model, [string]$Url = $script:CcrOllamaUrl) {
     if ($Tool -eq 'claude') { return @('--settings', (Join-Path $RootPath 'settings.json'), '--model', $Model) }
     $p = $script:CcrOllamaProvider
-    @('-m', $Model, '-c', "model_provider=$p", '-c', "model_providers.$p.base_url=$Url/v1", '-c', 'web_search=disabled', '--disable', 'plugins', '--disable', 'apps')
+    @('-m', $Model, '-c', "model_provider=$p", '-c', "model_providers.$p.base_url=$Url/v1", '-c', 'web_search=disabled', '-c', 'approvals_reviewer=user', '--disable', 'plugins', '--disable', 'apps')
 }
 
 # ...and with this environment besides the account's dir: claude's model

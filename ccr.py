@@ -38,7 +38,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.95"
+VERSION = "0.96"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -495,6 +495,15 @@ LOCAL_CLAUDE_ENV = {
 LOCAL_CLAUDE_WAIT_ENV = {"API_FORCE_IDLE_TIMEOUT": "0", "CLAUDE_STREAM_IDLE_TIMEOUT_MS": "1800000",
                          "API_TIMEOUT_MS": "1800000"}
 LOCAL_CODEX_IDLE_MS = 1800000
+# No auto mode (v0.96): its classifier would run on the local model too
+# (CLAUDE_CODE_AUTO_MODE_SERVER=0 keeps it off Anthropic's server), and it
+# must read the whole conversation again for every command: on a long one
+# it runs out of time and every command is blocked. Claude starts in accept
+# edits instead (edits in the folder go through, commands are asked), even
+# when a project asks for auto, and Shift+Tab skips auto. Added where
+# missing, as the waits. Codex: approvals_reviewer=user on the command line
+# (local_args), so its auto review cannot take the model's place.
+LOCAL_CLAUDE_PERMS = {"defaultMode": "acceptEdits", "disableAutoMode": "disable"}
 
 
 def local_codex_toml(url: str = OLLAMA_URL) -> str:
@@ -710,15 +719,20 @@ def local_pin_problem(tool: str, d: str, url: str = OLLAMA_URL) -> str:
 
 def add_local_waits(tool: str, d: str):
     """Add the long waits above to a local account's files where they are
-    missing, and in claude's env any key a newer ccr pins (an account made
-    by an older one lacks it). A value already there is never changed."""
+    missing, and in claude's env and permissions any key a newer ccr pins
+    (an account made by an older one lacks it). A value already there is
+    never changed."""
     if tool == "claude":
         sj = Path(d) / "settings.json"
         cfg = json.loads(sj.read_text(encoding="utf-8"))
         want = {**LOCAL_CLAUDE_ENV, **LOCAL_CLAUDE_WAIT_ENV}
         miss = [k for k in want if k not in cfg["env"]]
-        if miss:
+        perm = cfg.get("permissions") if isinstance(cfg.get("permissions"), dict) else {}
+        miss_perm = [k for k in LOCAL_CLAUDE_PERMS if k not in perm]
+        if miss or miss_perm:
             cfg["env"].update({k: want[k] for k in miss})
+            perm.update({k: LOCAL_CLAUDE_PERMS[k] for k in miss_perm})
+            cfg["permissions"] = perm
             sj.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
         return
     ct = Path(d) / "config.toml"
@@ -810,12 +824,14 @@ def local_args(tool: str, root_path: str, model: str, url: str = OLLAMA_URL) -> 
     """A local account's tool starts with these flags. Claude: the account's
     settings.json again as --settings (above a project's own settings), and
     the model. Codex: Ollama as provider on the command line (above any
-    config.toml), the model, and plugins, apps and web search off."""
+    config.toml), the model, plugins, apps and web search off, and approvals
+    asked of the user, never of codex's auto review (it would run on the
+    local model, as claude's auto mode)."""
     if tool == "claude":
         return ["--settings", str(Path(root_path) / "settings.json"), "--model", model]
     p = OLLAMA_PROVIDER
     return ["-m", model, "-c", f"model_provider={p}", "-c", f"model_providers.{p}.base_url={url}/v1",
-            "-c", "web_search=disabled", "--disable", "plugins", "--disable", "apps"]
+            "-c", "web_search=disabled", "-c", "approvals_reviewer=user", "--disable", "plugins", "--disable", "apps"]
 
 
 def local_env(tool: str, model: str) -> dict:
