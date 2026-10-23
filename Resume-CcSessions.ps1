@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.96'
+$script:CcrVersion = '0.97'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -2085,26 +2085,38 @@ function Show-CcrCloseConfirm {
     ($k.KeyChar -eq 'y' -or $k.KeyChar -eq 'Y')
 }
 
-# Confirmation before opening conversations that are open on another PC.
-function Show-CcrElsewhereConfirm {
+# Confirmation before opening conversations that are already open, on this PC
+# or on another one: two processes would append to the same transcript.
+# Returns 'open' (open anyway), 'find' (bring the window of the one running
+# here to the front; offered for a single row that has a window) or ''.
+function Show-CcrOpenConfirm {
     param([Parameter(Mandatory)][object[]]$Sessions)
     $dot = [char]0x00B7
+    $here = @($Sessions | Where-Object { $_.Running })
+    $find = $Sessions.Count -eq 1 -and $here.Count -eq 1 -and $here[0].RunKind -ne 'bg'
     $lines = [System.Collections.Generic.List[string]]::new()
     $lines.Add('')
-    $lines.Add("  `e[33mOpen on another PC`e[39m")
+    $lines.Add("  `e[33mAlready open$(if (-not $here.Count) { ' on another PC' })`e[39m")
     $lines.Add('')
     foreach ($s in $Sessions) {
-        $ago = if ($s.RunUpdated) { ", last update $(Format-CcrAge $s.RunUpdated) ago" } else { '' }
-        $lines.Add("    $($s.Tool) $dot `e[1m$($s.Title)`e[22m  `e[33m@$($s.RunningOn)`e[39m `e[2m($(if ($s.RunStatus) { $s.RunStatus } else { 'open' })$ago)`e[22m")
+        if ($s.Running) {
+            $kind = if ($s.RunKind -eq 'bg') { 'background session' } else { 'on this PC' }
+            $lines.Add("    $($s.Tool) $dot `e[1m$($s.Title)`e[22m  `e[31m$(if ($s.RunKind -eq 'bg') { 'bg' } else { 'run' })`e[39m `e[2m($kind, pid $($s.ProcessId)$(if ($s.RunStatus) { " $dot $($s.RunStatus)" }))`e[22m")
+        }
+        else {
+            $ago = if ($s.RunUpdated) { ", last update $(Format-CcrAge $s.RunUpdated) ago" } else { '' }
+            $lines.Add("    $($s.Tool) $dot `e[1m$($s.Title)`e[22m  `e[33m@$($s.RunningOn)`e[39m `e[2m($(if ($s.RunStatus) { $s.RunStatus } else { 'open' })$ago)`e[22m")
+        }
     }
     $lines.Add('')
-    $lines.Add("  Opening it here too makes two processes append to the same transcript.")
-    $lines.Add("  Close it on the other PC first, unless that entry is a leftover of a crash.")
+    $lines.Add("  Opening it again makes two processes append to the same transcript.")
+    if ($here.Count) { $lines.Add("  On this PC: $(if (@($here | Where-Object { $_.RunKind -ne 'bg' }).Count) { 'go to its window (Ctrl+F in the list) or ' })close it first (Ctrl+X).") }
+    if ($here.Count -lt $Sessions.Count) { $lines.Add("  On another PC: close it there first, unless that entry is a leftover of a crash.") }
     $lines.Add('')
-    $lines.Add("  `e[33m[y]`e[39m open anyway    `e[2many other key: back to the list`e[22m")
+    $lines.Add("  `e[33m[y]`e[39m open anyway$(if ($find) { "    `e[33m[f]`e[39m go to its window" })    `e[2many other key: back to the list`e[22m")
     Write-CcrScreen $lines
-    $k = [Console]::ReadKey($true)
-    ($k.KeyChar -eq 'y' -or $k.KeyChar -eq 'Y')
+    $k = "$([Console]::ReadKey($true).KeyChar)"
+    if ($k -eq 'y') { 'open' } elseif ($find -and $k -eq 'f') { 'find' } else { '' }
 }
 
 # Re-home a conversation: move its files into another account's data dir.
@@ -5249,7 +5261,7 @@ function Get-CcrPickerGuide([int]$Width, [bool]$AcctMode, [bool]$LimitsOn) {
         , @('Moving and opening',
             @("$([char]0x2191) $([char]0x2193)  PgUp PgDn  Home End", 'move'),
             @('Tab', $(if ($AcctMode) { 'mark a row, and press again to open it under another account: its own (green dot), another one (its number in the table on top: the conversation moves there), none' } else { 'mark / unmark a row' })),
-            @('Enter', 'open the marked rows, or the highlighted one: the first in this tab, the others as new tabs'),
+            @('Enter', 'open the marked rows, or the highlighted one: the first in this tab, the others as new tabs; a conversation already open, here or on another PC, asks first'),
             @('Shift+Enter  or  Ctrl+E', 'the same, with a model and an effort you pick first'),
             @('type', "filter by tool, account, title and folder, every word separated by a space must match; the words run, bg, cleared, archived, elsewhere and @host list those rows"),
             @('Esc', 'clear the filter, then leave'))
@@ -5772,6 +5784,28 @@ function Select-CcrSession {
             return $row
         }
     }
+    # Ctrl+F, and [f] on the already-open page: the window of a running
+    # conversation to the front, its tab selected, blinking.
+    function Find-CcrPickerWindow([object]$s) {
+        if ($s.RunningOn) { Show-CcrNotice "ccr: '$($s.Title)' is open on $($s.RunningOn) - its window is there." '33' }
+        elseif (-not $s.Running) { Show-CcrNotice "ccr: '$($s.Title)' is not running - there is no window to find." '33' }
+        elseif ($s.RunKind -eq 'bg') { Show-CcrNotice "ccr: '$($s.Title)' is a background session - it has no window." '33' }
+        elseif ($WhatIfPreference) { Show-CcrNotice "WhatIf: would bring the window of '$($s.Title)' (pid $($s.ProcessId)) to the front." '33' }
+        else {
+            [Console]::Write("`e[H`e[33mccr: looking for the window of '$($s.Title)'...`e[39m`e[K")
+            $why = Show-CcrSessionWindow -Session $s
+            if ($why) { Show-CcrNotice $why '33' }
+        }
+    }
+    # Before Enter / Shift+Enter open rows that are already open (here or on
+    # another PC): $true = open them all.
+    function Confirm-CcrPickerOpen([object[]]$rows) {
+        $open = @($rows | Where-Object { $_.Running -or $_.RunningOn })
+        if (-not $open.Count) { return $true }
+        $ans = Show-CcrOpenConfirm -Sessions $open
+        if ($ans -eq 'find') { Find-CcrPickerWindow $open[0] }
+        $ans -eq 'open'
+    }
     # A local account (Ollama only) gives and takes no conversation: its rows
     # cycle through their own account only, and no other row goes there.
     function Get-CcrAcctAvail([object]$row) {
@@ -5961,8 +5995,7 @@ function Select-CcrSession {
             if (($k.Key -eq [ConsoleKey]::Enter -and ($k.Modifiers -band [ConsoleModifiers]::Shift)) -or ($ctrl -and $k.Key -eq [ConsoleKey]::E)) {
                 $toOpen = @(Get-CcrPickerSelection)
                 if ($toOpen.Count -eq 0) { continue }
-                $elsewhere = @($toOpen | Where-Object { $_.RunningOn })
-                if ($elsewhere.Count -gt 0 -and -not (Show-CcrElsewhereConfirm -Sessions $elsewhere)) { continue }
+                if (-not (Confirm-CcrPickerOpen $toOpen)) { continue }
                 $opts = Show-CcrLaunchOptions -Sessions $toOpen -ClaudeRoots $AllClaudeRoots -CodexRoots $AllCodexRoots
                 if ($null -eq $opts) { continue }
                 foreach ($s in $toOpen) { $lk = Get-CcrLaunchKey $s; Set-CcrLaunchOption $s $opts[$lk].Model $opts[$lk].Effort }
@@ -6035,18 +6068,7 @@ function Select-CcrSession {
             # Ctrl+F: find the window of the running conversation of the
             # highlighted row - to the front, its tab selected, blinking.
             if ($k.Key -eq [ConsoleKey]::F -and $ctrl) {
-                if ($view.Count -gt 0) {
-                    $s = $view[$cursor]
-                    if ($s.RunningOn) { Show-CcrNotice "ccr: '$($s.Title)' is open on $($s.RunningOn) - its window is there." '33' }
-                    elseif (-not $s.Running) { Show-CcrNotice "ccr: '$($s.Title)' is not running - there is no window to find." '33' }
-                    elseif ($s.RunKind -eq 'bg') { Show-CcrNotice "ccr: '$($s.Title)' is a background session - it has no window." '33' }
-                    elseif ($WhatIfPreference) { Show-CcrNotice "WhatIf: would bring the window of '$($s.Title)' (pid $($s.ProcessId)) to the front." '33' }
-                    else {
-                        [Console]::Write("`e[H`e[33mccr: looking for the window of '$($s.Title)'...`e[39m`e[K")
-                        $why = Show-CcrSessionWindow -Session $s
-                        if ($why) { Show-CcrNotice $why '33' }
-                    }
-                }
+                if ($view.Count -gt 0) { Find-CcrPickerWindow $view[$cursor] }
                 continue
             }
             # Ctrl+G: the guide - every key, the signs on a row, the table on top.
@@ -6135,10 +6157,9 @@ function Select-CcrSession {
                     # Plain Enter: no model / effort flags (Shift+Enter above sets them).
                     $toOpen = @(Get-CcrPickerSelection)
                     foreach ($s in $toOpen) { Set-CcrLaunchOption $s '' '' }
-                    # A conversation open on another PC: ask first - two
-                    # processes would append to the same transcript.
-                    $elsewhere = @($toOpen | Where-Object { $_.RunningOn })
-                    if ($toOpen.Count -gt 0 -and ($elsewhere.Count -eq 0 -or (Show-CcrElsewhereConfirm -Sessions $elsewhere))) { return $toOpen }
+                    # A conversation already open, here or on another PC: ask
+                    # first - two processes would append to the same transcript.
+                    if ($toOpen.Count -gt 0 -and (Confirm-CcrPickerOpen $toOpen)) { return $toOpen }
                 }
                 'Delete' {
                     # The marked rows, or the highlighted one; rows still open are kept.
@@ -6396,7 +6417,7 @@ function Resume-CcSessions {
 
         Picker keys: Up/Down/PgUp/PgDn/Home/End move, Tab marks/unmarks,
         Enter opens the marked set (or the highlighted row if nothing is
-        marked), Ctrl+L asks every account for its usage limits again (the
+        marked; one already open, here or on another PC, asks first), Ctrl+L asks every account for its usage limits again (the
         table above the list), Shift+Enter (or Ctrl+E) opens it with a model and an effort
         chosen on a page - one section for the claude rows (--model,
         --effort), one for the codex rows (-m, -c model_reasoning_effort),

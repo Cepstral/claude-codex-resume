@@ -38,7 +38,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.96"
+VERSION = "0.97"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -2613,7 +2613,8 @@ def picker_guide(ctx, lim=None, width: int = 0) -> list:
                     "one (its number in the table on top: the conversation moves there), none" if cycle
                     else "mark / unmark a row"),
             ("Enter", "open the marked rows, or the highlighted one: the first here, the others as tabs "
-                      "(iTerm2, tmux) or windows (Terminal.app)"),
+                      "(iTerm2, tmux) or windows (Terminal.app); a conversation already open, here or on "
+                      "another PC, asks first"),
             ("Ctrl-E", "the same, with a model and an effort you pick first"),
         ] + ([("Ctrl-O", "open the marked rows under another account: the conversations move there first "
                          "(fzf older than 0.39; with a newer one Tab sets the account per row)")]
@@ -3301,16 +3302,62 @@ def confirm_close(s: Session) -> bool:
     return bool(ans) and ans.strip().lower() == "y"
 
 
-def confirm_elsewhere(sessions: list) -> bool:
-    """Before opening conversations that are open on another PC."""
-    print(f"\n{YELLOW}Open on another PC{RESET}\n")
+def confirm_open(sessions: list) -> str:
+    """Before opening conversations that are already open, on this PC or on
+    another one: two processes would append to the same transcript. "open"
+    (open anyway), "find" (the window of the one running here, offered for a
+    single row that has a window) or ""."""
+    here = [s for s in sessions if s.running]
+    find = len(sessions) == 1 and len(here) == 1 and here[0].run_kind != "bg"
+    print(f"\n{YELLOW}Already open{'' if here else ' on another PC'}{RESET}\n")
     for s in sessions:
-        ago = f", last update {fmt_age(s.run_updated)} ago" if s.run_updated else ""
-        print(f"    {s.tool} · {BOLD}{s.title}{RESET}  {YELLOW}@{s.running_on}{RESET} {DIM}({s.run_status or 'open'}{ago}){RESET}")
-    print("\n  Opening it here too makes two processes append to the same transcript.")
-    print("  Close it on the other PC first, unless that entry is a leftover of a crash.\n")
-    ans = ask(f"  {YELLOW}[y]{RESET} open anyway    {DIM}anything else: back to the list{RESET} > ")
-    return bool(ans) and ans.strip().lower() == "y"
+        if s.running:
+            kind = "background session" if s.run_kind == "bg" else "on this PC"
+            st = f" · {s.run_status}" if s.run_status else ""
+            print(f"    {s.tool} · {BOLD}{s.title}{RESET}  {RED}{'bg' if s.run_kind == 'bg' else 'run'}{RESET} "
+                  f"{DIM}({kind}, pid {s.pid}{st}){RESET}")
+        else:
+            ago = f", last update {fmt_age(s.run_updated)} ago" if s.run_updated else ""
+            print(f"    {s.tool} · {BOLD}{s.title}{RESET}  {YELLOW}@{s.running_on}{RESET} {DIM}({s.run_status or 'open'}{ago}){RESET}")
+    print("\n  Opening it again makes two processes append to the same transcript.")
+    if here:
+        win = "go to its window (Ctrl-F in the list) or " if any(s.run_kind != "bg" for s in here) else ""
+        print(f"  On this PC: {win}close it first (Ctrl-X).")
+    if len(here) < len(sessions):
+        print("  On another PC: close it there first, unless that entry is a leftover of a crash.")
+    ans = ask(f"\n  {YELLOW}[y]{RESET} open anyway" + (f"    {YELLOW}[f]{RESET} go to its window" if find else "")
+              + f"    {DIM}anything else: back to the list{RESET} > ")
+    ans = (ans or "").strip().lower()
+    return "open" if ans == "y" else "find" if find and ans == "f" else ""
+
+
+def find_picker_window(s: Session, dry: bool) -> None:
+    """Ctrl-F, and [f] on the already-open page: the window of a running
+    conversation to the front, its tab selected, blinking."""
+    if s.running_on:
+        why = f"'{s.title}' is open on {s.running_on} - its window is there."
+    elif not s.running:
+        why = f"'{s.title}' is not running - there is no window to find."
+    elif s.run_kind == "bg":
+        why = f"'{s.title}' is a background session - it has no window."
+    else:
+        print(f"{YELLOW}ccr: looking for the window of '{s.title}'...{RESET}")
+        why = find_window(s, dry)
+    if why:
+        print(f"{YELLOW}ccr: {why}{RESET}")
+        pause("(Enter to continue)")
+
+
+def confirm_picked_open(picked: list, dry: bool) -> bool:
+    """Before Enter / Ctrl-E open rows that are already open (here or on
+    another PC): True = open them all."""
+    still = [s for s in picked if s.running or s.running_on]
+    if not still:
+        return True
+    ans = confirm_open(still)
+    if ans == "find":
+        find_picker_window(still[0], dry)
+    return ans == "open"
 
 
 # ----------------------------------------------------------------------------
@@ -6902,19 +6949,7 @@ def main():
                 # Find the window of the running conversation of the highlighted
                 # row: to the front, its tab selected, blinking.
                 if here:
-                    s = here[0]
-                    if s.running_on:
-                        why = f"'{s.title}' is open on {s.running_on} - its window is there."
-                    elif not s.running:
-                        why = f"'{s.title}' is not running - there is no window to find."
-                    elif s.run_kind == "bg":
-                        why = f"'{s.title}' is a background session - it has no window."
-                    else:
-                        print(f"{YELLOW}ccr: looking for the window of '{s.title}'...{RESET}")
-                        why = find_window(s, a.dry_run)
-                    if why:
-                        print(f"{YELLOW}ccr: {why}{RESET}")
-                        pause("(Enter to continue)")
+                    find_picker_window(here[0], a.dry_run)
                 continue
             if key == "ctrl-x":
                 # Close the running conversation of the highlighted row (a stray
@@ -6983,8 +7018,7 @@ def main():
                 # cannot tell Shift+Enter from Enter).
                 if not picked:
                     continue
-                elsewhere = [x for x in picked if x.running_on]
-                if elsewhere and not confirm_elsewhere(elsewhere):
+                if not confirm_picked_open(picked, a.dry_run):
                     continue
                 opts = launch_options(picked, ctx)
                 if opts is None:
@@ -7023,10 +7057,9 @@ def main():
                 lbl = next(r.label for n, t, r in ctx.entries if str(n) == res[1][0])
                 for s in picked:
                     s.target_root = lbl
-            # A conversation open on another PC: ask first - two processes
-            # would append to the same transcript.
-            elsewhere = [s for s in picked if s.running_on]
-            if elsewhere and not confirm_elsewhere(elsewhere):
+            # A conversation already open, here or on another PC: ask first -
+            # two processes would append to the same transcript.
+            if not confirm_picked_open(picked, a.dry_run):
                 continue
             launch(picked, a.new_window, a.dry_run, ctx, a.terminal, a.tabs)
             return

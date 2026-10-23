@@ -29,6 +29,10 @@ record it in the parity table in `docs/multi-account.md`. Known cases so far:
   a background session, and close one with `claude stop <jobId>`. Codex has
   no registry, no background kind and no `stop`: its running flag is a
   process scan, `@host` and `bg` never apply, and Ctrl+X ends the process.
+  Opening a row that is already open asks first, here (`run`/`bg`) as well
+  as `@host` (v0.97; before only `@host` asked, and a second Enter on a
+  `run` row quietly started a second process on the same transcript):
+  Show-CcrOpenConfirm / confirm_open, `f` = Ctrl+F for a single `run` row.
 - Archived conversations (v0.75): `codex archive` moves a rollout from
   `sessions/YYYY/MM/DD` to a flat `archived_sessions/`, and codex refuses to
   resume it there ("session <id> is archived. Run `codex unarchive <id>`");

@@ -162,7 +162,7 @@ A title or folder too long for its column scrolls through it on the highlighted 
 
 Every selected conversation reopens with `claude --resume <id>` / `codex resume <id>`, each in the folder it was started in (Claude requires it; for Codex it keeps the agent's working root right). The **first one takes over the tab you ran `ccr` in**, so with a single selection `ccr` is simply "resume here"; the others open as new tabs (Windows Terminal: `wt -w 0`; iTerm2 tabs, Terminal.app windows, tmux windows). `-NewWindow` sends everything to a fresh window and leaves the current tab alone.
 
-- Enter on an `@host` row asks first: two processes would append to the same transcript.
+- Enter (and Shift+Enter) on a conversation that is already open asks first — a `run` / `bg` row on this PC or an `@host` row on another one: two processes would append to the same transcript. `y` opens it anyway; for a single `run` row, `f` brings its window to the front instead, like `Ctrl+F`.
 - A conversation whose tool is not installed on this PC is skipped, with a hint, instead of failing in its tab.
 - Under several accounts, each conversation starts under its own account (see [Several accounts](#several-accounts)).
 
