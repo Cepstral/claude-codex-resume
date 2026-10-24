@@ -38,7 +38,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.97"
+VERSION = "0.98"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()

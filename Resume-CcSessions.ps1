@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.97'
+$script:CcrVersion = '0.98'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -164,7 +164,7 @@ function Get-CcrCodexRoot {
 function Get-CcrConfig {
     $cfgPath = $script:CcrConfigPath
     if (-not $cfgPath -or -not (Test-Path -LiteralPath $cfgPath)) { return $null }
-    try { Get-Content -LiteralPath $cfgPath -Raw | ConvertFrom-Json }
+    try { Get-Content -LiteralPath $cfgPath -Raw -ErrorAction Stop | ConvertFrom-Json }
     catch { Write-Warning "ccr: cannot read $cfgPath ($_) - using the single default config dirs"; $null }
 }
 
@@ -337,7 +337,7 @@ function Get-CcrOllamaCloudProblem([string]$Url = $script:CcrOllamaUrl) {
     $off = $false
     try {
         $sj = Join-Path (Join-Path $HOME '.ollama') 'server.json'
-        if ((Test-Path -LiteralPath $sj) -and (Get-Content -LiteralPath $sj -Raw | ConvertFrom-Json).disable_ollama_cloud -eq $true) { $off = $true }
+        if ((Test-Path -LiteralPath $sj) -and (Get-Content -LiteralPath $sj -Raw -ErrorAction Stop | ConvertFrom-Json).disable_ollama_cloud -eq $true) { $off = $true }
     }
     catch { }
     foreach ($scope in 'Process', 'User', 'Machine') {
@@ -731,11 +731,11 @@ function Get-CcrQuickIdentity {
         if ($Tool -eq 'claude') {
             $f = Join-Path $RootPath '.claude.json'
             if (-not (Test-Path -LiteralPath $f)) { return '' }
-            return "$((Get-Content -LiteralPath $f -Raw | ConvertFrom-Json).oauthAccount.emailAddress)"
+            return "$((Get-Content -LiteralPath $f -Raw -ErrorAction Stop | ConvertFrom-Json).oauthAccount.emailAddress)"
         }
         $f = Join-Path $RootPath 'auth.json'
         if (-not (Test-Path -LiteralPath $f)) { return '' }
-        $jwt = "$((Get-Content -LiteralPath $f -Raw | ConvertFrom-Json).tokens.id_token)"
+        $jwt = "$((Get-Content -LiteralPath $f -Raw -ErrorAction Stop | ConvertFrom-Json).tokens.id_token)"
         if (-not $jwt) { return '' }
         $b = $jwt.Split('.')[1].Replace('-', '+').Replace('_', '/')
         $b += '=' * ((4 - $b.Length % 4) % 4)
@@ -788,7 +788,7 @@ function Save-CcrConfig([object]$Config) {
     # A file that exists but does not parse is never overwritten: it may
     # hold accounts the user can recover by fixing a stray character.
     if (Test-Path -LiteralPath $script:CcrConfigPath) {
-        try { $null = Get-Content -LiteralPath $script:CcrConfigPath -Raw | ConvertFrom-Json }
+        try { $null = Get-Content -LiteralPath $script:CcrConfigPath -Raw -ErrorAction Stop | ConvertFrom-Json }
         catch { throw "ccr: $($script:CcrConfigPath) exists but cannot be parsed ($_) - fix or remove it first; nothing overwritten" }
     }
     foreach ($key in 'claudeRoots', 'codexRoots') {
@@ -842,7 +842,7 @@ function Enable-CcrMultiAccount {
 function Test-CcrStatusline([string]$RootPath) {
     $sj = Join-Path $RootPath 'settings.json'
     if (-not (Test-Path -LiteralPath $sj)) { return $false }
-    try { [bool]((Get-Content -LiteralPath $sj -Raw | ConvertFrom-Json).PSObject.Properties['statusLine']) } catch { $false }
+    try { [bool]((Get-Content -LiteralPath $sj -Raw -ErrorAction Stop | ConvertFrom-Json).PSObject.Properties['statusLine']) } catch { $false }
 }
 
 # Give a claude account the status line of another one: the statusLine
@@ -933,7 +933,7 @@ function Add-CcrAccount {
                 try {
                     $defCj = Join-Path $from '.claude.json'
                     if (Test-Path -LiteralPath $defCj) {
-                        $dj = Get-Content -LiteralPath $defCj -Raw | ConvertFrom-Json
+                        $dj = Get-Content -LiteralPath $defCj -Raw -ErrorAction Stop | ConvertFrom-Json
                         foreach ($k in 'theme', 'lastOnboardingVersion') { if ($dj.PSObject.Properties[$k]) { $seed[$k] = $dj.$k } }
                     }
                 }
@@ -1065,7 +1065,9 @@ function Get-CcrClaudeRunningMap {
     foreach ($f in Get-ChildItem -LiteralPath $dir -Filter *.json -File -ErrorAction SilentlyContinue) {
         if ($f.BaseName -notmatch '^\d+$') { continue }
         try {
-            $o = Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json
+            # -ErrorAction Stop: a failed read (OneDrive: "the cloud operation was
+            # unsuccessful") is non-terminating and would slip past the catch.
+            $o = Get-Content -LiteralPath $f.FullName -Raw -ErrorAction Stop | ConvertFrom-Json
             if (-not $o.sessionId) { continue }
             $domHost = if ("$($o.pidDomain)" -match ':') { Get-CcrHostName (("$($o.pidDomain)" -split ':', 2)[1]) } else { '' }
             $updated = $f.LastWriteTimeUtc
@@ -4982,7 +4984,7 @@ function Get-CcrConfiguredModel {
             if ($Tool -eq 'claude') {
                 $f = Join-Path $p 'settings.json'
                 if (Test-Path -LiteralPath $f) {
-                    $j = Get-Content -LiteralPath $f -Raw | ConvertFrom-Json
+                    $j = Get-Content -LiteralPath $f -Raw -ErrorAction Stop | ConvertFrom-Json
                     $m = "$($j.model)"; $e = "$($j.effortLevel)"
                     if ($j.modelSettings -and @($j.modelSettings.PSObject.Properties).Count) { $perModel = $true }
                 }
@@ -4990,7 +4992,7 @@ function Get-CcrConfiguredModel {
             else {
                 $f = Join-Path $p 'config.toml'
                 if (Test-Path -LiteralPath $f) {
-                    foreach ($line in Get-Content -LiteralPath $f) {
+                    foreach ($line in Get-Content -LiteralPath $f -ErrorAction Stop) {
                         if ($line -match '^\s*\[') { break }   # top-level keys only
                         if ($line -match '^\s*model\s*=\s*"([^"]*)"') { $m = $Matches[1] }
                         elseif ($line -match '^\s*model_reasoning_effort\s*=\s*"([^"]*)"') { $e = $Matches[1] }
@@ -5379,7 +5381,7 @@ function Get-CcrLimitsCache {
     $p = Get-CcrLimitsPath
     if ($p -and (Test-Path -LiteralPath $p)) {
         try {
-            $c = Get-Content -LiteralPath $p -Raw | ConvertFrom-Json -AsHashtable
+            $c = Get-Content -LiteralPath $p -Raw -ErrorAction Stop | ConvertFrom-Json -AsHashtable
             if ($c -is [System.Collections.IDictionary]) { return $c }
         }
         catch { }
@@ -6322,7 +6324,7 @@ function Get-CcrStatePath {
 function Get-CcrState {
     $p = Get-CcrStatePath
     if ($p -and (Test-Path -LiteralPath $p)) {
-        try { return (Get-Content -LiteralPath $p -Raw | ConvertFrom-Json -AsHashtable) } catch { }
+        try { return (Get-Content -LiteralPath $p -Raw -ErrorAction Stop | ConvertFrom-Json -AsHashtable) } catch { }
     }
     @{}
 }

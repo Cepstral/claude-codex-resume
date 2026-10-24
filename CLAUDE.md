@@ -361,6 +361,16 @@ codex 0.160, Ollama 0.40.7), and why it is built this way:
   under `-WhatIf` it prints "What if: ... property ..." and returns nothing.
   Always write `ForEach-Object { $_.Member }` - a launch check and the
   account cycling silently broke under `ccr -WhatIf` before 2026-09-29.
+- A cmdlet's failed read (`Get-Content` on a missing, locked or unreadable
+  file) is a non-terminating error: `try { ... } catch { }` does not catch
+  it, so the red error prints and the code goes on with `$null`. Every read
+  inside a try that is meant to swallow or reword the failure takes
+  `-ErrorAction Stop` (`[IO.File]` methods throw anyway; Python's
+  `except Exception` covers OSError). Found on 2026-10-24 (v0.98): a
+  OneDrive that could not download printed "L'operazione cloud non è
+  riuscita" (the cloud operation was unsuccessful) for the other PC's
+  `sessions\<pid>.json` on every ccr start. The same gap let
+  `Save-CcrConfig` overwrite a ccr.json it could not read.
 - Windows Terminal splits its whole command line on `;`, inside a quoted
   `-Command` argument too, so every `;` in the command a tab runs has to
   reach `wt.exe` as `\;`. The account env prefix carries one, and without
