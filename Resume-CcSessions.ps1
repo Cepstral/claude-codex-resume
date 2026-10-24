@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.98'
+$script:CcrVersion = '0.99'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -452,10 +452,13 @@ stream_idle_timeout_ms = $script:CcrLocalCodexIdleMs
 # Add the long waits above to a local account's files where they are missing,
 # and in claude's env and permissions any key a newer ccr pins (an account
 # made by an older one lacks it). A value already there is never changed.
+# A file it cannot read or parse is left as it is (written back, it would
+# lose what it holds); the check before a start reports it.
 function Add-CcrLocalWaits([string]$Tool, [string]$Dir) {
     if ($Tool -eq 'claude') {
         $sj = Join-Path $Dir 'settings.json'
-        $cfg = Get-Content -LiteralPath $sj -Raw | ConvertFrom-Json
+        try { $cfg = Get-Content -LiteralPath $sj -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop } catch { return }
+        if (-not $cfg) { return }
         $want = [ordered]@{}
         foreach ($m in $script:CcrLocalClaudeEnv, $script:CcrLocalClaudeWaitEnv) { foreach ($k in $m.Keys) { $want[$k] = $m[$k] } }
         $miss = @($want.Keys | Where-Object { -not $cfg.env.PSObject.Properties[$_] })
@@ -468,7 +471,8 @@ function Add-CcrLocalWaits([string]$Tool, [string]$Dir) {
         return
     }
     $ct = Join-Path $Dir 'config.toml'
-    $t = Get-Content -LiteralPath $ct -Raw
+    try { $t = Get-Content -LiteralPath $ct -Raw -ErrorAction Stop } catch { return }
+    if (-not $t) { return }
     $prov = [regex]::Escape($script:CcrOllamaProvider)
     if ($t -match "(?ms)^\[model_providers\.$prov\][^\[]*?^\s*stream_idle_timeout_ms\s*=") { return }
     $t = ([regex]"(?m)^\[model_providers\.$prov\][ \t]*\r?\n").Replace($t, '$0' + "stream_idle_timeout_ms = $script:CcrLocalCodexIdleMs`n", 1)
@@ -480,12 +484,17 @@ function Add-CcrLocalWaits([string]$Tool, [string]$Dir) {
 # written whole, the previous one kept as config.toml.bak-<date> when it did
 # not point at Ollama. Plus the long waits where missing, and claude's
 # first-start flag, as Add-CcrAccount. -Url: the Ollama it talks to (this
-# PC's unless given).
+# PC's unless given). A file there that cannot be read, parsed or backed up
+# stops it before anything is written.
 function Set-CcrLocalPin([string]$Tool, [string]$Dir, [string]$Url = $script:CcrOllamaUrl) {
     New-Item -ItemType Directory -Path $Dir -Force | Out-Null
     if ($Tool -eq 'claude') {
         $sj = Join-Path $Dir 'settings.json'
-        $cfg = if (Test-Path -LiteralPath $sj) { Get-Content -LiteralPath $sj -Raw | ConvertFrom-Json } else { [pscustomobject]@{} }
+        $cfg = if (Test-Path -LiteralPath $sj) {
+            try { Get-Content -LiteralPath $sj -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop }
+            catch { throw "ccr: cannot read $sj ($_) - fix or remove it first; nothing changed" }
+        }
+        else { [pscustomobject]@{} }
         if (-not $cfg) { $cfg = [pscustomobject]@{} }
         $envObj = if ($cfg.PSObject.Properties['env'] -and $cfg.env) { $cfg.env } else { [pscustomobject]@{} }
         foreach ($k in $script:CcrLocalClaudeEnv.Keys) { $envObj | Add-Member -NotePropertyName $k -NotePropertyValue $script:CcrLocalClaudeEnv[$k] -Force }
@@ -504,7 +513,8 @@ function Set-CcrLocalPin([string]$Tool, [string]$Dir, [string]$Url = $script:Ccr
     else {
         $ct = Join-Path $Dir 'config.toml'
         if ((Test-Path -LiteralPath $ct) -and (Get-CcrLocalPinProblem codex $Dir $Url)) {
-            Copy-Item -LiteralPath $ct -Destination "$ct.bak-$(Get-Date -Format 'yyyy-MM-dd-HHmmss')"
+            try { Copy-Item -LiteralPath $ct -Destination "$ct.bak-$(Get-Date -Format 'yyyy-MM-dd-HHmmss')" -ErrorAction Stop }
+            catch { throw "ccr: cannot back up $ct ($_) - fix or remove it first; nothing changed" }
         }
         if (-not (Test-Path -LiteralPath $ct) -or (Get-CcrLocalPinProblem codex $Dir $Url)) {
             Set-Content -LiteralPath $ct -Value (Get-CcrLocalCodexToml $Url) -Encoding utf8NoBOM
@@ -854,10 +864,15 @@ function Copy-CcrStatusline {
     param([Parameter(Mandatory)][string]$FromPath, [Parameter(Mandatory)][string]$ToPath)
     $src = Join-Path $FromPath 'settings.json'
     if (-not (Test-CcrStatusline $FromPath)) { throw "ccr: no statusLine in $src - nothing to copy" }
-    $entry = (Get-Content -LiteralPath $src -Raw | ConvertFrom-Json).statusLine
+    $entry = (Get-Content -LiteralPath $src -Raw -ErrorAction Stop | ConvertFrom-Json).statusLine
     New-Item -ItemType Directory -Path $ToPath -Force | Out-Null
     $dst = Join-Path $ToPath 'settings.json'
-    $cfg = if (Test-Path -LiteralPath $dst) { Get-Content -LiteralPath $dst -Raw | ConvertFrom-Json } else { [pscustomobject]@{} }
+    # A target it cannot read or parse is not written back (it would lose what it holds).
+    $cfg = if (Test-Path -LiteralPath $dst) {
+        try { Get-Content -LiteralPath $dst -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop }
+        catch { throw "ccr: cannot read $dst ($_) - status line not copied" }
+    }
+    else { [pscustomobject]@{} }
     $cfg | Add-Member -NotePropertyName statusLine -NotePropertyValue $entry -Force
     # Depth 100 (the maximum): a settings.json can nest deeper than 10 (MCP
     # server configs, permission trees) and a shallow depth would truncate it.

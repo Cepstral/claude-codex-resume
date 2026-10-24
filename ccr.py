@@ -38,7 +38,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.98"
+VERSION = "0.99"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 HOME = Path.home()
@@ -721,10 +721,16 @@ def add_local_waits(tool: str, d: str):
     """Add the long waits above to a local account's files where they are
     missing, and in claude's env and permissions any key a newer ccr pins
     (an account made by an older one lacks it). A value already there is
-    never changed."""
+    never changed. A file it cannot read or parse is left as it is (written
+    back, it would lose what it holds); the check before a start reports it."""
     if tool == "claude":
         sj = Path(d) / "settings.json"
-        cfg = json.loads(sj.read_text(encoding="utf-8"))
+        try:
+            cfg = json.loads(sj.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(cfg, dict):
+            return
         want = {**LOCAL_CLAUDE_ENV, **LOCAL_CLAUDE_WAIT_ENV}
         miss = [k for k in want if k not in cfg["env"]]
         perm = cfg.get("permissions") if isinstance(cfg.get("permissions"), dict) else {}
@@ -736,7 +742,12 @@ def add_local_waits(tool: str, d: str):
             sj.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
         return
     ct = Path(d) / "config.toml"
-    t = ct.read_text(encoding="utf-8")
+    try:
+        t = ct.read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return
+    if not t:
+        return
     prov = re.escape(OLLAMA_PROVIDER)
     if re.search(rf"(?ms)^\[model_providers\.{prov}\][^\[]*?^\s*stream_idle_timeout_ms\s*=", t):
         return
@@ -751,11 +762,15 @@ def set_local_pin(tool: str, d: str, url: str = OLLAMA_URL):
     is written whole, the previous one kept as config.toml.bak-<date> when it
     did not point at Ollama. Plus the long waits where missing, and claude's
     first-start flag. url: the Ollama it talks to (this computer's unless
-    given)."""
+    given). A file there that cannot be read, parsed or backed up stops it
+    before anything is written."""
     Path(d).mkdir(parents=True, exist_ok=True)
     if tool == "claude":
         sj = Path(d) / "settings.json"
-        cfg = json.loads(sj.read_text(encoding="utf-8")) if sj.is_file() else {}
+        try:
+            cfg = json.loads(sj.read_text(encoding="utf-8") or "null") if sj.is_file() else {}
+        except (OSError, ValueError) as e:
+            raise RuntimeError(f"ccr: cannot read {sj} ({e}) - fix or remove it first; nothing changed")
         cfg = cfg if isinstance(cfg, dict) else {}
         env = cfg.get("env") if isinstance(cfg.get("env"), dict) else {}
         env.update(LOCAL_CLAUDE_ENV)
@@ -780,7 +795,10 @@ def set_local_pin(tool: str, d: str, url: str = OLLAMA_URL):
     else:
         ct = Path(d) / "config.toml"
         if ct.is_file() and local_pin_problem("codex", d, url):
-            shutil.copy2(ct, f"{ct}.bak-{datetime.now().strftime('%Y-%m-%d-%H%M%S')}")
+            try:
+                shutil.copy2(ct, f"{ct}.bak-{datetime.now().strftime('%Y-%m-%d-%H%M%S')}")
+            except OSError as e:
+                raise RuntimeError(f"ccr: cannot back up {ct} ({e}) - fix or remove it first; nothing changed")
         if not ct.is_file() or local_pin_problem("codex", d, url):
             ct.write_text(local_codex_toml(url), encoding="utf-8")
     add_local_waits(tool, d)
@@ -1102,7 +1120,11 @@ def copy_statusline(from_path: str, to_path: str):
     entry = json.loads(src.read_text(encoding="utf-8"))["statusLine"]
     Path(to_path).mkdir(parents=True, exist_ok=True)
     dst = Path(to_path) / "settings.json"
-    cfg = json.loads(dst.read_text(encoding="utf-8")) if dst.is_file() else {}
+    # A target it cannot read or parse is not written back (it would lose what it holds).
+    try:
+        cfg = json.loads(dst.read_text(encoding="utf-8")) if dst.is_file() else {}
+    except (OSError, ValueError) as e:
+        raise RuntimeError(f"ccr: cannot read {dst} ({e}) - status line not copied")
     cfg["statusLine"] = entry
     dst.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
     files = [f for f in Path(from_path).glob("statusline*") if f.is_file() and f.suffix not in (".log", ".txt")]

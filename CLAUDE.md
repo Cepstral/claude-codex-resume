@@ -371,6 +371,14 @@ codex 0.160, Ollama 0.40.7), and why it is built this way:
   riuscita" (the cloud operation was unsuccessful) for the other PC's
   `sessions\<pid>.json` on every ccr start. The same gap let
   `Save-CcrConfig` overwrite a ccr.json it could not read.
+  And a helper that reads a file and writes it back never writes one it
+  could not read or parse (v0.99): with reading denied, v0.98's
+  Set-CcrLocalPin left settings.json / config.toml empty (the codex
+  backup copy had failed too), and Copy-CcrStatusline said "copied". Now
+  Add-CcrLocalWaits / add_local_waits returns (the start check reports the
+  file), Set-CcrLocalPin / set_local_pin and Copy-CcrStatusline /
+  copy_statusline stop with "ccr: cannot read <file> (...)". Python raised
+  before writing already; it now gives the same messages.
 - Windows Terminal splits its whole command line on `;`, inside a quoted
   `-Command` argument too, so every `;` in the command a tab runs has to
   reach `wt.exe` as `\;`. The account env prefix carries one, and without
