@@ -128,6 +128,7 @@ The line above the list names only the essentials. **`Ctrl+G`** (or **`F1`**) op
 | [open](#opening-enter) the marked rows, or the highlighted one | `Enter` | `Enter` |
 | open them with a [model and an effort](#model-and-effort) | `Shift+Enter` or `Ctrl+E` | `Ctrl-E` |
 | [new conversation](#new-conversation) | `Ctrl+N` | `Ctrl-N` |
+| [a copy](#a-copy-of-a-conversation) of the highlighted conversation, under a new name | `Ctrl+Y` | `Ctrl-Y` |
 | [MAP](#map-the-multi-agent-panel), the multi-agent panel | `Ctrl+P` | `Ctrl-P` |
 | [accounts page](#several-accounts) | `Ctrl+A` | `Ctrl-A` |
 | open under [another account](#several-accounts) | `Tab` cycles the account of the row | `Tab` cycles it too (fzf 0.39+; older fzf: `Tab` marks, `Ctrl-O` picks the account) |
@@ -191,6 +192,15 @@ Every field starts at *no override* — the same as a plain `Enter` — with the
 4. **Account**, only when that tool has more than one.
 
 `MAP` asks for the question instead, then sets up its agents — the same pages as `Ctrl+P`.
+
+### A copy of a conversation
+
+`Ctrl+Y` (`Ctrl-Y` on macOS / Linux) copies the highlighted conversation, history and all, and opens the copy in the current tab, like `Enter`. From there the copy goes on by itself: ask it something else and the original never sees it. ccr asks for the copy's **name** first; leave it empty for `<title> (copy)`, or press `Esc` (`Ctrl-C` on macOS / Linux) to go back.
+
+- The original stays as it is, and it may be open in another tab right now: a copy is a new conversation with an id of its own, so nothing asks first.
+- **Claude Code** makes the copy itself: `claude --resume <id> --fork-session --name <name>`, in the original's folder and account. Claude writes the copy's transcript at its first message, so a copy you leave without typing anything is gone.
+- **Codex** has `codex fork`, but it takes no name and does not say which id the copy gets. So ccr asks Codex's own app-server, the same way the IDE extension does: `thread/fork` makes the copy (in the original's folder and account, as a normal user conversation) and `thread/name/set` names it; then ccr runs `codex resume <copy id>`. No model is involved. Codex app conversations (macOS) are copied the same way, and the copy opens in the terminal.
+- `-WhatIf` / `--dry-run` prints what would run, with `<copy>` in place of the id Codex would give.
 
 ### Several accounts
 
@@ -356,7 +366,7 @@ Outside iTerm2, Terminal.app and tmux (e.g. a bare SSH shell) only the first sel
 
 ### The fzf picker
 
-The key line sits above the prompt, with `Ctrl-G` / `F1` for the guide; on the new-conversation pages it says which step you are on and which folder you chose. Everything beyond the plain picker is version-gated, so an older fzf loses the marked counter or the line highlight rather than refusing to start. The config file is `$CCR_CONFIG` or `~/.config/ccr/ccr.json` (same keys as on Windows).
+The key line sits above the prompt, with `Ctrl-G` / `F1` for the guide; on the new-conversation pages it says which step you are on and which folder you chose. `Ctrl-Y` (a copy) asks the copy's name on a plain line once fzf has closed, as the new-conversation name does; `Ctrl-C` there goes back to the list (on Windows: a box above the list, `Esc`). Everything beyond the plain picker is version-gated, so an older fzf loses the marked counter or the line highlight rather than refusing to start. The config file is `$CCR_CONFIG` or `~/.config/ccr/ccr.json` (same keys as on Windows).
 
 *The Python port is verified against the same session data as the PowerShell version, and the Terminal.app path on a Mac; the iTerm2 scripting is still written from its dictionary alone — report anything odd with `ccr --dry-run`, which prints the exact AppleScript it would run.*
 

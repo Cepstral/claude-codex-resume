@@ -66,6 +66,29 @@ record it in the parity table in `docs/multi-account.md`. Known cases so far:
   disk, so its list is the `claude --model` aliases + `.claude.json`
   `additionalModelOptionsCache` + the settings.json model. Codex app threads
   (ccr.py) take no model from outside: ccr warns and hands them to the app.
+- A copy under a new name (Ctrl+Y on both sides, v0.100; Luca asked for
+  Ctrl+F, which is find-window, and chose Ctrl+Y): the highlighted row only,
+  no "already open" question (the copy has an id of its own), opened like
+  Enter in this tab, under the row's own account. Claude: `--resume <id>
+  --fork-session --name <name>`. Codex: `codex fork` takes no name and tells
+  nothing of the new id, so its app-server makes the copy (New-CcrCodexFork /
+  new_codex_fork: `thread/fork` with `excludeTurns`, `threadSource: user` -
+  without it the copy's session_meta has an empty thread_source -, then
+  `thread/name/set`), and ccr resumes the new id; `<copy>` stands for it
+  under -WhatIf / --dry-run. Verified on 2026-11-19 (claude 2.1.328, codex
+  0.160, GRINDELWALD, the real picker driven in a hidden console): the
+  claude copy registers its new id and name at start but writes its
+  transcript only at the first message, and its last `custom-title` line is
+  the new name (ccr's title rule: last one wins); a claude started with
+  Claude Code's child-session variables inherited (`CLAUDE_CODE_CHILD_SESSION`,
+  i.e. from a Bash/PowerShell tool of a Claude session) saves nothing at all
+  ("Transcript saving is off") - tests must clear `CLAUDE*` but
+  CLAUDE_CONFIG_DIR. The codex copy keeps the original's cwd, has
+  `forked_from_id`, `source: vscode`, `originator: codex-tui`; its name lands in
+  session_index.jsonl (accents intact: stdin is UTF-8); the app-server starts
+  the thread's MCP servers while it runs and they end with it. A test copy of a
+  guardian subagent thread was named "Guardian review" by codex itself before
+  ccr's name (newer, wins).
 - Installing (Ctrl+I / Ctrl+T, -Install): both vendors publish a standalone
   installer (claude.ai/install.ps1|sh, chatgpt.com/codex/install.ps1|sh), and
   ccr fetches it from that URL at install time and runs it as published -

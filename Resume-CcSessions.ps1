@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.99'
+$script:CcrVersion = '0.100'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -2210,6 +2210,69 @@ function Get-CcrCodexCuratedName([string]$RootPath, [string]$SessionId) {
 
 # Append one {"id","thread_name","updated_at"} line to an account's
 # session_index.jsonl, the format codex writes there (last entry wins).
+# Ctrl+Y on a codex row: the copy is made by codex's app-server, as the IDE
+# extension makes one. `codex fork` takes no name and tells ccr no id, so
+# thread/fork writes the new rollout (forked_from_id = the original, the
+# original's cwd), marked a user thread as the CLI marks its own (ccr lists
+# only those), and thread/name/set names it in the account's catalog and
+# session_index.jsonl. Nothing reaches a model. While it runs the app-server
+# starts the thread's MCP servers; they end with it. Returns the copy's id.
+function New-CcrCodexFork([string]$RootPath, [string]$SessionId, [string]$Name) {
+    $exe = "$(@(Get-Command codex -CommandType Application -ErrorAction SilentlyContinue)[0].Source)"
+    if (-not $exe) { throw 'codex is not installed here' }
+    $psi = [System.Diagnostics.ProcessStartInfo]::new($exe, 'app-server')
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    # The name goes in as typed, accents included.
+    $psi.StandardInputEncoding = [Text.UTF8Encoding]::new($false)
+    $psi.StandardOutputEncoding = [Text.UTF8Encoding]::new($false)
+    $psi.WorkingDirectory = [IO.Path]::GetTempPath()
+    if ($RootPath) { $psi.EnvironmentVariables['CODEX_HOME'] = $RootPath }
+    $p = [System.Diagnostics.Process]::Start($psi)
+    $null = $p.StandardError.ReadToEndAsync()
+    $in = $p.StandardInput
+    # One request, then the answer with its id (notifications skipped).
+    $call = {
+        param([int]$Id, [string]$Method, [object]$Params, [int]$Seconds)
+        $in.WriteLine((@{ jsonrpc = '2.0'; id = $Id; method = $Method; params = $Params } | ConvertTo-Json -Compress -Depth 6))
+        $in.Flush()
+        $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
+        while ($true) {
+            $task = $p.StandardOutput.ReadLineAsync()
+            $left = [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds
+            if ($left -le 0 -or -not $task.Wait($left)) { throw "codex app-server: no answer to $Method in $Seconds s" }
+            $line = $task.Result
+            if ($null -eq $line) { throw 'codex app-server ended' }
+            if ($line -notmatch "`"id`"\s*:\s*$Id\b") { continue }
+            try { $j = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+            # a request of the server's own may carry the same number
+            if ($j.PSObject.Properties['method'] -or "$($j.id)" -ne "$Id") { continue }
+            if ($j.PSObject.Properties['error'] -and $j.error) { throw "codex app-server: $Method - $($j.error.message)" }
+            return $j.result
+        }
+    }
+    try {
+        $null = & $call 1 'initialize' @{ clientInfo = @{ name = 'ccr'; version = $script:CcrVersion } } 30
+        $in.WriteLine('{"jsonrpc":"2.0","method":"initialized"}')
+        $in.Flush()
+        $r = & $call 2 'thread/fork' @{ threadId = $SessionId; excludeTurns = $true; threadSource = 'user' } 120
+        $newId = "$($r.thread.id)"
+        if ($newId -notmatch '^[0-9a-fA-F-]{36}$') { throw "codex app-server: thread/fork gave no thread id" }
+        if ($Name) {
+            try { $null = & $call 3 'thread/name/set' @{ threadId = $newId; name = $Name } 30 }
+            catch { Write-Warning "ccr: the copy has no name ($_) - /rename inside it names it" }
+        }
+        $newId
+    }
+    finally {
+        try { $in.Close() } catch { }
+        if (-not $p.WaitForExit(5000)) { try { $p.Kill($true) } catch { try { $p.Kill() } catch { } } }
+    }
+}
+
 function Add-CcrCodexIndexName([string]$RootPath, [string]$SessionId, [string]$Name) {
     $idx = Join-Path $RootPath 'session_index.jsonl'
     $line = ([ordered]@{ id = $SessionId; thread_name = $Name; updated_at = [DateTime]::UtcNow.ToString('o') } | ConvertTo-Json -Compress) + "`n"
@@ -5284,7 +5347,8 @@ function Get-CcrPickerGuide([int]$Width, [bool]$AcctMode, [bool]$LimitsOn) {
             @('Esc', 'clear the filter, then leave'))
         , @('New',
             @('Ctrl+N', 'a new conversation: the folder, then claude, codex or MAP'),
-            @('Ctrl+P', 'MAP: 2-4 agents discuss one question in a folder until they agree, each in a tab of its own'))
+            @('Ctrl+P', 'MAP: 2-4 agents discuss one question in a folder until they agree, each in a tab of its own'),
+            @('Ctrl+Y', 'a copy of the highlighted conversation under a name you type: it opens here and goes on on its own, the original stays as it is (it may be open right now)'))
         , @('Looking',
             @('Ctrl+K', 'token-usage column: the tokens of each session in the last hours, and its share'),
             @('Ctrl+J', 'the usage details of the highlighted row'))
@@ -6086,6 +6150,26 @@ function Select-CcrSession {
             # highlighted row - to the front, its tab selected, blinking.
             if ($k.Key -eq [ConsoleKey]::F -and $ctrl) {
                 if ($view.Count -gt 0) { Find-CcrPickerWindow $view[$cursor] }
+                continue
+            }
+            # Ctrl+Y: a copy of the highlighted conversation under a name asked
+            # here, opened like Enter; from there it goes on on its own. The
+            # original stays as it is and may be open right now: no question.
+            if ($k.Key -eq [ConsoleKey]::Y -and $ctrl) {
+                if ($view.Count -gt 0) {
+                    $s = $view[$cursor]
+                    $dflt = "$($s.Title) (copy)"
+                    $name = Read-CcrInput -Prompt 'name of the copy> ' `
+                        -Hint "a copy of $($s.Tool) $([char]0x00B7) '$($s.Title)' $([char]0x00B7) Enter confirm (empty = '$dflt') $([char]0x00B7) Esc back"
+                    if ($null -ne $name) {
+                        $name = $name.Trim()
+                        if (-not $name) { $name = $dflt }
+                        Set-CcrLaunchOption $s '' ''
+                        $s | Add-Member -NotePropertyName TargetRoot -NotePropertyValue $null -Force
+                        $s | Add-Member -NotePropertyName ForkName -NotePropertyValue $name -Force
+                        return $s
+                    }
+                }
                 continue
             }
             # Ctrl+G: the guide - every key, the signs on a row, the table on top.
@@ -7041,6 +7125,13 @@ function Resume-CcSessions {
         # Model / effort flags only when the Shift+Enter page chose them;
         # otherwise the tool's own settings apply.
         $argv = @(if ($s.Tool -eq 'claude') { 'claude', '--resume', $s.SessionId } else { 'codex', 'resume', $s.SessionId })
+        # Ctrl+Y, a copy: claude copies the transcript itself and takes the
+        # name at the start; codex's copy is made right before the start
+        # (New-CcrCodexFork, below), and <copy> stands for its id until then.
+        $forkName = if ($s.PSObject.Properties['ForkName']) { "$($s.ForkName)" } else { '' }
+        if ($forkName) {
+            $argv = @(if ($s.Tool -eq 'claude') { 'claude', '--resume', $s.SessionId, '--fork-session', '--name', $forkName } else { 'codex', 'resume', '<copy>' })
+        }
         $lm = if ($s.PSObject.Properties['LaunchModel']) { "$($s.LaunchModel)" } else { '' }
         $le = if ($s.PSObject.Properties['LaunchEffort']) { "$($s.LaunchEffort)" } else { '' }
         $vars = $null
@@ -7086,7 +7177,7 @@ function Resume-CcSessions {
         else { $argv += @(Get-CcrOverrideArgs $s.Tool $lm $le) }
         $cmd = Join-CcrArgv $argv 'pwsh'
         $cmdSh = Join-CcrArgv $argv 'sh'
-        $launch.Add([pscustomobject]@{ Tool = $s.Tool; Title = $s.Title; Cwd = $cwd; Command = $cmd; CommandSh = $cmdSh; Argv = $argv; RootPath = $rootPath; Session = $s; MoveTo = $moveTo; Vars = $vars })
+        $launch.Add([pscustomobject]@{ Tool = $s.Tool; Title = $(if ($forkName) { $forkName } else { $s.Title }); Cwd = $cwd; Command = $cmd; CommandSh = $cmdSh; Argv = $argv; RootPath = $rootPath; Session = $s; MoveTo = $moveTo; Vars = $vars; Fork = $forkName })
     }
     if ($launch.Count -eq 0) { Write-Warning 'ccr: nothing to open.'; return }
 
@@ -7107,7 +7198,8 @@ function Resume-CcSessions {
     }
 
     $moves = @($launch | Where-Object MoveTo)
-    $what = ($launch | ForEach-Object { "$($_.Tool):$($_.Title)$(if ($_.MoveTo) { " -> account $($_.MoveTo.Label)" })" }) -join ', '
+    $codexForks = @($launch | Where-Object { $_.Fork -and $_.Tool -eq 'codex' })
+    $what = ($launch | ForEach-Object { "$($_.Tool):$($_.Title)$(if ($_.Fork) { " (a copy of '$($_.Session.Title)')" })$(if ($_.MoveTo) { " -> account $($_.MoveTo.Label)" })" }) -join ', '
     $go = $PSCmdlet.ShouldProcess($what, "open as terminal tabs$(if ($moves.Count) { ", re-homing $($moves.Count)" })")
     if ($go) {
         # Archived codex conversations first: codex will not resume (or ccr
@@ -7128,6 +7220,22 @@ function Resume-CcSessions {
                 Write-Warning "ccr: could not move '$($m.Title)' to '$($m.MoveTo.Label)': $_ - it opens under '$($m.Session.Root)' instead"
                 $m.RootPath = $m.Session.RootPath
                 $m.MoveTo = $null
+            }
+        }
+        # Ctrl+Y on a codex row: its app-server makes and names the copy, and
+        # the resume opens that. No copy, nothing opened.
+        foreach ($l in $codexForks) {
+            try {
+                $newId = New-CcrCodexFork -RootPath $l.RootPath -SessionId $l.Session.SessionId -Name $l.Fork
+                Write-Host "ccr: copied '$($l.Session.Title)' as '$($l.Fork)'"
+                $l.Argv = @($l.Argv | ForEach-Object { if ($_ -eq '<copy>') { $newId } else { $_ } })
+                $l.Command = Join-CcrArgv $l.Argv 'pwsh'
+                $l.CommandSh = Join-CcrArgv $l.Argv 'sh'
+            }
+            catch {
+                Write-Warning "ccr: could not copy '$($l.Session.Title)': $_"
+                if ($inline -eq $l) { $inline = $null }
+                $tabs = @($tabs | Where-Object { $_ -ne $l })
             }
         }
     }
@@ -7184,6 +7292,7 @@ function Resume-CcSessions {
     }
     else {
         foreach ($m in $moves) { "move: $($m.Tool) $([char]0x00B7) $($m.Title)  ->  account '$($m.MoveTo.Label)' ($($m.MoveTo.Path))" }
+        foreach ($l in $codexForks) { "copy: codex $([char]0x00B7) $($l.Session.Title)  ->  '$($l.Fork)'  (codex app-server: thread/fork, thread/name/set; <copy> = the copy's id)" }
         if ($inline) { "this tab: $(Get-CcrRootPrefix $inline.Tool $inline.RootPath 'pwsh' $inline.Vars)$($inline.Command)   (cd $($inline.Cwd))" }
         if ($tabs.Count -gt 0) {
             if ($IsWindows) { "wt.exe $($wtArgs -join ' ')" }

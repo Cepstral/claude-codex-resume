@@ -18,6 +18,7 @@ import ctypes
 import json
 import math
 import os
+import queue
 import re
 import shlex
 import shutil
@@ -38,9 +39,12 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.99"
+VERSION = "0.100"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
+# Ctrl-Y on a codex row: stands for the copy's id in the resume command until
+# its app-server has made the copy (new_codex_fork).
+FORK_ID = "<copy>"
 HOME = Path.home()
 # CCR_FZF may be a full command (e.g. "fzf-tmux -p"); split like a shell would.
 FZF = shlex.split(os.environ.get("CCR_FZF") or "fzf")
@@ -277,7 +281,9 @@ class Session:
                  # kind ("bg" = a background session) / status / last update of the run
                  "running_on", "run_kind", "run_status", "run_updated", "run_job",
                  # model / effort chosen with Ctrl-E ('' = no flag)
-                 "model_override", "effort_override")
+                 "model_override", "effort_override",
+                 # Ctrl-Y: open a copy of it under this name ('' = the conversation itself)
+                 "fork_name")
 
     def __init__(self, **kw):
         for k in self.__slots__:
@@ -293,6 +299,7 @@ class Session:
         self.run_status = self.run_status or ""
         self.model_override = self.model_override or ""
         self.effort_override = self.effort_override or ""
+        self.fork_name = self.fork_name or ""
 
     @property
     def key(self):
@@ -1341,6 +1348,83 @@ def unarchive_codex(s: Session) -> None:
     if pages:
         s.source, s.parts = str(codex_head(s.id, pages)), [str(p) for p in pages]
     s.archived = False
+
+
+def new_codex_fork(root_path: str, sid: str, name: str) -> str:
+    """Ctrl-Y on a codex row: the copy is made by codex's app-server, as the
+    IDE extension makes one. `codex fork` takes no name and tells ccr no id,
+    so thread/fork writes the new rollout (forked_from_id = the original, the
+    original's cwd), marked a user thread as the CLI marks its own (ccr lists
+    only those), and thread/name/set names it in the account's catalog and
+    session_index.jsonl. Nothing reaches a model. While it runs the
+    app-server starts the thread's MCP servers; they end with it. Returns the
+    copy's id; raises RuntimeError on failure."""
+    exe = tool_path("codex")
+    if not exe:
+        raise RuntimeError("codex is not installed here")
+    env = tool_env("codex", root_path) if root_path else dict(os.environ)
+    p = subprocess.Popen([exe, "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=subprocess.DEVNULL, env=env, cwd=tempfile.gettempdir())
+    lines = queue.Queue()
+
+    def pump():
+        for raw in p.stdout:
+            lines.put(raw.decode("utf-8", "replace"))
+        lines.put(None)
+
+    threading.Thread(target=pump, daemon=True).start()
+
+    def call(i: int, method: str, params: dict, seconds: int):
+        """One request, then the answer with its id (notifications skipped)."""
+        p.stdin.write((json.dumps({"jsonrpc": "2.0", "id": i, "method": method, "params": params},
+                                  ensure_ascii=False) + "\n").encode("utf-8"))
+        p.stdin.flush()
+        deadline = time.monotonic() + seconds
+        while True:
+            try:
+                line = lines.get(timeout=max(0.0, deadline - time.monotonic()))
+            except queue.Empty:
+                raise RuntimeError(f"codex app-server: no answer to {method} in {seconds} s")
+            if line is None:
+                raise RuntimeError("codex app-server ended")
+            if not re.search(rf'"id"\s*:\s*{i}\b', line):
+                continue
+            try:
+                j = json.loads(line)
+            except ValueError:
+                continue
+            # a request of the server's own may carry the same number
+            if "method" in j or str(j.get("id")) != str(i):
+                continue
+            if j.get("error"):
+                raise RuntimeError(f"codex app-server: {method} - {(j['error'] or {}).get('message', j['error'])}")
+            return j.get("result") or {}
+
+    try:
+        call(1, "initialize", {"clientInfo": {"name": "ccr", "version": VERSION}}, 30)
+        p.stdin.write(b'{"jsonrpc":"2.0","method":"initialized"}\n')
+        p.stdin.flush()
+        r = call(2, "thread/fork", {"threadId": sid, "excludeTurns": True, "threadSource": "user"}, 120)
+        new_id = str((r.get("thread") or {}).get("id") or "")
+        if not UUID_RE.match(new_id):
+            raise RuntimeError("codex app-server: thread/fork gave no thread id")
+        if name:
+            try:
+                call(3, "thread/name/set", {"threadId": new_id, "name": name}, 30)
+            except (RuntimeError, OSError) as e:
+                print(f"ccr: the copy has no name ({e}) - /rename inside it names it", file=sys.stderr)
+        return new_id
+    except OSError as e:
+        raise RuntimeError(f"codex app-server: {e}")
+    finally:
+        try:
+            p.stdin.close()
+        except OSError:
+            pass
+        try:
+            p.wait(5)
+        except subprocess.TimeoutExpired:
+            p.kill()
 
 
 def move_session_to_root(s: Session, target: Root) -> str:
@@ -2648,6 +2732,8 @@ def picker_guide(ctx, lim=None, width: int = 0) -> list:
         ("New", [
             ("Ctrl-N", "a new conversation: the folder, then claude, codex (or the codex app) or MAP"),
             ("Ctrl-P", "MAP: 2-4 agents discuss one question in a folder until they agree, each in a tab of its own"),
+            ("Ctrl-Y", "a copy of the highlighted conversation under a name you type: it opens here and goes on on its "
+                       "own, the original stays as it is (it may be open right now)"),
         ]),
         ("Looking", [
             ("Ctrl-K", "token-usage column: the tokens of each session in the last hours, and its share"),
@@ -4107,8 +4193,15 @@ def choose_ollama_model(tool: str, label: str, title: str, back: str = "back", n
 
 
 def resume_argv(s: Session, local: bool = False) -> list:
-    """The resume command; local=True leaves the model to local_args."""
-    argv = ["claude", "--resume", s.id] if s.tool == "claude" else ["codex", "resume", s.id]
+    """The resume command; local=True leaves the model to local_args.
+    Ctrl-Y, a copy: claude copies the transcript itself and takes the name at
+    the start; codex's copy is made right before the start (new_codex_fork,
+    in launch), and FORK_ID stands for its id until then."""
+    if s.fork_name:
+        argv = (["claude", "--resume", s.id, "--fork-session", "--name", s.fork_name] if s.tool == "claude"
+                else ["codex", "resume", FORK_ID])
+    else:
+        argv = ["claude", "--resume", s.id] if s.tool == "claude" else ["codex", "resume", s.id]
     return argv if local else argv + override_args(s.tool, s.model_override, s.effort_override)
 
 
@@ -4166,8 +4259,8 @@ def launch(picked: list, new_window: bool, dry: bool, ctx: Ctx, terminal: bool =
             continue
         # Desktop-app threads go back to the app, not to a terminal tab. The
         # app reads the default dir and cannot be given one per launch, so
-        # no account change applies to them.
-        if s.tool == "codex" and s.origin == "app" and not terminal and not s.local:
+        # no account change applies to them. A copy (Ctrl-Y) opens here.
+        if s.tool == "codex" and s.origin == "app" and not terminal and not s.local and not s.fork_name:
             if opener:
                 if s.target_root and s.target_root != s.root:
                     print(f"ccr: 'codex app · {s.title}' opens in the Codex app, which always runs as the "
@@ -4291,6 +4384,26 @@ def launch(picked: list, new_window: bool, dry: bool, ctx: Ctx, terminal: bool =
             print(f"ccr: could not move '{s.title}' to '{m.label}': {ex} - it opens under '{s.root}' instead",
                   file=sys.stderr)
             e["root_path"], e["move_to"] = s.root_path, None
+    # Ctrl-Y on a codex row: its app-server makes and names the copy, and the
+    # resume opens that. No copy, nothing opened.
+    for e in launch_list:
+        s = e["s"]
+        if not (s.fork_name and s.tool == "codex"):
+            continue
+        if dry:
+            print(f"copy: codex · {s.title}  ->  '{s.fork_name}'  (codex app-server: thread/fork, thread/name/set; "
+                  f"{FORK_ID} = the copy's id)")
+            continue
+        try:
+            new_id = new_codex_fork(e["root_path"], s.id, s.fork_name)
+            print(f"ccr: copied '{s.title}' as '{s.fork_name}'")
+            e["argv"] = [new_id if a == FORK_ID else a for a in e["argv"]]
+        except RuntimeError as ex:
+            print(f"ccr: could not copy '{s.title}': {ex}", file=sys.stderr)
+            e["failed"] = True
+    launch_list = [e for e in launch_list if not e.get("failed")]
+    if not launch_list:
+        return
     # First terminal selection takes over this terminal; the rest open as tabs.
     # (`rest`, not `tabs`: that name is the --tabs flag passed to open_tab.)
     inline, rest = (None, launch_list) if new_window else (launch_list[0], launch_list[1:])
@@ -4302,7 +4415,7 @@ def launch(picked: list, new_window: bool, dry: bool, ctx: Ctx, terminal: bool =
             break
     if inline:
         s = inline["s"]
-        exec_inline(inline["cwd"], inline["argv"], f"{s.tool} · {s.title}", dry,
+        exec_inline(inline["cwd"], inline["argv"], f"{s.tool} · {s.fork_name or s.title}", dry,
                     root_prefix(ctx, s.tool, inline["root_path"], inline["env"]),
                     root_env(ctx, s.tool, inline["root_path"], inline["env"]))
 
@@ -6890,7 +7003,7 @@ def main():
             lim.port = free_port() if lim.pending and fzf_version() >= (0, 45) else 0
             res = run_fzf(rows, picker_hint(ctx, upd_note, lim), query=query, multi=not tabs,
                           expect=delete_keys() + ["ctrl-n", "ctrl-p", "ctrl-a", "ctrl-k", "ctrl-j", "ctrl-x", "ctrl-e",
-                                                  "ctrl-t", "ctrl-l", "ctrl-g", "f1", "ctrl-f"]
+                                                  "ctrl-t", "ctrl-l", "ctrl-g", "f1", "ctrl-f", "ctrl-y"]
                           + ([] if tabs else ["ctrl-o"]),
                           listen=lim.port, binds=([tabs.bind()] if tabs else []) + esc_bind(), track=bool(tabs),
                           info_cmd=tabs.info_cmd() if tabs else None, state=typed)
@@ -6972,6 +7085,21 @@ def main():
                 # row: to the front, its tab selected, blinking.
                 if here:
                     find_picker_window(here[0], a.dry_run)
+                continue
+            if key == "ctrl-y":
+                # A copy of the highlighted conversation under a name asked
+                # here, opened like Enter; from there it goes on on its own. The
+                # original stays as it is and may be open right now: no question.
+                if here:
+                    s = here[0]
+                    dflt = f"{s.title} (copy)"
+                    name = ask(f"name of the copy of {s.tool} · '{s.title}' (empty = '{dflt}'; Ctrl-C back)> ")
+                    if name is None:
+                        continue
+                    s.fork_name = name.strip() or dflt
+                    s.target_root, s.model_override, s.effort_override = None, "", ""
+                    launch([s], a.new_window, a.dry_run, ctx, a.terminal, a.tabs)
+                    return
                 continue
             if key == "ctrl-x":
                 # Close the running conversation of the highlighted row (a stray
