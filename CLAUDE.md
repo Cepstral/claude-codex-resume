@@ -554,3 +554,45 @@ codex 0.160, Ollama 0.40.7), and why it is built this way:
   "disabled": true}` in an account last used by an older claude): the model
   lists skip `disabled` entries.
 - No absolute machine paths, no personal data in the repo or docs.
+- Listing speed (v0.101, GRINDELWALD, 132 conversations in 6 accounts, from
+  the call to the picker in a console: 4.2-4.8 s -> 1.3 s in a new tab,
+  3.0-3.3 s -> 0.5-0.7 s in a tab that ran ccr before). What was slow, so it
+  does not come back:
+  - pwsh 7.x hands every .NET method call to AMSI with its arguments:
+    `[string]::IsNullOrEmpty($s)` costs 2.7 ms with a 128 KB `$s` and nothing
+    with a short one (Windows PowerShell 5.1: a tenth). `[regex]::Matches($tail,
+    ...)` on the 128 KB tails was 0.6 s of every listing. Never pass a
+    transcript's text to a static method: call methods ON it (`$t.IndexOf`,
+    `$t.Substring`) and use operators (`-cmatch`, `-split`), as Find-CcrMatch
+    does. Python's `re` has no such cost.
+  - `Get-CimInstance Win32_Process` takes ~1 s every time here, and the Codex
+    desktop app's app-server daemons keep codex.exe processes alive all day,
+    so skipping CIM when Get-Process finds no codex rarely helps:
+    Get-CcrProcessCommandLine reads the command lines from the processes
+    (NtQueryInformationProcess, class 60); CIM is the fallback. Checked
+    against CIM with a stand-in codex.exe (a copy of cmd.exe whose command
+    line says `resume <uuid>`): the same map, 0.1 s instead of 0.9 s.
+  - `Add-Type` compiles C# with Roslyn, 0.7 s at the first call in a process
+    (with the lazy-loading profile: in every new tab). New-CcrNativeType
+    declares P/Invoke methods with Reflection.Emit in milliseconds; the type
+    is found by name afterwards, `[CcrSqlite]` included.
+  - ConvertFrom-Json on each line of claude's history.jsonl (3 MB): 1-2 s.
+    Get-CcrHistoryEntry / History.get parse only the lines of the id asked;
+    old table vs new lookup compared for all 546 ids of every account: equal.
+  - Still there: the update check at the first ccr of every tab (a GitHub API
+    call, 0.3-0.7 s; with the lazy profile each tab loads ccr anew, so
+    `$script:CcrAutoChecked` is always false there), and ccr.py compiling
+    itself at every run (a script run as `__main__` is never cached: 0.55 s
+    for its 7200 lines here; a launcher importing a cached module would end
+    it).
+- The loader (v0.101; Start-CcrLoader / Loader): a runspace with an empty
+  InitialSessionState opens in ~10 ms but in NoLanguage mode, so it gets
+  FullLanguage; `(try { } catch { })` in parentheses parses as a command
+  named `try`, so `$(...)`. Verified in a hidden console (`Start-Process pwsh
+  -WindowStyle Hidden`) that reads its own screen back (ReadConsoleOutput-
+  CharacterW, `[Console]::CursorVisible`): nothing before 180 ms, the bar and
+  the labels, the line cleared and the cursor back after the picker, after a
+  throw and after Ctrl+C (a process started from Git Bash ignores Ctrl+C until
+  `SetConsoleCtrlHandler(NULL, FALSE)`); OSC 9;4 captured with WT_SESSION
+  set. ccr.py in a pty under WSL: the same, OSC only with WT_SESSION, the
+  cursor back before the KeyboardInterrupt trace. Redirected: nothing.

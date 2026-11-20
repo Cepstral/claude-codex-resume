@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.100'
+$script:CcrVersion = '0.101'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -103,21 +103,85 @@ function ConvertTo-CcrTitle {
     $t
 }
 
-# First-wins table of one parsed JSONL object per id (accelerator for titles).
-function Get-CcrHistoryTable {
-    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$IdName)
-    $table = @{}
-    if (-not (Test-Path -LiteralPath $Path)) { return $table }
-    try {
-        foreach ($line in (Read-CcrHeadLines -Path $Path)) {
-            if (-not $line) { continue }
-            try { $o = $line | ConvertFrom-Json } catch { continue }
-            $id = $o.$IdName
-            if ($id -and -not $table.ContainsKey($id)) { $table[$id] = $o }
+# Group 1 of the last (-Last) or first match of $Pattern in $Text, for a
+# pattern that starts with the fixed text $Lead; $null when there is none
+# ('' is a match whose group is empty). The same as the last / first match
+# of [regex]::Matches for ccr's patterns, whose matches cannot overlap: an
+# ordinal search for $Lead, then the pattern anchored there. -LineStart:
+# only where $Lead begins a line, as (?m)^ would.
+# Why not [regex]::Matches (v0.101): pwsh passes every .NET method call to
+# AMSI with its arguments, so a call that takes a 128 KB tail as an argument
+# costs ~4 ms however little it does, and the claude listing made seven per
+# transcript (0.6 s for 50 conversations). Methods called ON the text
+# (IndexOf, Substring) and operators (-cmatch) are not passed that way.
+function Find-CcrMatch([string]$Text, [string]$Lead, [string]$Pattern, [switch]$Last, [switch]$LineStart) {
+    $anchored = '^(?:' + $Pattern + ')'
+    $ord = [StringComparison]::Ordinal
+    $i = if ($Last) { $Text.LastIndexOf($Lead, $ord) } else { $Text.IndexOf($Lead, $ord) }
+    while ($i -ge 0) {
+        if (-not $LineStart -or $i -eq 0 -or $Text[$i - 1] -eq "`n") {
+            if ($Text.Substring($i) -cmatch $anchored) { return $Matches[1] }
         }
+        if (-not $Last) { $i = $Text.IndexOf($Lead, $i + 1, $ord); continue }
+        # LastIndexOf(value, from) finds an occurrence that ENDS by $from:
+        # one that starts before $i ends by $i - 1 + $Lead.Length - 1.
+        $from = $i + $Lead.Length - 2
+        $i = if ($from -lt 0) { -1 } else { $Text.LastIndexOf($Lead, $from, $ord) }
     }
-    catch { }
-    $table
+    $null
+}
+
+# A tool's history.jsonl (a line per prompt: claude sessionId, display,
+# project; codex session_id, text), the fallback for a title or a folder.
+# Get-CcrHistoryEntry gives the first line of one id, parsed, or $null.
+# Up to v0.100 every line was parsed into a table up front: claude's file is
+# 3 MB, and ConvertFrom-Json on each of its lines took 2 s of every start.
+# Now the file is read once, at the first question, and only the lines that
+# hold the id asked are parsed: an ordinal search for "<id>" in quotes, the
+# way the value is written; a line where it is something else (another
+# field, a nested key) or that does not parse is passed over, as the table
+# passed it over. The answer is the line the table kept.
+function New-CcrHistory([string]$Path, [string]$IdName) {
+    [pscustomobject]@{ Path = $Path; IdName = $IdName; Text = $null; Found = @{} }
+}
+
+function Get-CcrHistoryEntry([object]$History, [string]$Id) {
+    if (-not $Id) { return $null }
+    if ($History.Found.ContainsKey($Id)) { return $History.Found[$Id] }
+    if ($null -eq $History.Text) {
+        $History.Text = ''
+        try {
+            if (Test-Path -LiteralPath $History.Path) {
+                $share = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
+                $fs = [System.IO.File]::Open($History.Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, $share)
+                try {
+                    $sr = [System.IO.StreamReader]::new($fs, [System.Text.Encoding]::UTF8, $true)
+                    try { $History.Text = $sr.ReadToEnd() } finally { $sr.Dispose() }
+                }
+                finally { $fs.Dispose() }
+            }
+        }
+        catch { }
+    }
+    $text = $History.Text
+    $needle = '"' + $Id + '"'
+    $eol = [char[]]"`r`n"
+    $hit = $null
+    $i = $text.IndexOf($needle, [StringComparison]::OrdinalIgnoreCase)
+    while ($i -ge 0) {
+        $start = if ($i -eq 0) { 0 } else { $text.LastIndexOfAny($eol, $i - 1) + 1 }
+        $end = $text.IndexOfAny($eol, $i)
+        if ($end -lt 0) { $end = $text.Length }
+        try {
+            $o = $text.Substring($start, $end - $start) | ConvertFrom-Json -ErrorAction Stop
+            $v = $o.($History.IdName)
+            if ($v -is [string] -and $v -eq $Id) { $hit = $o; break }
+        }
+        catch { }
+        $i = $text.IndexOf($needle, $end, [StringComparison]::OrdinalIgnoreCase)
+    }
+    $History.Found[$Id] = $hit
+    $hit
 }
 
 function Format-CcrAge {
@@ -145,6 +209,143 @@ function Format-CcrCwd {
 }
 
 # =============================================================================
+#  loader: one line while ccr gets the list ready (v0.101)
+# =============================================================================
+# From the update check to the picker: a spinner, a 24-cell bar, the share
+# and count of the files read, and what is being read ("claude · default").
+# A background runspace draws it every 80 ms from a synchronized table that
+# the reading code only updates, so it moves while a read blocks; Windows
+# Terminal also shows it on the tab (OSC 9;4: 3 = busy while the total is
+# unknown, 1 = the share, 0 = clear). Only on an interactive console (stdin
+# and stdout not redirected, -Verbose off) and only from 180 ms on, so a
+# quick start shows nothing. While it runs, $script:CcrLoad is that table
+# and the enumerators add their files to Done; without a loader it is $null
+# and they skip it. Nothing else may print meanwhile: a message goes
+# between Suspend-CcrLoader (clears the line) and Resume-CcrLoader.
+# Stop-CcrLoader clears the line and gives the cursor and the tab back; the
+# listing calls it in a finally, so Ctrl+C and errors do too.
+$script:CcrLoad = $null
+$script:CcrLoadJob = $null
+
+$script:CcrLoaderDraw = {
+    param($s)
+    $frames = [char[]](0x280B, 0x2819, 0x2839, 0x2838, 0x283C, 0x2834, 0x2826, 0x2827, 0x2807, 0x280F)
+    $cell = [string][char]0x2501
+    $w = 24
+    $i = 0
+    $lastOsc = ''
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    [Threading.Monitor]::Enter($s.Lock)
+    try {
+        while (-not $s.Stop) {
+            if (-not $s.Paused -and $clock.ElapsedMilliseconds -ge $s.Delay) {
+                $total = [long]$s.Total
+                if ($total -gt 0) {
+                    $p = [Math]::Min(1.0, [double]$s.Done / $total)
+                    $full = [int][Math]::Floor($p * $w)
+                    $bar = "`e[32m" + ($cell * $full) + "`e[90m" + ($cell * ($w - $full)) + "`e[0m"
+                    $pct = [int][Math]::Floor($p * 100)
+                    $cnt = '{0,3}%  {1}/{2}' -f $pct, [Math]::Min([long]$s.Done, $total), $total
+                    $osc = "`e]9;4;1;$pct`a"
+                }
+                else {
+                    # total unknown: a segment that runs to and fro
+                    $pos = $i % (2 * ($w - 6)); if ($pos -ge $w - 6) { $pos = 2 * ($w - 6) - $pos }
+                    $bar = "`e[90m" + ($cell * $pos) + "`e[36m" + ($cell * 6) + "`e[90m" + ($cell * ($w - 6 - $pos)) + "`e[0m"
+                    $cnt = ''
+                    $osc = "`e]9;4;3;0`a"
+                }
+                # One line, never wrapped: what does not fit is left out (the
+                # label is cut first). "  X ccr" is 7 cells, "  <bar>" 2 + 24.
+                $avail = $(try { [Console]::WindowWidth } catch { 80 }) - 1
+                $used = 7
+                $line = "  `e[36m$($frames[$i % $frames.Length])`e[0m ccr"
+                if ($used + 2 + $w -le $avail) { $line += "  $bar"; $used += 2 + $w }
+                if ($cnt -and $used + 2 + $cnt.Length -le $avail) { $line += "  $cnt"; $used += 2 + $cnt.Length }
+                $label = "$($s.Label)"
+                $room = $avail - $used - 2
+                if ($label.Length -gt $room) { $label = if ($room -ge 4) { $label.Substring(0, $room - 1) + [char]0x2026 } else { '' } }
+                if ($label) { $line += "  `e[2m$label`e[0m" }
+                $out = "`r$line`e[K"
+                if (-not $s.Shown) { $out = "`e[?25l" + $out; $s.Shown = $true }
+                if ($s.Osc -and $osc -ne $lastOsc) { $out += $osc; $lastOsc = $osc }
+                [Console]::Write($out)
+                $i++
+            }
+            [void][Threading.Monitor]::Wait($s.Lock, 80)
+        }
+    }
+    catch { }
+    finally { [Threading.Monitor]::Exit($s.Lock) }
+}
+
+function Test-CcrLoaderOn {
+    if ([Console]::IsOutputRedirected -or [Console]::IsInputRedirected) { return $false }
+    if ($VerbosePreference -ne 'SilentlyContinue') { return $false }   # its lines would cut through the bar
+    $vt = try { $Host.UI.SupportsVirtualTerminal } catch { $false }
+    [bool]$vt
+}
+
+function Start-CcrLoader([string]$Label) {
+    if ($script:CcrLoad) { $script:CcrLoad.Label = $Label; return }
+    if (-not (Test-CcrLoaderOn)) { return }
+    $s = [hashtable]::Synchronized(@{ Done = 0L; Total = 0L; Label = $Label; Stop = $false; Paused = $false; Shown = $false
+            Delay = 180; Osc = [bool]$env:WT_SESSION; Lock = [object]::new() })
+    $job = @{ PrevEnc = $null; Rs = $null; Ps = $null; Handle = $null }
+    try {
+        # the braille and the bar cells need UTF-8 (the picker sets it too)
+        $job.PrevEnc = [Console]::OutputEncoding
+        [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+        # An empty session state opens in ~10 ms (the default one loads the
+        # core modules); the drawing needs the language, no cmdlet.
+        $iss = [initialsessionstate]::Create()
+        $iss.LanguageMode = [System.Management.Automation.PSLanguageMode]::FullLanguage
+        $job.Rs = [runspacefactory]::CreateRunspace($iss)
+        $job.Rs.Open()
+        $job.Ps = [powershell]::Create()
+        $job.Ps.Runspace = $job.Rs
+        [void]$job.Ps.AddScript($script:CcrLoaderDraw.ToString()).AddArgument($s)
+        $job.Handle = $job.Ps.BeginInvoke()
+    }
+    catch {
+        if ($job.Ps) { $job.Ps.Dispose() }
+        if ($job.Rs) { $job.Rs.Dispose() }
+        if ($job.PrevEnc) { try { [Console]::OutputEncoding = $job.PrevEnc } catch { } }
+        return
+    }
+    $script:CcrLoadJob = $job
+    $script:CcrLoad = $s
+}
+
+function Suspend-CcrLoader {
+    $s = $script:CcrLoad
+    if (-not $s) { return }
+    [Threading.Monitor]::Enter($s.Lock)
+    try {
+        $s.Paused = $true
+        if ($s.Shown) { [Console]::Write("`r`e[2K") }
+    }
+    finally { [Threading.Monitor]::Exit($s.Lock) }
+}
+
+function Resume-CcrLoader { if ($script:CcrLoad) { $script:CcrLoad.Paused = $false } }
+
+function Stop-CcrLoader {
+    $s = $script:CcrLoad
+    $job = $script:CcrLoadJob
+    $script:CcrLoad = $null
+    $script:CcrLoadJob = $null
+    if (-not $s -or -not $job) { return }
+    [Threading.Monitor]::Enter($s.Lock)
+    try { $s.Stop = $true; [Threading.Monitor]::PulseAll($s.Lock) }
+    finally { [Threading.Monitor]::Exit($s.Lock) }
+    try { $null = $job.Ps.EndInvoke($job.Handle) } catch { }
+    try { $job.Ps.Dispose(); $job.Rs.Dispose() } catch { }
+    if ($s.Shown) { [Console]::Write("`r`e[2K`e[?25h$(if ($s.Osc) { "`e]9;4;0;0`a" })") }
+    try { [Console]::OutputEncoding = $job.PrevEnc } catch { }
+}
+
+# =============================================================================
 #  claude enumerator
 # =============================================================================
 
@@ -165,7 +366,7 @@ function Get-CcrConfig {
     $cfgPath = $script:CcrConfigPath
     if (-not $cfgPath -or -not (Test-Path -LiteralPath $cfgPath)) { return $null }
     try { Get-Content -LiteralPath $cfgPath -Raw -ErrorAction Stop | ConvertFrom-Json }
-    catch { Write-Warning "ccr: cannot read $cfgPath ($_) - using the single default config dirs"; $null }
+    catch { Suspend-CcrLoader; Write-Warning "ccr: cannot read $cfgPath ($_) - using the single default config dirs"; Resume-CcrLoader; $null }
 }
 
 function Expand-CcrPath([string]$Path) {
@@ -1103,60 +1304,63 @@ function Get-CcrClaudeRunningMap {
     $map
 }
 
+# The transcripts of one claude account. Depth 1 only: subfolders hold
+# subagent transcripts, never resumable.
+function Get-CcrClaudeFiles([object]$Root) {
+    $projRoot = Join-Path $Root.Path 'projects'
+    if (-not (Test-Path -LiteralPath $projRoot)) { return @() }
+    @(Get-ChildItem -LiteralPath $projRoot -Directory -ErrorAction SilentlyContinue |
+            Get-ChildItem -Filter *.jsonl -File -ErrorAction SilentlyContinue)
+}
+
 function Get-CcrClaudeSession {
     [CmdletBinding()]
     param(
         # One entry from Get-CcrClaudeRoots; omitted = the single default root.
-        [object]$Root = $null
+        [object]$Root = $null,
+        # Its transcripts, when the caller has counted them already
+        # (Get-CcrClaudeFiles; the loader's total).
+        [object[]]$Files = $null
     )
     if (-not $Root) { $Root = [pscustomobject]@{ Label = ''; Path = (Get-CcrClaudeRoot); Default = $true } }
     $projRoot = Join-Path $Root.Path 'projects'
     if (-not (Test-Path -LiteralPath $projRoot)) { return @() }
     $running = Get-CcrClaudeRunningMap -RootPath $Root.Path
-    $hist = $null   # <root>\history.jsonl, loaded lazily only if a fallback is needed
-
-    # Depth 1 only: subfolders hold subagent transcripts, never resumable.
-    $files = Get-ChildItem -LiteralPath $projRoot -Directory -ErrorAction SilentlyContinue |
-        Get-ChildItem -Filter *.jsonl -File -ErrorAction SilentlyContinue
+    # <root>\history.jsonl, read only if a fallback is needed
+    $hist = New-CcrHistory (Join-Path $Root.Path 'history.jsonl') 'sessionId'
+    $files = if ($null -ne $Files) { $Files } else { Get-CcrClaudeFiles $Root }
 
     $out = foreach ($file in $files) {
+        if ($script:CcrLoad) { $script:CcrLoad.Done++ }
         if ($file.BaseName -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') { continue }
         $id = $file.BaseName
         try {
             $head = Read-CcrFileWindow -Path $file.FullName -Bytes 16KB -From Head
 
             # Exclude what the real /resume picker excludes (only on positive markers).
-            $m = [regex]::Match($head, '"isSidechain":(true|false)')
-            if ($m.Success -and $m.Groups[1].Value -eq 'true') { continue }
+            if ((Find-CcrMatch $head '"isSidechain":' '"isSidechain":(true|false)') -eq 'true') { continue }
             if ($head -match '"entrypoint":"daemon"') { continue }
 
             $tail = Read-CcrFileWindow -Path $file.FullName -Bytes 128KB -From Tail
 
             # Cwd: first structural "cwd" in the head (metadata preamble has none).
             $cwd = $null
-            $m = [regex]::Match($head, '"cwd":"((?:[^"\\]|\\.)*)"')
-            if ($m.Success) { $cwd = ConvertFrom-CcrJsonString $m.Groups[1].Value }
-            if (-not $cwd) {
-                if ($null -eq $hist) { $hist = Get-CcrHistoryTable -Path (Join-Path $Root.Path 'history.jsonl') -IdName 'sessionId' }
-                $cwd = $hist[$id].project
-            }
+            $raw = Find-CcrMatch $head '"cwd":"' '"cwd":"((?:[^"\\]|\\.)*)"'
+            if ($null -ne $raw) { $cwd = ConvertFrom-CcrJsonString $raw }
+            if (-not $cwd) { $cwd = (Get-CcrHistoryEntry $hist $id).project }
             if (-not $cwd) { $cwd = $HOME }
 
             # Title precedence of the real picker: customTitle, aiTitle (last
             # occurrence wins - these lines are appended), then first prompt.
             $title = $null
             foreach ($prop in 'customTitle', 'aiTitle') {
-                $pat = '"' + $prop + '":"((?:[^"\\]|\\.)*)"'
-                $mt = [regex]::Matches($tail, $pat)
-                $mh = [regex]::Matches($head, $pat)
-                $raw = if ($mt.Count) { $mt[$mt.Count - 1].Groups[1].Value }
-                elseif ($mh.Count) { $mh[$mh.Count - 1].Groups[1].Value }
+                $lead = '"' + $prop + '":"'
+                $pat = $lead + '((?:[^"\\]|\\.)*)"'
+                $raw = Find-CcrMatch $tail $lead $pat -Last
+                if ($null -eq $raw) { $raw = Find-CcrMatch $head $lead $pat -Last }
                 if ($raw) { $title = ConvertTo-CcrTitle (ConvertFrom-CcrJsonString $raw); if ($title) { break } }
             }
-            if (-not $title) {
-                if ($null -eq $hist) { $hist = Get-CcrHistoryTable -Path (Join-Path $Root.Path 'history.jsonl') -IdName 'sessionId' }
-                $title = ConvertTo-CcrTitle $hist[$id].display
-            }
+            if (-not $title) { $title = ConvertTo-CcrTitle (Get-CcrHistoryEntry $hist $id).display }
             if (-not $title) {
                 # Last resort: first real user message from the head window.
                 # Covers sessions whose prompts arrived queued/piped - claude
@@ -1174,8 +1378,7 @@ function Get-CcrClaudeSession {
                         if ($t.StartsWith('<')) {
                             # Session started via a slash command: use the
                             # command itself as the title (e.g. /scan-archive).
-                            $cm = [regex]::Match($t, '<command-name>([^<]+)</command-name>')
-                            if ($cm.Success) { $title = ConvertTo-CcrTitle $cm.Groups[1].Value }
+                            if ($t -cmatch '<command-name>([^<]+)</command-name>') { $title = ConvertTo-CcrTitle $Matches[1] }
                         }
                         else { $title = ConvertTo-CcrTitle $t }
                         if ($title) { break }
@@ -1188,10 +1391,10 @@ function Get-CcrClaudeSession {
             # --resume sort rule: min(last message timestamp, file mtime).
             # mtime alone over-reports (metadata-only appends bump it).
             $last = $file.LastWriteTimeUtc
-            $tm = [regex]::Matches($tail, '"timestamp":"([^"]+)"')
-            if ($tm.Count) {
+            $tm = Find-CcrMatch $tail '"timestamp":"' '"timestamp":"([^"]+)"' -Last
+            if ($null -ne $tm) {
                 try {
-                    $ts = [datetime]::Parse($tm[$tm.Count - 1].Groups[1].Value, [cultureinfo]::InvariantCulture,
+                    $ts = [datetime]::Parse($tm, [cultureinfo]::InvariantCulture,
                         [System.Globalization.DateTimeStyles]::AdjustToUniversal)
                     if ($ts -lt $last) { $last = $ts }
                 }
@@ -1201,12 +1404,11 @@ function Get-CcrClaudeSession {
             # /clear bookkeeping. A session begun by /clear records, near its top,
             # the Remote Control bridge id of the terminal process it was cleared
             # in; the conversation it replaced ends with that same bridge id.
-            $bh = [regex]::Matches($head, '"bridgeSessionId":"([^"]+)"')
-            $bt = [regex]::Matches($tail, '"bridgeSessionId":"([^"]+)"')
-            $headBridge = if ($bh.Count) { $bh[0].Groups[1].Value } else { $null }
-            $tailBridge = if ($bt.Count) { $bt[$bt.Count - 1].Groups[1].Value }
-            elseif ($bh.Count) { $bh[$bh.Count - 1].Groups[1].Value }
-            else { $null }
+            $bLead = '"bridgeSessionId":"'
+            $bPat = '"bridgeSessionId":"([^"]+)"'
+            $headBridge = Find-CcrMatch $head $bLead $bPat
+            $tailBridge = Find-CcrMatch $tail $bLead $bPat -Last
+            if ($null -eq $tailBridge -and $null -ne $headBridge) { $tailBridge = Find-CcrMatch $head $bLead $bPat -Last }
             $startedByClear = $false
             foreach ($line in ($head -split "`n")) {
                 if ($line -notlike '*"type":"user"*') { continue }
@@ -1218,10 +1420,10 @@ function Get-CcrClaudeSession {
                 if ($t) { $startedByClear = $t.Contains('<command-name>/clear</command-name>'); break }
             }
             $startedAt = $null
-            $fm = [regex]::Match($head, '"timestamp":"([^"]+)"')
-            if ($fm.Success) {
+            $fm = Find-CcrMatch $head '"timestamp":"' '"timestamp":"([^"]+)"'
+            if ($null -ne $fm) {
                 try {
-                    $startedAt = [datetime]::Parse($fm.Groups[1].Value, [cultureinfo]::InvariantCulture,
+                    $startedAt = [datetime]::Parse($fm, [cultureinfo]::InvariantCulture,
                         [System.Globalization.DateTimeStyles]::AdjustToUniversal)
                 }
                 catch { }
@@ -1279,20 +1481,102 @@ function Get-CcrClaudeSession {
 #  codex enumerator
 # =============================================================================
 
+# A static class of P/Invoke methods, made with Reflection.Emit instead of
+# Add-Type (v0.101): Add-Type compiles C# with Roslyn, which cost 0.7 s at
+# the first listing of every new tab (the sqlite catalog below); emitting
+# the same declarations takes milliseconds. $Methods: @{ Name; Dll; Returns;
+# Params }, where the parameter 'utf8' is a string passed as UTF-8
+# (UnmanagedType.LPUTF8Str). Made once per process, found by name after.
+function New-CcrNativeType([string]$Name, [object[]]$Methods) {
+    $have = $Name -as [type]
+    if ($have) { return $have }
+    $asm = [System.Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly([System.Reflection.AssemblyName]::new($Name),
+        [System.Reflection.Emit.AssemblyBuilderAccess]::Run)
+    $tb = $asm.DefineDynamicModule($Name).DefineType($Name, 'Public, Class, Abstract, Sealed')
+    $utf8 = [System.Reflection.Emit.CustomAttributeBuilder]::new(
+        [Runtime.InteropServices.MarshalAsAttribute].GetConstructor([type[]]@([Runtime.InteropServices.UnmanagedType])),
+        [object[]]@([Runtime.InteropServices.UnmanagedType]::LPUTF8Str))
+    foreach ($m in $Methods) {
+        $ps = @($m.Params)
+        $types = [type[]]@($ps | ForEach-Object { if ($_ -is [string]) { [string] } else { $_ } })
+        $mb = $tb.DefinePInvokeMethod($m.Name, $m.Dll, 'Public, Static, PinvokeImpl', [System.Reflection.CallingConventions]::Standard,
+            $m.Returns, $types, [Runtime.InteropServices.CallingConvention]::Winapi, [Runtime.InteropServices.CharSet]::Ansi)
+        $mb.SetImplementationFlags('PreserveSig')
+        for ($i = 0; $i -lt $ps.Count; $i++) {
+            if ($ps[$i] -is [string]) { $mb.DefineParameter($i + 1, 'In', $null).SetCustomAttribute($utf8) }
+        }
+    }
+    $tb.CreateType()
+}
+
+# Windows: the command lines of these processes, as @{ Id; CommandLine },
+# read from each process (NtQueryInformationProcess, class 60 =
+# ProcessCommandLineInformation, Windows 8.1+). A process this user may not
+# open is left out, as CIM gives no command line for it either. $null when
+# the native calls are not there; the caller asks CIM then.
+function Get-CcrProcessCommandLine([int[]]$Ids) {
+    try {
+        $nt = New-CcrNativeType 'CcrProcess' @(
+            @{ Name = 'OpenProcess'; Dll = 'kernel32.dll'; Returns = [IntPtr]; Params = @([int], [bool], [int]) }
+            @{ Name = 'CloseHandle'; Dll = 'kernel32.dll'; Returns = [bool]; Params = @([IntPtr]) }
+            @{ Name = 'NtQueryInformationProcess'; Dll = 'ntdll.dll'; Returns = [int]; Params = @([IntPtr], [int], [IntPtr], [int], [int].MakeByRefType()) }
+        )
+    }
+    catch { return $null }
+    $mar = [Runtime.InteropServices.Marshal]
+    $out = [System.Collections.Generic.List[object]]::new()
+    foreach ($id in $Ids) {
+        $h = $nt::OpenProcess(0x1000, $false, $id)   # PROCESS_QUERY_LIMITED_INFORMATION
+        if ($h -eq [IntPtr]::Zero) { continue }
+        try {
+            $size = 8KB
+            for ($try = 0; $try -lt 3; $try++) {
+                $buf = $mar::AllocHGlobal($size)
+                try {
+                    $need = 0
+                    if ($nt::NtQueryInformationProcess($h, 60, $buf, $size, [ref]$need) -eq 0) {
+                        # a UNICODE_STRING: Length in bytes, MaximumLength, Buffer
+                        $len = $mar::ReadInt16($buf) -band 0xFFFF
+                        $text = $mar::PtrToStringUni($mar::ReadIntPtr($buf, [IntPtr]::Size), $len / 2)
+                        $out.Add([pscustomobject]@{ Id = $id; CommandLine = $text })
+                        break
+                    }
+                    if ($need -le $size) { break }   # failed for another reason than the size
+                    $size = $need
+                }
+                finally { $mar::FreeHGlobal($buf) }
+            }
+        }
+        finally { $null = $nt::CloseHandle($h) }
+    }
+    , $out.ToArray()
+}
+
 # sessionId -> live codex process id. Codex has no pid registry; resumed
 # sessions carry their uuid on the command line. Freshly started ones can't be
 # mapped and simply won't show as running.
+# Without a codex process there is nothing to read (Get-Process is quick).
+# On Windows the command lines come from the processes themselves
+# (Get-CcrProcessCommandLine): up to v0.100 a CIM query of Win32_Process
+# read them, about 1 s each time, once per codex account - and the desktop
+# app's app-server daemons keep codex.exe processes alive all day, so it ran
+# on nearly every start. CIM stays as the fallback. The listing makes the
+# map once for all the codex accounts (Get-CcrCodexSession -Running).
 function Get-CcrCodexRunningMap {
     $map = @{}
     try {
+        $codex = @(Get-Process -Name codex -ErrorAction SilentlyContinue)
+        if (-not $codex.Count) { return $map }
         $procs = if ($IsWindows) {
-            # CIM gives the full command line reliably on Windows.
-            Get-CimInstance Win32_Process -Filter "Name='codex.exe'" -ErrorAction Stop |
-                ForEach-Object { [pscustomobject]@{ Id = [int]$_.ProcessId; CommandLine = $_.CommandLine } }
+            $read = Get-CcrProcessCommandLine @($codex | ForEach-Object { $_.Id })
+            if ($null -ne $read) { $read }
+            else {
+                Get-CimInstance Win32_Process -Filter "Name='codex.exe'" -ErrorAction Stop |
+                    ForEach-Object { [pscustomobject]@{ Id = [int]$_.ProcessId; CommandLine = $_.CommandLine } }
+            }
         }
         else {
-            Get-Process -Name codex -ErrorAction Stop |
-                ForEach-Object { [pscustomobject]@{ Id = $_.Id; CommandLine = $_.CommandLine } }
+            $codex | ForEach-Object { [pscustomobject]@{ Id = $_.Id; CommandLine = $_.CommandLine } }
         }
         foreach ($p in $procs) {
             if ($p.CommandLine -match '(?i)resume\s+([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})') {
@@ -1316,6 +1600,21 @@ function Initialize-CcrSqlite {
     # resolves to libsqlite3.dylib / libsqlite3.so (if absent, the overlay
     # silently degrades to first-prompt titles).
     $lib = if ($IsWindows) { 'winsqlite3.dll' } else { 'sqlite3' }
+    # Emitted (New-CcrNativeType); the C# below, compiled, only when that fails.
+    $p = [IntPtr]; $pp = [IntPtr].MakeByRefType()
+    try {
+        $null = New-CcrNativeType 'CcrSqlite' @(
+            @{ Name = 'sqlite3_open_v2'; Dll = $lib; Returns = [int]; Params = @('utf8', $pp, [int], $p) }
+            @{ Name = 'sqlite3_prepare_v2'; Dll = $lib; Returns = [int]; Params = @($p, 'utf8', [int], $pp, $p) }
+            @{ Name = 'sqlite3_step'; Dll = $lib; Returns = [int]; Params = @($p) }
+            @{ Name = 'sqlite3_column_text'; Dll = $lib; Returns = $p; Params = @($p, [int]) }
+            @{ Name = 'sqlite3_finalize'; Dll = $lib; Returns = [int]; Params = @($p) }
+            @{ Name = 'sqlite3_close_v2'; Dll = $lib; Returns = [int]; Params = @($p) }
+        )
+        return
+    }
+    catch { Write-Verbose "ccr: emitting the sqlite calls failed ($_), compiling them" }
+    if ('CcrSqlite' -as [type]) { return }
     Add-Type -TypeDefinition (@'
 using System;
 using System.Runtime.InteropServices;
@@ -1411,11 +1710,14 @@ function Get-CcrCodexTitleMap {
         # is opened read-write so sqlite can replay a torn WAL tail.
         # -WhatIf:$false: these are internal temp snapshots, not user-visible
         # state - they must happen even when the caller runs with -WhatIf.
+        # A failed copy prints nothing (it would land in the loader's line,
+        # v0.101): the db's ends the overlay (catch below), a side file's is
+        # left out as before.
         $tmp = Join-Path ([IO.Path]::GetTempPath()) "ccr-$PID-$($stateDb.Name)"
-        Copy-Item -LiteralPath $stateDb.FullName -Destination $tmp -Force -WhatIf:$false -Confirm:$false
+        Copy-Item -LiteralPath $stateDb.FullName -Destination $tmp -Force -ErrorAction Stop -WhatIf:$false -Confirm:$false
         foreach ($ext in '-wal', '-shm') {
             $side = $stateDb.FullName + $ext
-            if (Test-Path -LiteralPath $side) { Copy-Item -LiteralPath $side -Destination ($tmp + $ext) -Force -WhatIf:$false -Confirm:$false }
+            if (Test-Path -LiteralPath $side) { Copy-Item -LiteralPath $side -Destination ($tmp + $ext) -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false }
             else { Remove-Item -LiteralPath ($tmp + $ext) -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false }
         }
         try {
@@ -1509,31 +1811,49 @@ function Get-CcrCodexHead([string]$ThreadId, [object[]]$Pages) {
     if ($h.Count) { $h[0] } else { $Pages[0] }
 }
 
+# The rollouts of one codex account: sessions\ and archived_sessions\ (codex
+# archive moves a rollout there, see Restore-CcrCodexArchived), kept apart.
+function Get-CcrCodexFiles([object]$Root) {
+    $get = { param($d) @(Get-ChildItem -LiteralPath $d -Recurse -Filter 'rollout-*.jsonl' -File -ErrorAction SilentlyContinue) }
+    $s = @(& $get (Join-Path $Root.Path 'sessions'))
+    $a = @(& $get (Join-Path $Root.Path 'archived_sessions'))
+    [pscustomobject]@{ Sessions = $s; Archived = $a; Count = $s.Count + $a.Count }
+}
+
 function Get-CcrCodexSession {
     [CmdletBinding()]
     param(
         # One entry from Get-CcrCodexRoots; omitted = the single default root.
-        [object]$Root = $null
+        [object]$Root = $null,
+        # Its rollouts, when the caller has counted them already
+        # (Get-CcrCodexFiles; the loader's total).
+        [object]$Files = $null,
+        # The running map (Get-CcrCodexRunningMap), when the caller made it
+        # once for every codex account.
+        [hashtable]$Running = $null
     )
     if (-not $Root) { $Root = [pscustomobject]@{ Label = ''; Path = (Get-CcrCodexRoot); Default = $true } }
     $sessRoot = Join-Path $Root.Path 'sessions'
     # codex archive moves a rollout here (see Restore-CcrCodexArchived)
     $archRoot = Join-Path $Root.Path 'archived_sessions'
     if (-not (Test-Path -LiteralPath $sessRoot) -and -not (Test-Path -LiteralPath $archRoot)) { return @() }
-    $hist = $null   # <root>\history.jsonl, loaded lazily only if a fallback is needed
-    $running = Get-CcrCodexRunningMap
+    # <root>\history.jsonl, read only if a fallback is needed
+    $hist = New-CcrHistory (Join-Path $Root.Path 'history.jsonl') 'session_id'
+    $running = if ($null -ne $Running) { $Running } else { Get-CcrCodexRunningMap }
     $curated = Get-CcrCodexTitleMap -RootPath $Root.Path
+    if ($null -eq $Files) { $Files = Get-CcrCodexFiles $Root }
 
     # One row per thread: title and folder from its head page, last activity
     # from its newest one.
     $threads = [System.Collections.Generic.List[object]]::new()
-    foreach ($dir in $sessRoot, $archRoot) {
-        $byId = Get-CcrCodexPages @(Get-ChildItem -LiteralPath $dir -Recurse -Filter 'rollout-*.jsonl' -File -ErrorAction SilentlyContinue)
+    foreach ($set in @($Files.Sessions), @($Files.Archived)) {
+        $byId = Get-CcrCodexPages $set
         foreach ($tid in $byId.Keys) { $threads.Add([pscustomobject]@{ Id = $tid; Pages = $byId[$tid] }) }
     }
     $archPrefix = $archRoot.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
     $out = foreach ($thread in $threads) {
         $pages = @($thread.Pages)
+        if ($script:CcrLoad) { $script:CcrLoad.Done += $pages.Count }
         $file = Get-CcrCodexHead $thread.Id $pages
         $id = $thread.Id
         $cwd = $null
@@ -1590,10 +1910,7 @@ function Get-CcrCodexSession {
         if ($cwd) { $cwd = $cwd -replace '^\\\\\?\\UNC\\', '\\' -replace '^\\\\\?\\', '' }
         else { $cwd = $HOME }
         if ($curated.ContainsKey($id)) { $title = ConvertTo-CcrTitle $curated[$id] }   # /rename wins
-        if (-not $title) {
-            if ($null -eq $hist) { $hist = Get-CcrHistoryTable -Path (Join-Path $Root.Path 'history.jsonl') -IdName 'session_id' }
-            $title = ConvertTo-CcrTitle $hist[$id].text
-        }
+        if (-not $title) { $title = ConvertTo-CcrTitle (Get-CcrHistoryEntry $hist $id).text }
         if (-not $title) { $title = '(session)' }
 
         [pscustomobject]@{
@@ -1661,9 +1978,9 @@ function ConvertTo-CcrUtc([string]$Iso) {
 function Get-CcrCodexLastActivity([System.IO.FileInfo]$File) {
     foreach ($n in 64KB, 1MB) {
         try { $tail = Read-CcrFileWindow -Path $File.FullName -Bytes $n -From Tail } catch { break }
-        $tm = [regex]::Matches($tail, '(?m)^\{"timestamp":"([^"]+)"')
-        if ($tm.Count -gt 0) {
-            $ts = ConvertTo-CcrUtc $tm[$tm.Count - 1].Groups[1].Value
+        $tm = Find-CcrMatch $tail '{"timestamp":"' '\{"timestamp":"([^"]+)"' -Last -LineStart
+        if ($null -ne $tm) {
+            $ts = ConvertTo-CcrUtc $tm
             if ($ts) { return $ts }
             break
         }
@@ -6473,7 +6790,9 @@ function Invoke-CcrAutoUpdate([string]$Channel, [string]$SelfPath) {
             Set-CcrChannelState $Channel @{ sha = $sha }
             return $null
         }
+        Suspend-CcrLoader
         Write-Host "ccr: auto-updating channel '$Channel' v$had -> v$($got.Version) (branch $branch @ $($sha.Substring(0, 7)))..." -ForegroundColor Yellow
+        Resume-CcrLoader
         Install-CcrScript $got.Tmp $target
         Set-CcrChannelState $Channel @{ sha = $sha }
         @{ From = $had; To = $got.Version }
@@ -6827,122 +7146,168 @@ function Resume-CcSessions {
         return
     }
 
-    # --- auto-update (throttled; a message only when something is installed) --
-    # Runs before the self-heal below, which then delegates this invocation
-    # to the freshly installed file. The banner the picker shows for this
-    # one run travels in an env var that the picker clears.
-    $selfPath = $MyInvocation.MyCommand.ScriptBlock.File
-    if (-not $selfPath) { $selfPath = Join-Path (Split-Path -Parent $PROFILE) 'Resume-CcSessions.ps1' }
-    if (-not $WhatIfPreference -and -not $env:CCR_UPDATED_FROM) {   # not again in the run that was just updated
-        try {
-            $upd = Invoke-CcrAutoUpdate -Channel (Get-CcrChannelOf $selfPath) -SelfPath $selfPath
-            if ($upd) { $env:CCR_UPDATED_FROM = "$($upd.From)>$($upd.To)" }
-        }
-        catch { Write-Warning "ccr: auto-update failed: $_" }
+    # --- the loader (v0.101) ---------------------------------------------------
+    # From here to the picker ccr checks for updates and reads every
+    # conversation; on an interactive console a line shows it moving
+    # (Start-CcrLoader). Not for -Install and the account commands, which
+    # print as they go and list nothing. The finally clears it on every way
+    # out, Ctrl+C and errors included; whatever prints before that stops or
+    # suspends it first. PowerShell's own progress bars (the update download,
+    # a large Copy-Item) would draw over it: off until the finally.
+    $prevProgress = $ProgressPreference
+    if (-not ($Install -or $Accounts -or $AddAccount -or $RemoveAccount -or $DisableAccounts)) {
+        $ProgressPreference = 'SilentlyContinue'
+        Start-CcrLoader 'checking for updates'
     }
-
-    # --- stale-shell self-heal ---------------------------------------------
-    # A shell loads this file once, at startup; after an update every already
-    # open tab (including tabs ccr itself opened) keeps the old function. If
-    # the file on disk carries a different version, reload it and delegate
-    # this invocation to the fresh code. The path comes from the function's
-    # own definition, so it follows wherever the profile loads the file from.
     try {
-        $m = [regex]::Match(((Get-Content -LiteralPath $selfPath -TotalCount 30 -ErrorAction Stop) -join "`n"),
-            "CcrVersion = '([^']+)'")
-        if ($m.Success -and $m.Groups[1].Value -ne $script:CcrVersion) {
-            Write-Host "ccr: v$($m.Groups[1].Value) is on disk, this shell had loaded v$($script:CcrVersion) - reloading (run '. `$PROFILE' to make it stick)." -ForegroundColor Yellow
-            $inv = ". `"$selfPath`"; Resume-CcSessions -Tool $Tool -Top $Top"
-            if ($filterText) { $inv += " -Filter '$($filterText -replace "'", "''")'" }
-            if ($New) { $inv += ' -New' }
-            if ($NewWindow) { $inv += ' -NewWindow' }
-            if ($Accounts) { $inv += ' -Accounts' }
-            if ($AddAccount) { $inv += " -AddAccount '$AddAccount'" }
-            if ($CopySettings) { $inv += ' -CopySettings' }
-            if ($Local) { $inv += ' -Local' }
-            if ($Ollama) { $inv += " -Ollama '$($Ollama -replace "'", "''")'" }
-            if ($RemoveAccount) { $inv += " -RemoveAccount '$RemoveAccount'" }
-            if ($DisableAccounts) { $inv += ' -DisableAccounts' }
-            if ($Root) { $inv += " -Root '$($Root -replace "'", "''")'" }
-            if ($UsageHours -ne 5) { $inv += " -UsageHours $UsageHours" }
-            if ($Install) { $inv += " -Install $Install" }
-            if ($Panel) { $inv += ' -Panel' }
-            if ($Continue) { $inv += ' -Continue' }
-            if ($Usage) { $inv += ' -Usage' }
-            if ($WhatIfPreference) { $inv += ' -WhatIf' }
-            & ([scriptblock]::Create($inv))
-            return
+        # --- auto-update (throttled; a message only when something is installed) --
+        # Runs before the self-heal below, which then delegates this invocation
+        # to the freshly installed file. The banner the picker shows for this
+        # one run travels in an env var that the picker clears.
+        $selfPath = $MyInvocation.MyCommand.ScriptBlock.File
+        if (-not $selfPath) { $selfPath = Join-Path (Split-Path -Parent $PROFILE) 'Resume-CcSessions.ps1' }
+        if (-not $WhatIfPreference -and -not $env:CCR_UPDATED_FROM) {   # not again in the run that was just updated
+            try {
+                $upd = Invoke-CcrAutoUpdate -Channel (Get-CcrChannelOf $selfPath) -SelfPath $selfPath
+                if ($upd) { $env:CCR_UPDATED_FROM = "$($upd.From)>$($upd.To)" }
+            }
+            catch { Suspend-CcrLoader; Write-Warning "ccr: auto-update failed: $_"; Resume-CcrLoader }
         }
-    }
-    catch { }
 
-    # --- installing the tools (-Install; Ctrl+I in the picker) ---------------
-    if ($Install) {
-        $ok = $true
-        foreach ($t in @(if ($Install -eq 'all') { 'claude', 'codex' } else { $Install })) {
-            if (-not (Invoke-CcrInstall -Tool $t -WhatIf:$WhatIfPreference)) { $ok = $false }
-        }
-        if (-not $ok) { $global:LASTEXITCODE = 1 }
-        return
-    }
-
-    # --- account management (multi-account) --------------------------------
-    if ($Accounts) { Show-CcrAccounts; return }
-    if ($AddAccount -or $RemoveAccount -or $DisableAccounts) {
-        if ($WhatIfPreference) {
-            # The login flows are external processes, so -WhatIf must stop
-            # here (the same notice the picker's account page prints).
-            $what = if ($AddAccount -and $Ollama) { "add the local $Tool account '$AddAccount' (Ollama at $Ollama only) in $(Expand-CcrPath (Get-CcrLocalDirSpec $AddAccount '<tool>'))" }
-            elseif ($AddAccount -and $Local) { "add the local $Tool account '$AddAccount' (Ollama on this PC only) in $(Expand-CcrPath (Get-CcrLocalDirSpec $AddAccount '<tool>'))" }
-            elseif ($AddAccount) { "add $Tool account '$AddAccount'$(if ($CopySettings) { ' (copying the default account settings)' })" }
-            elseif ($RemoveAccount) { "remove $Tool account '$RemoveAccount'" } else { 'disable multi-account mode' }
-            Write-Host "WhatIf: would $what." -ForegroundColor Yellow
-            return
-        }
+        # --- stale-shell self-heal ---------------------------------------------
+        # A shell loads this file once, at startup; after an update every already
+        # open tab (including tabs ccr itself opened) keeps the old function. If
+        # the file on disk carries a different version, reload it and delegate
+        # this invocation to the fresh code. The path comes from the function's
+        # own definition, so it follows wherever the profile loads the file from.
         try {
-            if ($AddAccount -and ($Local -or $Ollama)) { Add-CcrLocalAccount -Label $AddAccount -Tool $Tool -Url $Ollama }
-            elseif ($AddAccount) { Add-CcrAccount -Label $AddAccount -Tool $Tool -CopySettings:$CopySettings }
-            elseif ($RemoveAccount) { Remove-CcrAccount -Label $RemoveAccount -Tool $Tool }
-            else { Disable-CcrMultiAccount }
+            $m = [regex]::Match(((Get-Content -LiteralPath $selfPath -TotalCount 30 -ErrorAction Stop) -join "`n"),
+                "CcrVersion = '([^']+)'")
+            if ($m.Success -and $m.Groups[1].Value -ne $script:CcrVersion) {
+                Stop-CcrLoader   # the fresh code runs its own
+                Write-Host "ccr: v$($m.Groups[1].Value) is on disk, this shell had loaded v$($script:CcrVersion) - reloading (run '. `$PROFILE' to make it stick)." -ForegroundColor Yellow
+                $inv = ". `"$selfPath`"; Resume-CcSessions -Tool $Tool -Top $Top"
+                if ($filterText) { $inv += " -Filter '$($filterText -replace "'", "''")'" }
+                if ($New) { $inv += ' -New' }
+                if ($NewWindow) { $inv += ' -NewWindow' }
+                if ($Accounts) { $inv += ' -Accounts' }
+                if ($AddAccount) { $inv += " -AddAccount '$AddAccount'" }
+                if ($CopySettings) { $inv += ' -CopySettings' }
+                if ($Local) { $inv += ' -Local' }
+                if ($Ollama) { $inv += " -Ollama '$($Ollama -replace "'", "''")'" }
+                if ($RemoveAccount) { $inv += " -RemoveAccount '$RemoveAccount'" }
+                if ($DisableAccounts) { $inv += ' -DisableAccounts' }
+                if ($Root) { $inv += " -Root '$($Root -replace "'", "''")'" }
+                if ($UsageHours -ne 5) { $inv += " -UsageHours $UsageHours" }
+                if ($Install) { $inv += " -Install $Install" }
+                if ($Panel) { $inv += ' -Panel' }
+                if ($Continue) { $inv += ' -Continue' }
+                if ($Usage) { $inv += ' -Usage' }
+                if ($WhatIfPreference) { $inv += ' -WhatIf' }
+                & ([scriptblock]::Create($inv))
+                return
+            }
         }
-        catch { Write-Error "$_" }
-        return
-    }
+        catch { }
 
-    # Config dirs (accounts) per tool. One unlabeled root each unless ccr.json
-    # says otherwise; -Root narrows the LISTING to a single configured account.
-    # Multi-account mode (explicit config dir on every launch) depends on how
-    # many accounts are configured for that tool, not on how many are listed:
-    # a session must always start under its own account's dir.
-    $allClaudeRoots = @(Get-CcrClaudeRoots)
-    $allCodexRoots = @(Get-CcrCodexRoots)
-    $multiClaude = $allClaudeRoots.Count -gt 1
-    $multiCodex = $allCodexRoots.Count -gt 1
-    $claudeRoots = $allClaudeRoots
-    $codexRoots = $allCodexRoots
-    if ($Root) {
-        $known = @(@($allClaudeRoots.Label) + @($allCodexRoots.Label) | Where-Object { $_ } | Select-Object -Unique)
-        if ($Root -notin $known) {
-            Write-Error "ccr: no account '$Root' in $($script:CcrConfigPath) (known: $($known -join ', '))"
+        # --- installing the tools (-Install; Ctrl+I in the picker) ---------------
+        if ($Install) {
+            $ok = $true
+            foreach ($t in @(if ($Install -eq 'all') { 'claude', 'codex' } else { $Install })) {
+                if (-not (Invoke-CcrInstall -Tool $t -WhatIf:$WhatIfPreference)) { $ok = $false }
+            }
+            if (-not $ok) { $global:LASTEXITCODE = 1 }
             return
         }
-        # Copies, not the same objects: the narrowed entry is shown as the
-        # default of the listing, while the full lists keep the real default.
-        $claudeRoots = @($allClaudeRoots | Where-Object { $_.Label -eq $Root } | ForEach-Object { [pscustomobject]@{ Label = $_.Label; Path = $_.Path; Default = $true; Local = $_.Local; OllamaUrl = $_.OllamaUrl } })
-        $codexRoots = @($allCodexRoots | Where-Object { $_.Label -eq $Root } | ForEach-Object { [pscustomobject]@{ Label = $_.Label; Path = $_.Path; Default = $true; Local = $_.Local; OllamaUrl = $_.OllamaUrl } })
-    }
 
-    $sessions = [System.Collections.Generic.List[object]]::new()
-    if ($Tool -in 'claude', 'all') { foreach ($r in $claudeRoots) { foreach ($s in Get-CcrClaudeSession -Root $r) { $sessions.Add($s) } } }
-    if ($Tool -in 'codex', 'all') { foreach ($r in $codexRoots) { foreach ($s in Get-CcrCodexSession -Root $r) { $sessions.Add($s) } } }
-    if ($sessions.Count -eq 0 -and -not ($New -or $Panel -or $Continue)) {
-        $absent = @('claude', 'codex' | Where-Object { -not (Get-Command $_ -CommandType Application, ExternalScript -ErrorAction SilentlyContinue) })
-        Write-Warning "ccr: no sessions found.$(if ($absent.Count) { " Not installed on this PC: $($absent -join ', ') - ccr -Install $($absent[0]) installs it." })"
-        return
-    }
+        # --- account management (multi-account) --------------------------------
+        if ($Accounts) { Show-CcrAccounts; return }
+        if ($AddAccount -or $RemoveAccount -or $DisableAccounts) {
+            if ($WhatIfPreference) {
+                # The login flows are external processes, so -WhatIf must stop
+                # here (the same notice the picker's account page prints).
+                $what = if ($AddAccount -and $Ollama) { "add the local $Tool account '$AddAccount' (Ollama at $Ollama only) in $(Expand-CcrPath (Get-CcrLocalDirSpec $AddAccount '<tool>'))" }
+                elseif ($AddAccount -and $Local) { "add the local $Tool account '$AddAccount' (Ollama on this PC only) in $(Expand-CcrPath (Get-CcrLocalDirSpec $AddAccount '<tool>'))" }
+                elseif ($AddAccount) { "add $Tool account '$AddAccount'$(if ($CopySettings) { ' (copying the default account settings)' })" }
+                elseif ($RemoveAccount) { "remove $Tool account '$RemoveAccount'" } else { 'disable multi-account mode' }
+                Write-Host "WhatIf: would $what." -ForegroundColor Yellow
+                return
+            }
+            try {
+                if ($AddAccount -and ($Local -or $Ollama)) { Add-CcrLocalAccount -Label $AddAccount -Tool $Tool -Url $Ollama }
+                elseif ($AddAccount) { Add-CcrAccount -Label $AddAccount -Tool $Tool -CopySettings:$CopySettings }
+                elseif ($RemoveAccount) { Remove-CcrAccount -Label $RemoveAccount -Tool $Tool }
+                else { Disable-CcrMultiAccount }
+            }
+            catch { Write-Error "$_" }
+            return
+        }
 
-    $sorted = @($sessions | Sort-Object LastActivity -Descending)
-    if ($Top -gt 0) { $sorted = @($sorted | Select-Object -First $Top) }
+        # Config dirs (accounts) per tool. One unlabeled root each unless ccr.json
+        # says otherwise; -Root narrows the LISTING to a single configured account.
+        # Multi-account mode (explicit config dir on every launch) depends on how
+        # many accounts are configured for that tool, not on how many are listed:
+        # a session must always start under its own account's dir.
+        $allClaudeRoots = @(Get-CcrClaudeRoots)
+        $allCodexRoots = @(Get-CcrCodexRoots)
+        $multiClaude = $allClaudeRoots.Count -gt 1
+        $multiCodex = $allCodexRoots.Count -gt 1
+        $claudeRoots = $allClaudeRoots
+        $codexRoots = $allCodexRoots
+        if ($Root) {
+            $known = @(@($allClaudeRoots.Label) + @($allCodexRoots.Label) | Where-Object { $_ } | Select-Object -Unique)
+            if ($Root -notin $known) {
+                Stop-CcrLoader
+                Write-Error "ccr: no account '$Root' in $($script:CcrConfigPath) (known: $($known -join ', '))"
+                return
+            }
+            # Copies, not the same objects: the narrowed entry is shown as the
+            # default of the listing, while the full lists keep the real default.
+            $claudeRoots = @($allClaudeRoots | Where-Object { $_.Label -eq $Root } | ForEach-Object { [pscustomobject]@{ Label = $_.Label; Path = $_.Path; Default = $true; Local = $_.Local; OllamaUrl = $_.OllamaUrl } })
+            $codexRoots = @($allCodexRoots | Where-Object { $_.Label -eq $Root } | ForEach-Object { [pscustomobject]@{ Label = $_.Label; Path = $_.Path; Default = $true; Local = $_.Local; OllamaUrl = $_.OllamaUrl } })
+        }
+
+        # The files of every listed account first - a cheap count that gives
+        # the loader its total - then each account is read with them, the
+        # loader moving file by file. Codex's running map is made once, for
+        # all its accounts (up to v0.100: once per account).
+        $load = $script:CcrLoad   # $null without a loader
+        if ($load) { $load.Label = 'counting conversations' }
+        $work = [System.Collections.Generic.List[object]]::new()
+        if ($Tool -in 'claude', 'all') {
+            foreach ($r in $claudeRoots) { $f = @(Get-CcrClaudeFiles $r); $work.Add([pscustomobject]@{ Tool = 'claude'; Root = $r; Files = $f; Count = $f.Count }) }
+        }
+        if ($Tool -in 'codex', 'all') {
+            foreach ($r in $codexRoots) { $f = Get-CcrCodexFiles $r; $work.Add([pscustomobject]@{ Tool = 'codex'; Root = $r; Files = $f; Count = $f.Count }) }
+        }
+        if ($load) { $load.Total = [long](($work | Measure-Object -Property Count -Sum).Sum) }
+        $sessions = [System.Collections.Generic.List[object]]::new()
+        $codexRunning = $null
+        foreach ($w in $work) {
+            $before = if ($load) { $load.Done } else { 0 }
+            if ($load) { $load.Label = "$($w.Tool) $([char]0x00B7) $(if ($w.Root.Label) { $w.Root.Label } else { 'default' })" }
+            $got = if ($w.Tool -eq 'claude') { Get-CcrClaudeSession -Root $w.Root -Files $w.Files }
+            else {
+                $run = if (-not $w.Count) { @{} } else {
+                    if ($null -eq $codexRunning) { $codexRunning = Get-CcrCodexRunningMap }
+                    $codexRunning
+                }
+                Get-CcrCodexSession -Root $w.Root -Files $w.Files -Running $run
+            }
+            foreach ($s in $got) { $sessions.Add($s) }
+            if ($load) { $load.Done = $before + $w.Count }
+        }
+        if ($sessions.Count -eq 0 -and -not ($New -or $Panel -or $Continue)) {
+            Stop-CcrLoader
+            $absent = @('claude', 'codex' | Where-Object { -not (Get-Command $_ -CommandType Application, ExternalScript -ErrorAction SilentlyContinue) })
+            Write-Warning "ccr: no sessions found.$(if ($absent.Count) { " Not installed on this PC: $($absent -join ', ') - ccr -Install $($absent[0]) installs it." })"
+            return
+        }
+
+        $sorted = @($sessions | Sort-Object LastActivity -Descending)
+        if ($Top -gt 0) { $sorted = @($sorted | Select-Object -First $Top) }
+    }
+    finally { Stop-CcrLoader; $ProgressPreference = $prevProgress }
 
     if ($New -or $Panel -or $Continue) {
         # -n / -Panel: skip the session picker, go straight to the folder menu

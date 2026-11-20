@@ -39,7 +39,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.100"
+VERSION = "0.101"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 # Ctrl-Y on a codex row: stands for the copy's id in the resume command until
@@ -177,25 +177,209 @@ def mtime_utc(p: Path):
     return datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc)
 
 
-def history_table(path: Path, id_key: str) -> dict:
-    """First-wins table of one parsed JSONL object per id (title accelerator)."""
-    table = {}
-    try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    o = json.loads(line)
-                except Exception:
-                    continue
-                k = o.get(id_key)
-                if k and k not in table:
-                    table[k] = o
-    except OSError:
-        pass
-    return table
+class History:
+    """A tool's history.jsonl (a line per prompt: claude sessionId, display,
+    project; codex session_id, text), the fallback for a title or a folder.
+    get(id) gives the first line of that id, parsed, or None. Up to v0.100
+    every line was parsed into a table up front (in the PowerShell version
+    that took 2 s of every start for claude's 3 MB file). Now the file is
+    read once, at the first question, and only the lines that hold the id
+    asked are parsed: a search for "<id>" in quotes, the way the value is
+    written; a line where it is something else (another field, a nested
+    key) or that does not parse is passed over, as the table passed it over.
+    The answer is the line the table kept."""
+
+    def __init__(self, path: Path, id_key: str):
+        self.path, self.id_key, self.text, self.found = path, id_key, None, {}
+
+    def get(self, sid: str):
+        if not sid:
+            return None
+        if sid in self.found:
+            return self.found[sid]
+        if self.text is None:
+            try:
+                self.text = Path(self.path).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                self.text = ""
+        t, needle, hit = self.text, '"' + sid + '"', None
+        i = t.find(needle)
+        while i >= 0:
+            end = t.find("\n", i)
+            end = len(t) if end < 0 else end
+            try:
+                o = json.loads(t[t.rfind("\n", 0, i) + 1:end])
+                if isinstance(o, dict) and o.get(self.id_key) == sid:
+                    hit = o
+                    break
+            except ValueError:
+                pass
+            i = t.find(needle, end)
+        self.found[sid] = hit
+        return hit
+
+
+# ----------------------------------------------------------------------------
+# loader: one line while ccr gets the list ready (v0.101)
+# ----------------------------------------------------------------------------
+class Loader:
+    """From the update check to the picker: a spinner, a 24-cell bar, the
+    share and count of the files read, and what is being read ("claude ·
+    default"). A thread draws it on stderr every 80 ms from fields the
+    reading code only updates, so it moves while a read blocks. Windows
+    Terminal also shows it on the tab (OSC 9;4: 3 = busy while the total is
+    unknown, 1 = the share, 0 = clear), sent only where WT_SESSION says the
+    terminal is Windows Terminal: iTerm2 takes OSC 9 for a notification.
+    Only when stdin, stdout and stderr are terminals (and CCR_DEBUG is off),
+    and only from 180 ms on, so a quick start shows nothing. Same line and
+    rules as the PowerShell version (Start-CcrLoader)."""
+    FRAMES = "\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f"
+    CELL = "\u2501"
+    WIDTH = 24
+    DELAY = 0.18
+
+    def __init__(self, label: str):
+        self.done, self.total, self.label = 0, 0, label
+        self.cond = threading.Condition()
+        self.stopped = self.paused = self.shown = False
+        self.osc = bool(os.environ.get("WT_SESSION"))
+        self.thread = threading.Thread(target=self._run, name="ccr-loader", daemon=True)
+
+    @staticmethod
+    def wanted() -> bool:
+        if os.environ.get("CCR_DEBUG"):   # its lines would cut through the bar
+            return False
+        try:
+            return sys.stdin.isatty() and sys.stdout.isatty() and sys.stderr.isatty()
+        except (AttributeError, ValueError):
+            return False
+
+    def _line(self, i: int):
+        w, cell = self.WIDTH, self.CELL
+        total = self.total
+        if total > 0:
+            p = min(1.0, self.done / total)
+            full = int(p * w)
+            bar = f"\033[32m{cell * full}\033[90m{cell * (w - full)}\033[0m"
+            pct = int(p * 100)
+            cnt = f"{pct:3d}%  {min(self.done, total)}/{total}"
+            osc = f"\033]9;4;1;{pct}\a"
+        else:
+            # total unknown: a segment that runs to and fro
+            pos = i % (2 * (w - 6))
+            if pos >= w - 6:
+                pos = 2 * (w - 6) - pos
+            bar = f"\033[90m{cell * pos}\033[36m{cell * 6}\033[90m{cell * (w - 6 - pos)}\033[0m"
+            cnt = ""
+            osc = "\033]9;4;3;0\a"
+        # One line, never wrapped: what does not fit is left out (the label
+        # is cut first). "  X ccr" is 7 cells, "  <bar>" 2 + 24.
+        avail = shutil.get_terminal_size((80, 24)).columns - 1
+        used = 7
+        line = f"  \033[36m{self.FRAMES[i % len(self.FRAMES)]}\033[0m ccr"
+        if used + 2 + w <= avail:
+            line += "  " + bar
+            used += 2 + w
+        if cnt and used + 2 + len(cnt) <= avail:
+            line += "  " + cnt
+            used += 2 + len(cnt)
+        label, room = str(self.label), avail - used - 2
+        if len(label) > room:
+            label = label[: room - 1] + "\u2026" if room >= 4 else ""
+        if label:
+            line += f"  {DIM}{label}{RESET}"
+        return line, osc
+
+    def _run(self):
+        start, i, last_osc = time.monotonic(), 0, ""
+        with self.cond:
+            while not self.stopped:
+                if not self.paused and time.monotonic() - start >= self.DELAY:
+                    line, osc = self._line(i)
+                    out = "\r" + line + "\033[K"
+                    if not self.shown:
+                        out = "\033[?25l" + out
+                        self.shown = True
+                    if self.osc and osc != last_osc:
+                        out += osc
+                        last_osc = osc
+                    try:
+                        sys.stderr.write(out)
+                        sys.stderr.flush()
+                    except (OSError, ValueError):
+                        return
+                    i += 1
+                self.cond.wait(0.08)
+
+    def suspend(self):
+        with self.cond:
+            self.paused = True
+            if self.shown:
+                sys.stderr.write("\r\033[2K")
+                sys.stderr.flush()
+
+    def resume(self):
+        self.paused = False
+
+    def stop(self):
+        with self.cond:
+            self.stopped = True
+            self.cond.notify_all()
+        self.thread.join(1)
+        if self.shown:
+            try:
+                sys.stderr.write("\r\033[2K\033[?25h" + ("\033]9;4;0;0\a" if self.osc else ""))
+                sys.stderr.flush()
+            except (OSError, ValueError):
+                pass
+
+
+# The running loader, or None: the enumerators add their files to its done
+# count, which costs nothing without one. Nothing else may print while it
+# runs: a message goes between loader_suspend() (clears the line) and
+# loader_resume().
+LOADER = None
+
+
+def loader_start(label: str):
+    global LOADER
+    if LOADER:
+        LOADER.label = label
+        return
+    if not Loader.wanted():
+        return
+    LOADER = Loader(label)
+    LOADER.thread.start()
+
+
+def loader_set(label: str = None, total: int = None):
+    if LOADER:
+        if label is not None:
+            LOADER.label = label
+        if total is not None:
+            LOADER.total = total
+
+
+def loader_suspend():
+    if LOADER:
+        LOADER.suspend()
+
+
+def loader_resume():
+    if LOADER:
+        LOADER.resume()
+
+
+def loader_stop():
+    """Clear the line, give the cursor and the tab back. Called on every way
+    out of the listing (a finally, and at exit for Ctrl-C anywhere)."""
+    global LOADER
+    ld, LOADER = LOADER, None
+    if ld:
+        ld.stop()
+
+
+atexit.register(loader_stop)
 
 
 def fmt_age(utc: datetime) -> str:
@@ -336,7 +520,9 @@ def load_config():
     try:
         return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     except Exception as e:
+        loader_suspend()
         print(f"ccr: cannot read {CONFIG_PATH} ({e}) - using the single default config dirs", file=sys.stderr)
+        loader_resume()
         return None
 
 
@@ -1554,38 +1740,42 @@ def claude_running(root_path: str) -> dict:
     return m
 
 
-def claude_sessions(root: Root = None) -> list:
+def claude_files(root: Root) -> list:
+    """The transcripts of one claude account. Depth 1 only: subfolders hold
+    subagent transcripts, never resumable."""
+    proj = Path(root.path) / "projects"
+    if not proj.is_dir():
+        return []
+    return [f for slug in sorted(proj.iterdir()) if slug.is_dir() for f in slug.glob("*.jsonl")]
+
+
+def claude_sessions(root: Root = None, files: list = None) -> list:
+    """files: its transcripts, when the caller has counted them already
+    (claude_files; the loader's total)."""
     root = root or Root("", str(claude_root()), True)
     proj = Path(root.path) / "projects"
     if not proj.is_dir():
         return []
     running = claude_running(root.path)
-    cache = {}
-
-    def history():
-        if "t" not in cache:
-            cache["t"] = history_table(Path(root.path) / "history.jsonl", "sessionId")
-        return cache["t"]
-
+    hist = History(Path(root.path) / "history.jsonl", "sessionId")   # read only if a fallback is needed
     out = []
-    for slug in sorted(proj.iterdir()):
-        if not slug.is_dir():
+    for f in (files if files is not None else claude_files(root)):
+        if LOADER:
+            LOADER.done += 1
+        if not UUID_RE.match(f.stem):
             continue
-        for f in slug.glob("*.jsonl"):  # depth 1 only: subfolders hold subagent transcripts
-            if not UUID_RE.match(f.stem):
-                continue
-            try:
-                s = claude_one(f, running, history, root)
-                if s:
-                    out.append(s)
-            except Exception as e:
-                if os.environ.get("CCR_DEBUG"):
-                    print(f"ccr: skipping {f}: {e}", file=sys.stderr)
+        try:
+            s = claude_one(f, running, hist, root)
+            if s:
+                out.append(s)
+        except Exception as e:
+            if os.environ.get("CCR_DEBUG"):
+                print(f"ccr: skipping {f}: {e}", file=sys.stderr)
     mark_cleared(out)
     return out
 
 
-def claude_one(f: Path, running: dict, history, root: Root):
+def claude_one(f: Path, running: dict, hist: History, root: Root):
     sid = f.stem
     head = read_window(f, 16 * 1024)
     # Exclude what the real /resume picker excludes (positive markers only).
@@ -1601,7 +1791,7 @@ def claude_one(f: Path, running: dict, history, root: Root):
     if m:
         cwd = json_unescape(m.group(1))
     if not cwd:
-        cwd = (history().get(sid) or {}).get("project")
+        cwd = (hist.get(sid) or {}).get("project")
     if not cwd:
         cwd = str(HOME)
 
@@ -1618,7 +1808,7 @@ def claude_one(f: Path, running: dict, history, root: Root):
             if title:
                 break
     if not title:
-        title = clean_title((history().get(sid) or {}).get("display"))
+        title = clean_title((hist.get(sid) or {}).get("display"))
 
     # First real user line: /clear marker, and the last-resort title.
     started_by_clear = False
@@ -1695,7 +1885,11 @@ def mark_cleared(sessions: list):
 # codex enumerator
 # ----------------------------------------------------------------------------
 def codex_running() -> dict:
-    """sessionId -> live codex pid, from 'codex resume <uuid>' command lines."""
+    """sessionId -> live codex pid, from 'codex resume <uuid>' command lines.
+    The listing makes it once for all the codex accounts (up to v0.100: once
+    per account). ps itself is the check for a codex process, so there is no
+    cheaper one to make first (the PowerShell version asks Get-Process before
+    reading command lines)."""
     m = {}
     if os.name == "nt" or not shutil.which("ps"):
         return m
@@ -1910,28 +2104,39 @@ def codex_head(tid: str, pages: list) -> Path:
     return next((p for p in pages if p.name.lower().endswith(f"-{tid.lower()}.jsonl")), pages[0])
 
 
-def codex_sessions(root: Root = None) -> list:
+def codex_files(root: Root) -> tuple:
+    """The rollouts of one codex account: sessions/ and archived_sessions/
+    (codex archive moves a rollout there, see unarchive_codex), kept apart."""
+    sess_root = Path(root.path) / "sessions"
+    arch_root = Path(root.path) / "archived_sessions"
+    return (list(sess_root.rglob("rollout-*.jsonl")) if sess_root.is_dir() else [],
+            list(arch_root.rglob("rollout-*.jsonl")) if arch_root.is_dir() else [])
+
+
+def codex_sessions(root: Root = None, files: tuple = None, running: dict = None) -> list:
+    """files: its rollouts, when the caller has counted them already
+    (codex_files; the loader's total); running: the map the caller made once
+    for every codex account."""
     root = root or Root("", str(codex_root()), True)
     sess_root = Path(root.path) / "sessions"
     # codex archive moves a rollout here (see unarchive_codex)
     arch_root = Path(root.path) / "archived_sessions"
     if not sess_root.is_dir() and not arch_root.is_dir():
         return []
-    running = codex_running()
+    if running is None:
+        running = codex_running()
     curated = codex_title_map(root.path)
-    cache = {}
-
-    def history():
-        if "t" not in cache:
-            cache["t"] = history_table(Path(root.path) / "history.jsonl", "session_id")
-        return cache["t"]
+    hist = History(Path(root.path) / "history.jsonl", "session_id")   # read only if a fallback is needed
+    live, archive = files if files is not None else codex_files(root)
 
     out = []
     # One row per thread: title and folder from its head page, last activity
     # from its newest one.
-    threads = [(tid, pages, False) for tid, pages in codex_pages(sess_root.rglob("rollout-*.jsonl")).items()]
-    threads += [(tid, pages, True) for tid, pages in codex_pages(arch_root.rglob("rollout-*.jsonl")).items()]
+    threads = [(tid, pages, False) for tid, pages in codex_pages(live).items()]
+    threads += [(tid, pages, True) for tid, pages in codex_pages(archive).items()]
     for tid, pages, archived in threads:
+        if LOADER:
+            LOADER.done += len(pages)
         f = codex_head(tid, pages)
         sid, cwd, title, skip, origin = tid, None, None, False, "cli"
         try:
@@ -1980,7 +2185,7 @@ def codex_sessions(root: Root = None) -> list:
         if sid in curated:
             title = clean_title(curated[sid])
         if not title:
-            title = clean_title((history().get(sid) or {}).get("text"))
+            title = clean_title((hist.get(sid) or {}).get("text"))
         if not title:
             title = "(session)"
         out.append(Session(tool="codex", id=sid, title=title, cwd=cwd, last=max(codex_last(p) for p in pages),
@@ -6757,7 +6962,9 @@ def auto_update(channel: str, me: str):
     if version_tuple(new_ver) <= version_tuple(had):   # same (e.g. a docs-only commit) or older
         set_channel_state(channel, sha=sha)
         return None
+    loader_suspend()
     print(f"{YELLOW}ccr: auto-updating channel '{channel}' v{had} -> v{new_ver} (branch {branch} @ {sha[:7]})...{RESET}")
+    loader_resume()
     install_script(src, target)
     set_channel_state(channel, sha=sha)
     return had, new_ver
@@ -6766,6 +6973,37 @@ def auto_update(channel: str, me: str):
 # ----------------------------------------------------------------------------
 # main
 # ----------------------------------------------------------------------------
+def list_sessions(tool: str, ctx) -> list:
+    """Every conversation of the listed accounts: the files of every account
+    first - a cheap count that gives the loader its total - then each account
+    read with them, the loader moving file by file. Codex's running map is
+    made once, for all its accounts."""
+    loader_set("counting conversations")
+    work = []
+    if tool in ("claude", "all"):
+        for r in ctx.claude:
+            f = claude_files(r)
+            work.append(("claude", r, f, len(f)))
+    if tool in ("codex", "all"):
+        for r in ctx.codex:
+            f = codex_files(r)
+            work.append(("codex", r, f, len(f[0]) + len(f[1])))
+    loader_set(total=sum(w[3] for w in work))
+    sessions, running = [], None
+    for t, r, files, n in work:
+        before = LOADER.done if LOADER else 0
+        loader_set(f"{t} \u00b7 {r.label or 'default'}")
+        if t == "claude":
+            sessions += claude_sessions(r, files)
+        else:
+            if n and running is None:
+                running = codex_running()
+            sessions += codex_sessions(r, files, running if n else {})
+        if LOADER:
+            LOADER.done = before + n
+    return sessions
+
+
 # The PowerShell spellings (ccr -Update, -Root work, -WhatIf, -AddAccount x,
 # any case, one or two dashes) translated to the GNU ones argparse knows, so
 # a command line copied from either doc works on both platforms. Only known
@@ -6889,14 +7127,24 @@ def main():
     # then run the freshly installed file with the same arguments. The
     # banner the picker shows for this one run travels in an env var.
     upd_note = os.environ.pop("CCR_UPDATED_FROM", "")
+    # The loader (v0.101): from here to the picker ccr checks for updates and
+    # reads every conversation, and on a terminal a line shows it moving. Not
+    # for --install and the account commands, which print as they go and
+    # list nothing. Every way out of the listing stops it (finally / atexit);
+    # whatever prints before that stops or suspends it first.
+    if not (a.install or a.accounts or a.add_account or a.remove_account or a.disable_accounts):
+        loader_start("checking for updates")
     if not a.dry_run and not upd_note:
         me = self_path()
         try:
             upd = auto_update(channel_of(me), me)
         except Exception as e:
+            loader_suspend()
             print(f"ccr: auto-update failed: {e}", file=sys.stderr)
+            loader_resume()
             upd = None
         if upd:
+            loader_stop()   # the fresh copy runs its own
             env = dict(os.environ)
             env["CCR_UPDATED_FROM"] = f"{upd[0]}>{upd[1]}"
             os.execve(sys.executable, [sys.executable, channel_path(channel_of(me), me)] + sys.argv[1:], env)
@@ -6933,14 +7181,12 @@ def main():
         return
 
     while True:   # restarted after an account change, so the listing reflects the new ccr.json
-        ctx = Ctx(a.root)
-        sessions = []
-        if a.tool in ("claude", "all"):
-            for r in ctx.claude:
-                sessions += claude_sessions(r)
-        if a.tool in ("codex", "all"):
-            for r in ctx.codex:
-                sessions += codex_sessions(r)
+        loader_start("counting conversations")
+        try:
+            ctx = Ctx(a.root)
+            sessions = list_sessions(a.tool, ctx)
+        finally:
+            loader_stop()
         if not sessions and not (a.new or a.panel or a.cont):
             absent = [t for t in ("claude", "codex") if not tool_path(t)]
             sys.exit("ccr: no sessions found." + (f" Not installed on this computer: {', '.join(absent)} - "

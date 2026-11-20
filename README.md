@@ -31,7 +31,7 @@ If you work with several CLI agent sessions at once — one terminal window, one
 
 ### Windows
 
-One line, no admin rights. It copies the script next to your PowerShell profile and adds a load line to the profile (both idempotent):
+One line, no admin rights. It copies the script next to your PowerShell profile and adds a small block to the profile that loads it the first time you run `ccr`, so a new shell does not spend ~0.3 s reading 400 KB of script it may never use (both idempotent; the plain load line that installs before v0.101 wrote is replaced by the block, and the installer says so):
 
 ```powershell
 irm https://raw.githubusercontent.com/Cepstral/claude-codex-resume/main/install.ps1 | iex
@@ -58,11 +58,36 @@ gh api repos/Cepstral/claude-codex-resume/contents/install.ps1 -H "Accept: appli
    Unblock-File (Join-Path (Split-Path -Parent $PROFILE) 'Resume-CcSessions.ps1')
    ```
 
-3. Add one line to your profile (`notepad $PROFILE`):
+3. Load it from your profile (`notepad $PROFILE`). One line does it, read at every shell start:
 
    ```powershell
    . (Join-Path (Split-Path -Parent $PROFILE) 'Resume-CcSessions.ps1')
    ```
+
+   Or what the installer writes, which reads the file only at the first `ccr` (or `ccrtest`, `Resume-CcSessions`) and then makes its functions, the `ccr` alias and its `Ccr*` variables global, as if the profile had loaded it:
+
+   ```powershell
+   # >>> claude-codex-resume: ccr, loaded at its first call >>>
+   $global:__ccrFile = Join-Path (Split-Path -Parent $PROFILE) 'Resume-CcSessions.ps1'
+   function global:Import-Ccr {
+       Remove-Item -Path function:global:ccr, function:global:ccrtest, function:global:Resume-CcSessions -ErrorAction SilentlyContinue
+       . $global:__ccrFile
+       $fns = @(Get-ChildItem function: | Where-Object { $_.ScriptBlock.File -eq $global:__ccrFile })
+       foreach ($f in $fns) { Set-Item -LiteralPath "function:global:$($f.Name)" -Value $f.ScriptBlock }
+       foreach ($a in Get-ChildItem alias: | Where-Object { $_.ResolvedCommandName -in $fns.Name }) {
+           Set-Alias -Name $a.Name -Value $a.Definition -Scope Global -Force
+       }
+       foreach ($v in Get-Variable -Scope Script | Where-Object Name -like 'Ccr*') {
+           Set-Variable -Name $v.Name -Value $v.Value -Scope Global -Force
+       }
+   }
+   function global:ccr { Import-Ccr; Resume-CcSessions @args }
+   function global:ccrtest { Import-Ccr; ccrtest @args }
+   function global:Resume-CcSessions { Import-Ccr; Resume-CcSessions @args }
+   # <<< claude-codex-resume <<<
+   ```
+
+   `. $PROFILE` puts the three entry points back; the next `ccr` reads the file from disk again.
 
 4. Open a new tab and run `ccr`.
 
@@ -113,6 +138,8 @@ ccr -AddAccount work   # add a second account (see "Several accounts")
 ccr -Root work         # list only the conversations of the account "work"
 ccr -Accounts          # which accounts exist, and who is logged in where
 ```
+
+**While it loads.** From `ccr` to the picker, ccr checks for an update and reads every conversation of every account. When that takes more than about 0.2 s, a line shows it moving: a spinner, a bar, the share and count of the files read, and what is being read (`checking for updates`, `counting conversations`, `claude · default`, `codex · work`). In Windows Terminal the tab shows the same progress (busy while the total is unknown, then the share). The line only appears in an interactive terminal: with the output redirected or captured nothing is drawn, and the line is cleared, the cursor and the tab given back, however the listing ends (`Ctrl+C` included). The same goes for `-n`, `-Panel` and `-Continue`, which read the conversations too.
 
 macOS / Linux only: `--terminal` (resume Codex **app** conversations with `codex resume` in a terminal instead of handing them to the app) and `--tabs` (Terminal.app: extra sessions as tabs instead of windows). See [macOS / Linux notes](#macos--linux-notes).
 
@@ -368,6 +395,8 @@ Outside iTerm2, Terminal.app and tmux (e.g. a bare SSH shell) only the first sel
 
 The key line sits above the prompt, with `Ctrl-G` / `F1` for the guide; on the new-conversation pages it says which step you are on and which folder you chose. `Ctrl-Y` (a copy) asks the copy's name on a plain line once fzf has closed, as the new-conversation name does; `Ctrl-C` there goes back to the list (on Windows: a box above the list, `Esc`). Everything beyond the plain picker is version-gated, so an older fzf loses the marked counter or the line highlight rather than refusing to start. The config file is `$CCR_CONFIG` or `~/.config/ccr/ccr.json` (same keys as on Windows).
 
+The loading line (see [Usage](#usage)) is drawn on stderr. The tab's progress bar is Windows Terminal's (OSC 9;4), sent only when `WT_SESSION` says the terminal is Windows Terminal: iTerm2 takes the same sequence for a notification. `CCR_DEBUG` turns the line off, as `-Verbose` does on Windows, since their messages would cut through it.
+
 *The Python port is verified against the same session data as the PowerShell version, and the Terminal.app path on a Mac; the iTerm2 scripting is still written from its dictionary alone — report anything odd with `ccr --dry-run`, which prints the exact AppleScript it would run.*
 
 ## How it works
@@ -378,6 +407,8 @@ No database, no index: ccr reads the same files the tools' own resume features r
 - **Codex** — `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` (plus `archived_sessions/`). Session id from the file name, folder and title from the first lines, last activity from the time on the file's **last line** (every rollout line carries one) — not from the file's modified time, which the desktop app, the IDE extension and subagents leave at the conversation's start; the file time is only the fallback. A conversation can span several files: with paginated history (the Codex desktop app), editing a message starts a new page `rollout-<ts>-<id>_<page>.jsonl` and the conversation goes on there. ccr shows the pages as one row, with title and folder from the first page and last activity from the newest, and reads (`Ctrl+K`), moves and deletes all of them together.
 
 The PowerShell version needs no modules (the Codex catalog is read with `winsqlite3.dll`, which ships with Windows); the Python version needs only the standard library and fzf.
+
+**Speed (v0.101).** Listing 132 conversations of six accounts went from about 4.5 s to about 1.3 s in a new PowerShell tab (0.5 s in a tab that has run ccr before). What it took: `history.jsonl` (the fallback for a title or a folder) is read only when a conversation needs it, and then only the lines of that conversation are parsed, not all of them; the running state of Codex conversations is read once for all its accounts, straight from the `codex.exe` processes instead of through a WMI query (about 1 s each time, and the Codex app keeps such processes alive); the calls into `winsqlite3.dll` are declared without compiling C#; and the searches in a transcript's head and tail no longer pass the whole text to a .NET method, which pwsh hands to the antimalware scan interface (AMSI) with its arguments, at ~4 ms per 128 KB. The listing is the same, row for row.
 
 ### A note on Codex titles
 
