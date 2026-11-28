@@ -39,7 +39,7 @@ from pathlib import Path
 
 # Shown in the picker hint line; bumped together with $script:CcrVersion in
 # Resume-CcSessions.ps1 - the two scripts move in lockstep.
-VERSION = "0.101"
+VERSION = "0.102"
 UUID_IN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 UUID_RE = re.compile("^" + UUID_IN + "$")
 # Ctrl-Y on a codex row: stands for the copy's id in the resume command until
@@ -2944,7 +2944,10 @@ def picker_guide(ctx, lim=None, width: int = 0) -> list:
             ("Ctrl-K", "token-usage column: the tokens of each session in the last hours, and its share"),
             ("Ctrl-J", "the usage details of the highlighted row"),
         ] + ([("Ctrl-L", "ask every account for its usage limits again (otherwise those of the last 5 minutes)")]
-             if lim and lim.on else [])),
+             if lim and lim.on else []) + [
+            ("F5", "read the conversations again, for the ones started or changed since the list opened: the filter "
+                   "stays, the marks go (fn+F5 on a Mac keyboard)"),
+        ]),
         ("Managing", [
             ("Ctrl-A", "accounts: add one, log in, copy settings, remove, turn multi-account mode off"),
             ("Ctrl-F", "find the window of the running conversation of the highlighted row: it comes to the front "
@@ -7249,7 +7252,7 @@ def main():
             lim.port = free_port() if lim.pending and fzf_version() >= (0, 45) else 0
             res = run_fzf(rows, picker_hint(ctx, upd_note, lim), query=query, multi=not tabs,
                           expect=delete_keys() + ["ctrl-n", "ctrl-p", "ctrl-a", "ctrl-k", "ctrl-j", "ctrl-x", "ctrl-e",
-                                                  "ctrl-t", "ctrl-l", "ctrl-g", "f1", "ctrl-f", "ctrl-y"]
+                                                  "ctrl-t", "ctrl-l", "ctrl-g", "f1", "ctrl-f", "ctrl-y", "f5"]
                           + ([] if tabs else ["ctrl-o"]),
                           listen=lim.port, binds=([tabs.bind()] if tabs else []) + esc_bind(), track=bool(tabs),
                           info_cmd=tabs.info_cmd() if tabs else None, state=typed)
@@ -7276,6 +7279,13 @@ def main():
             if key == "ctrl-l":
                 # Ask every account for its usage limits again.
                 lim.refresh(force=True)
+                continue
+            if key == "f5":
+                # Read the conversations again (v0.102): a picker left open
+                # does not see the ones started or changed since. Listed from
+                # the top, as after Ctrl-A; the typed filter stays (query).
+                restart = True
+                upd_note = ""
                 continue
             if key == "ctrl-k":
                 # The usage column on/off. Turning it on reads the transcripts

@@ -161,6 +161,7 @@ The line above the list names only the essentials. **`Ctrl+G`** (or **`F1`**) op
 | open under [another account](#several-accounts) | `Tab` cycles the account of the row | `Tab` cycles it too (fzf 0.39+; older fzf: `Tab` marks, `Ctrl-O` picks the account) |
 | [token usage](#usage-limits-and-token-usage): column / details | `Ctrl+K` / `Ctrl+J` | `Ctrl-K` / `Ctrl-J` |
 | ask the [usage limits](#usage-limits-and-token-usage) again | `Ctrl+L` | `Ctrl-L` |
+| read the conversations again: a list left open does not see the ones started or changed since (the filter stays, the marks go) | `F5` | `F5` (`fn`+`F5` on a Mac keyboard) |
 | [find the window](#running-conversations-find-and-close) of a running conversation | `Ctrl+F` | `Ctrl-F` |
 | [close](#running-conversations-find-and-close) a running conversation | `Ctrl+X` | `Ctrl-X` |
 | [install / update](#installing-or-updating-claude-code-and-codex) Claude Code or Codex | `Ctrl+I` or `Ctrl+T` | `Ctrl-T` (fzf reads `Ctrl-I` as `Tab`) |

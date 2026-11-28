@@ -22,7 +22,7 @@
 
 # Shown in the picker hint line; bump on every change so a stale function
 # loaded by an old tab is immediately recognizable.
-$script:CcrVersion = '0.101'
+$script:CcrVersion = '0.102'
 
 # Optional multi-account config: ccr.json next to this file (or the file named
 # by $env:CCR_CONFIG). Captured at load time - $PSScriptRoot is only set while
@@ -5668,7 +5668,8 @@ function Get-CcrPickerGuide([int]$Width, [bool]$AcctMode, [bool]$LimitsOn) {
             @('Ctrl+Y', 'a copy of the highlighted conversation under a name you type: it opens here and goes on on its own, the original stays as it is (it may be open right now)'))
         , @('Looking',
             @('Ctrl+K', 'token-usage column: the tokens of each session in the last hours, and its share'),
-            @('Ctrl+J', 'the usage details of the highlighted row'))
+            @('Ctrl+J', 'the usage details of the highlighted row'),
+            @('F5', 'read the conversations again, for the ones started or changed since the list opened: the filter stays, the marks go'))
         , @('Managing',
             @('Ctrl+A', 'accounts: add one, log in, copy settings, remove, turn multi-account mode off'),
             @('Ctrl+F', 'find the window of the running conversation of the highlighted row: it comes to the front with its tab selected, and its title blinks'),
@@ -6500,6 +6501,12 @@ function Select-CcrSession {
                 if ($limitsOn) { Start-CcrLimitsRefresh $true }
                 continue
             }
+            # F5: read the conversations again (v0.102) - a picker left open
+            # in a tab does not see the ones started or changed since. The
+            # caller lists from the top, as after Ctrl+A; the filter stays.
+            if ($k.Key -eq [ConsoleKey]::F5) {
+                return [pscustomobject]@{ Restart = $true; Filter = $filter }
+            }
             if ($k.Key -eq [ConsoleKey]::K -and $ctrl) {
                 # Ctrl+K: the usage column on/off. Turning it on reads the
                 # transcripts written inside the window (once per picker).
@@ -6838,7 +6845,7 @@ function Resume-CcSessions {
         Picker keys: Up/Down/PgUp/PgDn/Home/End move, Tab marks/unmarks,
         Enter opens the marked set (or the highlighted row if nothing is
         marked; one already open, here or on another PC, asks first), Ctrl+L asks every account for its usage limits again (the
-        table above the list), Shift+Enter (or Ctrl+E) opens it with a model and an effort
+        table above the list), F5 reads the conversations again (the filter stays), Shift+Enter (or Ctrl+E) opens it with a model and an effort
         chosen on a page - one section for the claude rows (--model,
         --effort), one for the codex rows (-m, -c model_reasoning_effort),
         each shown only when the selection has such rows, all starting at
@@ -7351,9 +7358,9 @@ function Resume-CcSessions {
     }
     if ($null -eq $picked) { Write-Host 'ccr: cancelled.'; return }
     if ($picked -isnot [System.Array] -and $picked.PSObject.Properties['Restart']) {
-        # An account was added from inside the picker: run again from the top
-        # with the same arguments, so the listing and the account column
-        # reflect the new ccr.json.
+        # An account was added from inside the picker, or F5: run again from
+        # the top with the same arguments, so the listing and the account
+        # column reflect the new ccr.json and the conversations as they are now.
         $again = @{} + $PSBoundParameters
         if ($picked.Filter) { $again['Filter'] = @($picked.Filter) } else { $again.Remove('Filter') }
         Resume-CcSessions @again
